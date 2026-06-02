@@ -69,8 +69,8 @@ function isOwaTopFrame(): boolean {
 // Find a treeitem element by its OWA folder display name.
 //
 // OWA normalizes ASCII letters in `data-folder-name` to lowercase
-// (verified empirically: "DAZN" → "dazn", "全球v.大豐TBC..." →
-// "全球v.大豐tbc..."), while CJK characters are preserved verbatim. Our
+// (verified empirically: "CompanyB" → "company-b", "公司甲v.公司乙ABC..." →
+// "公司甲v.公司乙abc..."), while CJK characters are preserved verbatim. Our
 // stored folder names come from Graph API which keeps the original case,
 // so we have to lowercase both sides for the comparison.
 //

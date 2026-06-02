@@ -60,10 +60,10 @@ describe('matchEmail', () => {
   })
 
   it('matches domain on sender', () => {
-    const r = rule({ type: 'domain', signal: 'foodpanda.tw' })
+    const r = rule({ type: 'domain', signal: 'vendor.example' })
     const e = makeEmail({
       Id: 'e1',
-      From: { EmailAddress: { Address: 'someone@foodpanda.tw' } },
+      From: { EmailAddress: { Address: 'someone@vendor.example' } },
     })
     const out = matchEmail(e, [r])
     expect(out?.rule.id).toBe(r.id)
@@ -71,11 +71,11 @@ describe('matchEmail', () => {
   })
 
   it('matches domain on recipient CC', () => {
-    const r = rule({ type: 'domain', signal: 'kgi.com' })
+    const r = rule({ type: 'domain', signal: 'company-a.example' })
     const e = makeEmail({
       Id: 'e1',
       From: { EmailAddress: { Address: 'me@example.com' } },
-      ToRecipients: [{ EmailAddress: { Address: 'someone@kgi.com' } }],
+      ToRecipients: [{ EmailAddress: { Address: 'someone@company-a.example' } }],
     })
     const out = matchEmail(e, [r])
     expect(out?.rule.id).toBe(r.id)
@@ -83,10 +83,10 @@ describe('matchEmail', () => {
   })
 
   it('strips @ prefix from domain signal', () => {
-    const r = rule({ type: 'domain', signal: '@foodpanda.tw' })
+    const r = rule({ type: 'domain', signal: '@vendor.example' })
     const e = makeEmail({
       Id: 'e1',
-      From: { EmailAddress: { Address: 'x@foodpanda.tw' } },
+      From: { EmailAddress: { Address: 'x@vendor.example' } },
     })
     expect(matchEmail(e, [r])).not.toBeNull()
   })
@@ -136,13 +136,13 @@ describe('matchEmail', () => {
     })
     const domainRule = rule({
       type: 'domain',
-      signal: 'foodpanda.tw',
+      signal: 'vendor.example',
       targetFolderPath: 'B',
     })
     const e = makeEmail({
       Id: 'e1',
       Subject: '25A0067A 報告',
-      From: { EmailAddress: { Address: 'x@foodpanda.tw' } },
+      From: { EmailAddress: { Address: 'x@vendor.example' } },
     })
     const out = matchEmail(e, [domainRule, codeRule])
     expect(out?.rule.type).toBe('case_code')
@@ -154,26 +154,26 @@ describe('matchEmail', () => {
     // feature is pointless.
     const domainRule = rule({
       type: 'domain',
-      signal: 'dazn.com',
+      signal: 'company-b.example',
       targetFolderPath: '11sports',
     })
     const compoundRule = rule({
       type: 'compound',
       signal: encodeCompound([
-        { type: 'domain', value: 'dazn.com' },
+        { type: 'domain', value: 'company-b.example' },
         { type: 'subject_keyword', value: '三二零九' },
       ]),
-      targetFolderPath: 'DAZN',
+      targetFolderPath: 'CompanyB',
     })
     const eWithKeyword = makeEmail({
       Id: 'e1',
       Subject: 'RE: 三二零九 案件討論',
-      From: { EmailAddress: { Address: 'x@dazn.com' } },
+      From: { EmailAddress: { Address: 'x@company-b.example' } },
     })
     const eWithoutKeyword = makeEmail({
       Id: 'e2',
       Subject: '一般通知',
-      From: { EmailAddress: { Address: 'x@dazn.com' } },
+      From: { EmailAddress: { Address: 'x@company-b.example' } },
     })
 
     // Compound wins when both conditions match
@@ -212,16 +212,16 @@ describe('matchEmail', () => {
 
 describe('findConflicts', () => {
   it('detects same (type, signal) with different targets', () => {
-    const a = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'A', targetFolderPath: 'A' })
-    const b = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'B', targetFolderPath: 'B' })
+    const a = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'A', targetFolderPath: 'A' })
+    const b = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'B', targetFolderPath: 'B' })
     const conflicts = findConflicts([a, b])
     expect(conflicts).toHaveLength(1)
     expect(conflicts[0]!.rules).toHaveLength(2)
   })
 
   it('does not flag duplicates with same target', () => {
-    const a = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'A' })
-    const b = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'A' })
+    const a = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'A' })
+    const b = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'A' })
     expect(findConflicts([a, b])).toHaveLength(0)
   })
 
@@ -240,8 +240,8 @@ describe('findConflicts', () => {
   })
 
   it('ignores disabled rules', () => {
-    const a = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'A' })
-    const b = rule({ type: 'domain', signal: 'kgi.com', targetFolderId: 'B', enabled: false })
+    const a = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'A' })
+    const b = rule({ type: 'domain', signal: 'company-a.example', targetFolderId: 'B', enabled: false })
     expect(findConflicts([a, b])).toHaveLength(0)
   })
 })
@@ -528,11 +528,11 @@ describe('ruleBeatsThread precedence', () => {
 // no proper-noun heuristics, no stopword lists.
 describe('extractSubjectSignal', () => {
   it('returns the entire normalized subject for typical Chinese cases', () => {
-    expect(extractSubjectSignal('關於凱基證券股權移轉案')).toBe('關於凱基證券股權移轉案')
+    expect(extractSubjectSignal('關於甲公司股權移轉案')).toBe('關於甲公司股權移轉案')
   })
 
   it('strips reply / forward / system prefixes (normalizeSubject behavior)', () => {
-    expect(extractSubjectSignal('Re: [External] 凱基證券 詢問')).toBe('凱基證券 詢問')
+    expect(extractSubjectSignal('Re: [External] 甲公司 詢問')).toBe('甲公司 詢問')
     expect(extractSubjectSignal('Re: Re: Fw: 通知')).toBe('通知')
   })
 
@@ -566,7 +566,7 @@ describe('extractSubjectSignal', () => {
   })
 
   it('is deterministic — same input always yields same signal', () => {
-    const subj = '關於凱基證券股權移轉案會議紀要'
+    const subj = '關於甲公司股權移轉案會議紀要'
     expect(extractSubjectSignal(subj)).toBe(extractSubjectSignal(subj))
   })
 
@@ -574,8 +574,8 @@ describe('extractSubjectSignal', () => {
     // matchSubjectKeyword does case-insensitive `includes`. Signal is
     // already prefix-stripped + lowercased, so a raw subject with reply
     // prefix matches via substring.
-    const signal = extractSubjectSignal('Re: 關於凱基證券詢問')
-    const rawIncoming = 'Re: Re: 關於凱基證券詢問'
+    const signal = extractSubjectSignal('Re: 關於甲公司詢問')
+    const rawIncoming = 'Re: Re: 關於甲公司詢問'
     expect(rawIncoming.toLowerCase().includes(signal)).toBe(true)
   })
 })

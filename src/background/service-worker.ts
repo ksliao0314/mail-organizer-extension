@@ -641,7 +641,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           return { ok: false, code: 'NO_ROOT', message: `找不到「${rootPath}」根目錄` }
         }
         // Walk the root subtree, collecting LEAF folders (no children) — these
-        // are case-level folders (e.g. 法顧/foodpanda). Skipping interior
+        // are case-level folders (e.g. 法顧/vendor). Skipping interior
         // category nodes (e.g. 法顧) which don't have direct case mail.
         const targets: MailFolderNode[] = []
         function collectLeaves(nodes: MailFolderNode[]): void {

@@ -133,13 +133,13 @@ describe('computeRuleHealth — conflicts', () => {
     // Two enabled domain rules same signal different targetFolderId → conflict
     const a = rule({
       id: 'a',
-      signal: 'kgi.com',
+      signal: 'company-a.example',
       targetFolderId: 'AAA' + 'a'.repeat(50),
       targetFolderPath: '03/A',
     })
     const b = rule({
       id: 'b',
-      signal: 'kgi.com',
+      signal: 'company-a.example',
       targetFolderId: 'BBB' + 'b'.repeat(50),
       targetFolderPath: '03/B',
     })

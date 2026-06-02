@@ -131,9 +131,9 @@ describe('tombstones — cap', () => {
 // canonical form (lowercase, no @).
 describe('tombstones — signal normalization', () => {
   it('blocks a rule with @-prefixed signal when tombstone is unprefixed', () => {
-    const candidates = [rule({ signal: '@KGI.COM', targetFolderPath: '03/Z' })]
+    const candidates = [rule({ signal: '@Company-A.EXAMPLE', targetFolderPath: '03/Z' })]
     const tombs: RuleTombstone[] = [
-      { type: 'domain', signalNorm: 'kgi.com', targetFolderPath: '03/Z', deletedAt: 0 },
+      { type: 'domain', signalNorm: 'company-a.example', targetFolderPath: '03/Z', deletedAt: 0 },
     ]
     expect(filterByTombstones(candidates, tombs)).toHaveLength(0)
   })
@@ -339,7 +339,7 @@ describe('autoDisableStaleRules — legacy_token branch', () => {
   it('disables auto_scan + subject_keyword rule with token-shape signal', async () => {
     const r = newRule({
       type: 'subject_keyword',
-      signal: '凱基證券', // 4-char pure Chinese → legacy token shape
+      signal: '甲公司', // 4-char pure Chinese → legacy token shape
       targetFolderId: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3',
       targetFolderPath: '03/X',
       confidence: 0.75,
@@ -406,7 +406,7 @@ describe('autoDisableStaleRules — legacy_token branch', () => {
     // from extractSubjectFeature (4+ Chinese token). Over-broad. Retire.
     const r = newRule({
       type: 'subject_keyword',
-      signal: '凱基證券',
+      signal: '甲公司',
       targetFolderId: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3',
       targetFolderPath: '03/X',
       confidence: 0.7,
@@ -455,7 +455,7 @@ describe('autoDisableStaleRules — legacy_token branch', () => {
   it('keeps pre-cutoff user_manual subject_keyword (sacred)', async () => {
     const r = newRule({
       type: 'subject_keyword',
-      signal: '凱基證券',
+      signal: '甲公司',
       targetFolderId: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3',
       targetFolderPath: '03/X',
       confidence: 0.95,
@@ -620,13 +620,13 @@ describe('toggleRule clears auto-disable provenance on re-enable', () => {
 // ---- dedupeRulesByKey — historical duplicate cleanup (2026-05-27) -------
 describe('dedupeRulesByKey', () => {
   it('collapses identical (type, signal, target) triplets, preserving best survivor', async () => {
-    // 3 ai_confirmed dups for dazn.com → 11 sports. They differ only in
+    // 3 ai_confirmed dups for company-b.example → 11 sports. They differ only in
     // id and matchCount. Higher matchCount should survive.
-    const r1 = rule({ type: 'domain', signal: 'dazn.com', targetFolderPath: '03/11 sports' })
+    const r1 = rule({ type: 'domain', signal: 'company-b.example', targetFolderPath: '03/11 sports' })
     r1.matchCount = 3
-    const r2 = rule({ type: 'domain', signal: 'dazn.com', targetFolderPath: '03/11 sports' })
+    const r2 = rule({ type: 'domain', signal: 'company-b.example', targetFolderPath: '03/11 sports' })
     r2.matchCount = 10
-    const r3 = rule({ type: 'domain', signal: 'dazn.com', targetFolderPath: '03/11 sports' })
+    const r3 = rule({ type: 'domain', signal: 'company-b.example', targetFolderPath: '03/11 sports' })
     r3.matchCount = 5
     await addRules([r1, r2, r3])
 
@@ -666,10 +666,10 @@ describe('dedupeRulesByKey', () => {
   })
 
   it('keeps unique-triplet rules untouched (different targets remain)', async () => {
-    // dazn.com → A and dazn.com → B are a real conflict (different
+    // company-b.example → A and company-b.example → B are a real conflict (different
     // targets), NOT a duplicate. Both stay.
-    const a = rule({ type: 'domain', signal: 'dazn.com', targetFolderPath: 'A' })
-    const b = rule({ type: 'domain', signal: 'dazn.com', targetFolderPath: 'B' })
+    const a = rule({ type: 'domain', signal: 'company-b.example', targetFolderPath: 'A' })
+    const b = rule({ type: 'domain', signal: 'company-b.example', targetFolderPath: 'B' })
     await addRules([a, b])
 
     const { removed } = await dedupeRulesByKey()

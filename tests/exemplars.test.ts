@@ -70,16 +70,16 @@ describe('buildExamplesBlock', () => {
 
   it('formats each rule type humanly', () => {
     const rules: Rule[] = [
-      rule({ type: 'domain', signal: 'kgi.com', targetFolderPath: '03/凱基證券' }),
+      rule({ type: 'domain', signal: 'company-a.example', targetFolderPath: '03/甲公司' }),
       rule({ type: 'case_code', signal: '25A0067A', targetFolderPath: '03/X 案' }),
       rule({ type: 'subject_keyword', signal: '請款', targetFolderPath: '05/發票' }),
-      rule({ type: 'sender', signal: 'admin@gov.tw', targetFolderPath: '03/行政' }),
+      rule({ type: 'sender', signal: 'admin@gov.example', targetFolderPath: '03/行政' }),
     ]
     const block = buildExamplesBlock(rules)
-    expect(block).toMatch(/寄件人網域 @kgi\.com → 03\/凱基證券/)
+    expect(block).toMatch(/寄件人網域 @company-a\.example → 03\/甲公司/)
     expect(block).toMatch(/主旨含案件代號 25A0067A → 03\/X 案/)
     expect(block).toMatch(/主旨含「請款」 → 05\/發票/)
-    expect(block).toMatch(/寄件人 admin@gov\.tw → 03\/行政/)
+    expect(block).toMatch(/寄件人 admin@gov\.example → 03\/行政/)
   })
 
   it('warns AI that examples are guidance, not absolute', () => {

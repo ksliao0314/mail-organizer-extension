@@ -847,13 +847,13 @@ export function wasUserOverride(item: PlanItem): boolean {
  * projects / clients from a shared address.
  *
  *   1. domain + Taiwan court case number → compound  (Taiwan legal)
- *      e.g. `cht.com.tw + 112訴204` — uniquely identifies a case-client pair.
+ *      e.g. `telco.example + 112訴204` — uniquely identifies a case-client pair.
  *   2. Taiwan court case number alone (no usable domain) → subject_keyword
  *      Court case numbers are globally unique per court; safe.
  *   3. Latin case code alone → case_code
  *      Structurally unique within a firm's internal coding system.
  *   4. domain + subject feature → compound  (NEW 2026-05-22)
- *      e.g. `cht.com.tw + 凱基證券` — generic noun-phrase routing.
+ *      e.g. `telco.example + 甲公司` — generic noun-phrase routing.
  *      Feature = a Chinese 4-12 char or Latin 6-12 char proper
  *      noun-ish token from the subject, excluding stopwords and
  *      Taiwan-legal patterns (those have their own slots above).
@@ -983,9 +983,9 @@ function chooseLearningSignal(
   // compound (domain + 整段主旨), encoding what made the user pick THIS
   // folder over the existing one.
   if (usableDomain && !isGenericProviderDomain(usableDomain)) {
-    // Compare via normalizeSignal so a stored rule signal of `@dazn.com`
+    // Compare via normalizeSignal so a stored rule signal of `@company-b.example`
     // (legitimate when entered through certain manual flows / import
-    // sources) matches `dazn.com` from extractDomain. Direct
+    // sources) matches `company-b.example` from extractDomain. Direct
     // `.toLowerCase()` compare was missing the `@`-prefix case and the
     // trim-whitespace case, leaving conflicting domain rules undetected.
     const conflictExists = existingRules.some(

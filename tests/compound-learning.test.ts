@@ -43,9 +43,9 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
   it('produces a compound rule (domain + courtCase) when both signals present', async () => {
     const item = planItem({
       emailSubject: 'Re: 112訴204 開庭通知',
-      emailFrom: 'litigation@cht.com.tw',
+      emailFrom: 'litigation@telco.example',
       action: 'move',
-      targetFolderPath: '03/民事/台台併參加',
+      targetFolderPath: '03/民事/乙併購案',
       aiOriginalAction: 'move',
       aiOriginalTargetFolderPath: '03/民事/未分類',
     })
@@ -56,7 +56,7 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
     expect(rules[0]!.type).toBe('compound')
     const parsed = decodeCompound(rules[0]!.signal)
     expect(parsed?.conditions).toEqual([
-      { type: 'domain', value: 'cht.com.tw' },
+      { type: 'domain', value: 'telco.example' },
       { type: 'subject_keyword', value: '112訴204' },
     ])
     expect(rules[0]!.confidence).toBe(0.95)
@@ -66,9 +66,9 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
   it('handles 114訴更一14 (sub-classified case)', async () => {
     const item = planItem({
       emailSubject: '114訴更一14 補件',
-      emailFrom: 'court@ncc.gov.tw',
+      emailFrom: 'court@agency.example',
       action: 'move',
-      targetFolderPath: '03/行政/NCCv.中天-執照',
+      targetFolderPath: '03/行政/丙行政訴訟案',
       aiOriginalAction: 'move',
       aiOriginalTargetFolderPath: '03/行政/未分類',
     })
@@ -83,7 +83,7 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
   it('canonicalizes full form 112年度訴字第204號 to compact in compound rule', async () => {
     const item = planItem({
       emailSubject: '請見 112年度訴字第204號 附件',
-      emailFrom: 'a@cht.com.tw',
+      emailFrom: 'a@telco.example',
       action: 'move',
       targetFolderPath: '03/X',
       aiOriginalAction: 'move',
@@ -100,7 +100,7 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
       emailSubject: '114民著訴74 期日通知',
       emailFrom: '',
       action: 'move',
-      targetFolderPath: '03/民事/DAZN',
+      targetFolderPath: '03/民事/CompanyB',
       aiOriginalAction: 'move',
       aiOriginalTargetFolderPath: '03/民事/未分類',
     })

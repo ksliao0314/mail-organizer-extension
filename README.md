@@ -205,4 +205,4 @@ npm run lint         # eslint
 
 ## License
 
-私人使用、不開源。Issues / PRs 暫不接受。
+私人使用、**不開源**(All Rights Reserved,詳見 [`LICENSE`](LICENSE))。原始碼公開僅供參考 / 作品集展示,未授權任何使用、複製、修改或散布。Issues / PRs 暫不接受。

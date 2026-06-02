@@ -1320,8 +1320,8 @@ const TYPE_LABEL: Record<RuleType, string> = {
  *   - Otherwise → 「主旨」(full-subject signal, post-2026-05-27 design)
  *
  * Helps the user distinguish at a glance:
- *   "112訴204"   [案號]   → 03/民事/凱基證券案
- *   "25A0067A"   [案件代號]→ 03/民事/凱基證券案
+ *   "112訴204"   [案號]   → 03/民事/甲公司案件
+ *   "25A0067A"   [案件代號]→ 03/民事/甲公司案件
  *   "請款通知"   [主旨]   → 05/發票
  *
  * Defaults to TYPE_LABEL for non-subject_keyword types.
@@ -3813,7 +3813,7 @@ function ConflictsView({
 
 const TYPE_PLACEHOLDER: Record<RuleType, string> = {
   case_code: '25A0067A',
-  domain: 'foodpanda.tw（不需要 @）',
+  domain: 'vendor.example（不需要 @）',
   compound: '',
   subject_keyword: '工時審閱',
   sender: '例:contact@example.com',
@@ -4132,7 +4132,7 @@ function CompoundEditor({
 
   const PLACEHOLDER: Record<CompoundCondition['type'], string> = {
     sender: '例:contact@example.com',
-    domain: 'foodpanda.tw',
+    domain: 'vendor.example',
     subject_keyword: '工時審閱',
   }
 

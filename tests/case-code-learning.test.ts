@@ -47,7 +47,7 @@ describe('AI generators prefer case_code over domain when subject has one', () =
   it('generates a case_code rule when subject contains a case code', async () => {
     const item = planItem({
       emailSubject: 'Re: 25A0067A 補件通知',
-      emailFrom: 'court@example.gov.tw',
+      emailFrom: 'court@gov.example',
       action: 'move',
       targetFolderPath: '03/民事/X 案',
       aiOriginalAction: 'move',
@@ -105,14 +105,14 @@ describe('AI generators prefer case_code over domain when subject has one', () =
       // Domain rule for same client — should NOT be disabled (different type)
       rule({
         type: 'domain',
-        signal: 'court.gov.tw',
+        signal: 'court.example',
         targetFolderPath: '03/民事/未分類',
         source: 'auto_scan',
       }),
     ])
     const item = planItem({
       emailSubject: '25A0067A 開庭通知',
-      emailFrom: 'court@court.gov.tw',
+      emailFrom: 'court@court.example',
       action: 'move',
       targetFolderPath: '03/民事/X 案',
       aiOriginalAction: 'move',
@@ -124,7 +124,7 @@ describe('AI generators prefer case_code over domain when subject has one', () =
     const rules = await listRules()
     const caseRule = rules.find((x) => x.type === 'case_code' && x.signal === '25A0067A' && x.targetFolderPath === '03/民事/未分類')
     expect(caseRule?.enabled).toBe(false) // disabled
-    const domainRule = rules.find((x) => x.type === 'domain' && x.signal === 'court.gov.tw')
+    const domainRule = rules.find((x) => x.type === 'domain' && x.signal === 'court.example')
     expect(domainRule?.enabled).toBe(true) // untouched — different type
   })
 

@@ -637,7 +637,7 @@ export type RuleEvent =
  */
 export type RuleTombstone = {
   type: RuleType
-  /** Lowercased and stripped (e.g. `@kgi.com` → `kgi.com`). */
+  /** Lowercased and stripped (e.g. `@company-a.example` → `company-a.example`). */
   signalNorm: string
   targetFolderPath: string
   deletedAt: number

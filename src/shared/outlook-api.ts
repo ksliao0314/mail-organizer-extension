@@ -294,8 +294,8 @@ export class OutlookApi {
       /**
        * Optional OData $filter expression — server-side pre-filter so
        * we don't pull (and pay for) emails we don't need. Examples:
-       *   - `endswith(from/emailAddress/address, '@dazn.com')`
-       *   - `from/emailAddress/address eq 'support@dazn.com'`
+       *   - `endswith(from/emailAddress/address, '@company-b.example')`
+       *   - `from/emailAddress/address eq 'support@company-b.example'`
        *
        * Kept generic — the auto-conflict-resolver that previously
        * consumed this was removed in 2026-05-27 (learning-time conflict

@@ -1030,7 +1030,7 @@ export function reconcileRulesAgainstTree(
 
 // More-specific rules win. Compound has multiple AND-conditions, so it's
 // strictly more specific than any single-condition type. Without this,
-// "domain dazn.com → A" would match before "domain dazn.com AND subject k → B"
+// "domain company-b.example → A" would match before "domain company-b.example AND subject k → B"
 // — the conflict-split feature wouldn't actually do anything useful.
 //
 // This map is the SINGLE SOURCE OF TRUTH for type ordering. It controls:
@@ -1579,7 +1579,7 @@ const MIN_SUBJECT_SIGNAL_LEN = 2
  *
  * Returns the same form `normalizeSubject` produces (reply/forward
  * prefixes stripped, lowercased, whitespace collapsed) so:
- *   - "Re: 關於凱基證券股權移轉案" → "關於凱基證券股權移轉案"
+ *   - "Re: 關於甲公司股權移轉案" → "關於甲公司股權移轉案"
  *   - "FW: [External] Project Phoenix" → "project phoenix"
  *   - "Re: Re: 通知" → "通知"
  *

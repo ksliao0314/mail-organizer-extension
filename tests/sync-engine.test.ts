@@ -625,7 +625,7 @@ describe('folderActivity sync (v2 schema)', () => {
       [
         {
           folderId: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLWFhYWE=',
-          folderPath: '案件/foodpanda',
+          folderPath: '案件/vendor',
           count: 3,
           latestMessage: {
             subject: '第一次答辯狀',
