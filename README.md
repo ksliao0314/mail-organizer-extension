@@ -1,5 +1,7 @@
 # Mail Organizer
 
+[![CI](https://github.com/ksliao0314/mail-organizer-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/ksliao0314/mail-organizer-extension/actions/workflows/ci.yml)
+
 Chrome MV3 擴充工具:讀取 Outlook 網頁版收件夾、用「既有規則 + Claude AI」把每封信歸類到對應資料夾。
 
 設計鎖定的是「長時間、高郵件量」的工作流程——例如每天 50–100 封進的律師事務所、財務團隊、客服信箱。AI 不是唯一決策來源:規則命中為主、AI 補位、使用者每次的修正都會被學成新規則。
