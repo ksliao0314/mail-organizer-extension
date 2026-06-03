@@ -34,6 +34,7 @@ import {
 } from '@/shared/rules'
 import {
   addFolderToCache,
+  addToRecentlyProcessed,
   addToSkipHistory,
   bumpMetrics,
   clearUndoSnapshot,
@@ -402,6 +403,32 @@ export async function startExecute(
         await bumpRuleHits(ruleHitTally)
       } catch (e) {
         console.warn('[mail-organizer] bumpRuleHits flush failed (non-fatal)', e)
+      }
+    }
+    // Record the emails we actually moved/deleted into the recently-
+    // processed ledger so the NEXT batch's inbox fetch filters them out.
+    // Outlook's store is eventually consistent: for a short window after a
+    // move/delete the inbox listing can still return the just-handled email
+    // with its now-dead id, and the next batch would try to re-move it and
+    // hit 404 ErrorItemNotFound — which is exactly the "already-moved
+    // emails reappear in the continue list" bug. We record only DEFINITE
+    // outcomes (moved / deleted / folder_created); `skipped` (incl. the
+    // uncertain-network soft-skip) is left out so a genuinely-unmoved
+    // email can still be retried next batch.
+    const processedIds = state.results
+      .filter(
+        (r) =>
+          r.status === 'moved' ||
+          r.status === 'deleted' ||
+          r.status === 'folder_created',
+      )
+      .map((r) => r.emailId)
+      .filter(Boolean)
+    if (processedIds.length > 0) {
+      try {
+        await addToRecentlyProcessed(processedIds)
+      } catch (e) {
+        console.warn('[mail-organizer] addToRecentlyProcessed failed (non-fatal)', e)
       }
     }
     // Flush thread memory — conversation + normalized subject.

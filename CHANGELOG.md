@@ -40,6 +40,31 @@
 
 ---
 
+## 2026-06-03 — 根因修復:已移動的信不再出現在下一批(Outlook 最終一致性)
+
+### 問題
+
+批次歸類完成後按「繼續歸類」,下一批清單裡會出現**剛才已經移動的信**,執行時整排顯示「訊息已不在原位置」。2026-06-02 的 retry 修復只處理了症狀(404 → 軟跳過),沒處理源頭。
+
+### 根因
+
+**Outlook 的訊息儲存是最終一致(eventually consistent)**。一封信被 move/delete 後,它已離開收件匣(並拿到新 id),但 `listInboxMessages` 在接下來幾秒〜一兩分鐘內,仍可能把這封信用**舊 id** 列回來。下一批抓到這個舊 id、嘗試 move → Outlook 回 404 `ErrorItemNotFound`。
+
+### 修復:recentlyProcessed 帳本(client-side 過濾)
+
+- 新增 storage 帳本 `recentlyProcessed`(`emailId → 時間戳`,TTL 15 分鐘、cap 2000)— 只需撐過 Outlook 傳播延遲,不需跨 session
+- `execute.ts`:批次結束時把**確定** moved / deleted / folder_created 的 emailId 寫進帳本(`skipped`/uncertain 軟跳過**不**記,讓真的沒搬動的信下批還能重試)
+- `service-worker.ts`:`classifyPreflight` 與 `peekNextBatch` 兩個 inbox 抓取點,都用 `getRecentlyProcessedIds()` 把帳本內的 id 連同 skipHistory 一起濾掉 — 已處理的信在進 plan 之前就被剔除,prefetch / pipeline 模式自動受惠(走同一個 preflight handler)
+- 與 skipHistory 區隔:skipHistory = 使用者**刻意保留**在收件匣(濾 60 天);recentlyProcessed = 我們**剛搬走**(濾 15 分鐘)
+
+### 新增測試
+
+- `tests/recently-processed.test.ts`(7 tests):記錄 / 讀取、忽略空 id、idempotent、TTL 過期剔除、新舊條目並存、re-touch 延長 TTL
+
+測試總數:**423 tests across 25 files**。
+
+---
+
 ## 2026-06-02 — 非冪等 POST retry 修復 + 404-as-skipped
 
 ### 根因

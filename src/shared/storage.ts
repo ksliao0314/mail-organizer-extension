@@ -5,6 +5,8 @@ import {
   FOLDER_ACTIVITY_MAX_AGE_MS,
   LOCAL_STORAGE_QUOTA_BYTES,
   LOCAL_STORAGE_WARN_THRESHOLD,
+  RECENTLY_PROCESSED_CAP,
+  RECENTLY_PROCESSED_TTL_MS,
   RULE_HISTORY_CAP,
   SKIP_HISTORY_CAP,
   SKIP_HISTORY_TTL_MS,
@@ -41,6 +43,7 @@ const KEY_FOLDER_ACTIVITY = 'folderActivity'
 const KEY_WEEKLY_DIGEST = 'weeklyDigest'
 const KEY_CONVERSATION_MEMORY = 'conversationMemory'
 const KEY_SUBJECT_MEMORY = 'subjectMemory'
+const KEY_RECENTLY_PROCESSED = 'recentlyProcessed'
 
 // FOLDER_ACTIVITY_CAP / FOLDER_ACTIVITY_MAX_AGE_MS / TOMBSTONE_CAP /
 // RULE_HISTORY_CAP: see src/shared/constants.ts.
@@ -298,6 +301,7 @@ const withMetricsLock = createWriteMutex()
 const withTombstoneLock = createWriteMutex()
 const withConversationMemoryLock = createWriteMutex()
 const withSubjectMemoryLock = createWriteMutex()
+const withRecentlyProcessedLock = createWriteMutex()
 // F11 (2026-06-03): the rule-history audit log did an unserialized
 // read-append-write. Callers invoke recordRuleEvents AFTER their
 // mutateRules critical section has released (so the rules lock doesn't
@@ -428,6 +432,76 @@ export async function clearSkipHistory(): Promise<number> {
 export async function getSkipHistoryCount(): Promise<number> {
   const existing = await getSkipHistory()
   return Object.keys(existing).length
+}
+
+// ---- Recently-processed ledger --------------------------------------------
+//
+// emailId → unix-ms when we successfully moved / deleted it. Used to
+// pre-filter the NEXT batch's inbox fetch so an email we just handled
+// can't reappear via Outlook's read-after-write lag (its now-dead id
+// would 404 on the re-move). Distinct from skipHistory:
+//   - skipHistory  = user DELIBERATELY kept it in inbox → exclude 60 days
+//   - recentlyProcessed = we MOVED/DELETED it → exclude ~15 min (just
+//     long enough to outlast Outlook propagation; after that it's
+//     genuinely gone from inbox and won't be re-listed anyway)
+
+/** Map of emailId → unix-ms recorded when moved/deleted. */
+export type RecentlyProcessed = Record<string, number>
+
+function pruneRecentlyProcessed(rec: RecentlyProcessed): RecentlyProcessed {
+  const cutoff = Date.now() - RECENTLY_PROCESSED_TTL_MS
+  const fresh: Array<[string, number]> = []
+  for (const [id, ts] of Object.entries(rec)) {
+    if (typeof ts === 'number' && ts >= cutoff) fresh.push([id, ts])
+  }
+  if (fresh.length > RECENTLY_PROCESSED_CAP) {
+    fresh.sort((a, b) => b[1] - a[1]) // newest first
+    fresh.length = RECENTLY_PROCESSED_CAP
+  }
+  return Object.fromEntries(fresh)
+}
+
+export async function getRecentlyProcessed(): Promise<RecentlyProcessed> {
+  const stored = await chrome.storage.local.get(KEY_RECENTLY_PROCESSED)
+  return (stored[KEY_RECENTLY_PROCESSED] as RecentlyProcessed | undefined) ?? {}
+}
+
+/**
+ * Returns the set of email IDs processed within the TTL window (TTL-pruned
+ * on read so callers always get a current view). Cheap helper for the
+ * inbox-filter call sites.
+ */
+export async function getRecentlyProcessedIds(): Promise<Set<string>> {
+  const rec = await getRecentlyProcessed()
+  const cutoff = Date.now() - RECENTLY_PROCESSED_TTL_MS
+  const ids = new Set<string>()
+  for (const [id, ts] of Object.entries(rec)) {
+    if (typeof ts === 'number' && ts >= cutoff) ids.add(id)
+  }
+  return ids
+}
+
+/** Record email IDs we just moved/deleted. Idempotent on duplicates. */
+export async function addToRecentlyProcessed(emailIds: string[]): Promise<void> {
+  if (emailIds.length === 0) return
+  await withRecentlyProcessedLock(async () => {
+    const existing = await getRecentlyProcessed()
+    const now = Date.now()
+    let changed = false
+    for (const id of emailIds) {
+      if (!id) continue
+      // Always refresh the timestamp — re-touching an id extends its
+      // exclusion window, which is the desired behaviour if it somehow
+      // gets re-processed.
+      existing[id] = now
+      changed = true
+    }
+    if (changed) {
+      await chrome.storage.local.set({
+        [KEY_RECENTLY_PROCESSED]: pruneRecentlyProcessed(existing),
+      })
+    }
+  })
 }
 
 // ---- Rule tombstones -------------------------------------------------------

@@ -80,6 +80,17 @@ export const ERROR_LOG_CAP = 200
 export const SKIP_HISTORY_TTL_MS = 60 * 24 * 60 * 60 * 1000 // 60 days
 export const SKIP_HISTORY_CAP = 5000
 
+// recentlyProcessed: emails we just moved / deleted in a batch, excluded
+// from the NEXT batch's candidate list. Outlook's message store is
+// eventually consistent — for a short window after a move/delete the
+// inbox listing can still return the just-handled email (with its now-
+// dead id), so the next batch tries to re-move it and gets a 404
+// ErrorItemNotFound. This ledger filters those out client-side. Short
+// TTL: it only needs to outlive Outlook's propagation lag (seconds to a
+// minute or two in practice), not user sessions.
+export const RECENTLY_PROCESSED_TTL_MS = 15 * 60 * 1000 // 15 min
+export const RECENTLY_PROCESSED_CAP = 2000
+
 /** Recent-activity panel data store cap. */
 export const FOLDER_ACTIVITY_CAP = 200
 /** Retention for folderActivity entries. */

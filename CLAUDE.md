@@ -357,6 +357,7 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 - **REDESIGN_CUTOFF_ISO = '2026-05-27T00:00:00.000Z'** — `isLegacyTokenSubjectRule` 用這個分界線辨識舊 tokenize 路徑生的規則
 - **非冪等 retry 是禁忌** — `outlook-api.ts:request()` 對 POST / DELETE / PATCH **不** retry 網路錯誤 + 5xx,只 retry 429。若硬把這條規則破掉,POST `/move` 第一次成功但 response 掉了的場景會在重試時 404、UI 顯示成失敗、使用者誤以為訊息沒搬走。`OutlookError.uncertain = true` 是給這類「可能成功」case 用的 marker
 - **404 ErrorItemNotFound on move/delete = soft skip,不是 error** — `executeItem` 用 `isAlreadyMovedError(e)` helper 偵測、回傳 `status: 'skipped'`。原因:訊息已不在那個 Id(可能我們上一次 POST 其實成功了、或被其他規則 / 帳號處理過)。重試只會再 404
+- **Outlook 收件匣列表是最終一致 → 用 recentlyProcessed 帳本過濾** — move/delete 後幾秒〜一兩分鐘內,`listInboxMessages` 仍可能用舊 id 列回剛搬走的信。`execute.ts` 批次結束記下 moved/deleted/folder_created 的 emailId 進 `recentlyProcessed`(TTL 15 分、`storage.ts`),`classifyPreflight` + `peekNextBatch` 抓 inbox 時用 `getRecentlyProcessedIds()` 連同 skipHistory 一起濾掉。這是「已移動的信出現在下一批」的根因修復;404 軟跳過只是症狀防護。**uncertain 軟跳過的信不記帳本**(讓真沒搬動的能重試)
 
 ---
 

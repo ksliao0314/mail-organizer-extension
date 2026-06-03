@@ -97,6 +97,7 @@ import {
   getFolderActivityRefreshAt,
   getFolderCache,
   getMetrics,
+  getRecentlyProcessedIds,
   getRuleEvents,
   getRuleTombstones,
   getSettings,
@@ -858,17 +859,23 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         const settings = await getSettings()
         const batchSize =
           typeof msg.batchSize === 'number' ? msg.batchSize : settings.batchSize
-        const [rawEmails, skipHistory] = await Promise.all([
+        const [rawEmails, skipHistory, recentlyProcessed] = await Promise.all([
           api.listInboxMessages({
             top: batchSize,
             // Id for skip-history match, Flag for skipFlagged filter — that's all.
             select: 'Id,Flag',
           }),
           getSkipHistory(),
+          getRecentlyProcessedIds(),
         ])
         const skipIds = new Set(Object.keys(skipHistory))
-        const afterSkipHistory =
-          skipIds.size > 0 ? rawEmails.filter((m) => !skipIds.has(m.Id)) : rawEmails
+        // Exclude both user-skipped (skipHistory) AND just-moved/deleted
+        // (recentlyProcessed) so the peek count matches what classify will
+        // actually act on — and so a just-handled email lingering in the
+        // inbox listing (Outlook lag) doesn't inflate "還有 N 封可處理".
+        const afterSkipHistory = rawEmails.filter(
+          (m) => !skipIds.has(m.Id) && !recentlyProcessed.has(m.Id),
+        )
         // Skip flagged mail is now hardcoded always-on (2026-05-27 reorg).
         // Lawyers use Outlook's follow-up flag to mark "I'm tracking this"
         // — auto-routing those was always a footgun. The UI toggle was
@@ -919,9 +926,10 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         const tree = await getOrFetchFolderTree(forceFresh)
 
         await setClassifyStage({ stage: 'fetching_inbox' })
-        const [rawEmails, skipHistory] = await Promise.all([
+        const [rawEmails, skipHistory, recentlyProcessed] = await Promise.all([
           api.listInboxMessages({ top: batchSize }),
           getSkipHistory(),
+          getRecentlyProcessedIds(),
         ])
 
         // Reconcile rule paths against the live tree before matching: if a
@@ -987,10 +995,17 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         }
 
         // Pre-filter pass 1: drop emails the user already decided to keep in
-        // inbox (skip history).
+        // inbox (skip history) OR that we just moved/deleted in a recent
+        // batch (recentlyProcessed). The latter is the root fix for
+        // "already-moved emails reappear in the continue list": Outlook's
+        // store is eventually consistent, so a just-moved email can still
+        // show up in this inbox listing with its now-dead id; acting on it
+        // would 404. Filtering by the ledger drops it before it ever enters
+        // a plan.
         const skipIds = new Set(Object.keys(skipHistory))
-        const afterSkipHistory =
-          skipIds.size > 0 ? rawEmails.filter((m) => !skipIds.has(m.Id)) : rawEmails
+        const afterSkipHistory = rawEmails.filter(
+          (m) => !skipIds.has(m.Id) && !recentlyProcessed.has(m.Id),
+        )
         const preFilteredCount = rawEmails.length - afterSkipHistory.length
 
         // Pre-filter pass 2: skip Outlook-flagged ("待處理") messages when
