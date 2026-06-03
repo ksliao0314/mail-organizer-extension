@@ -207,4 +207,8 @@ npm run lint         # eslint
 
 ## License
 
-私人使用、**不開源**(All Rights Reserved,詳見 [`LICENSE`](LICENSE))。原始碼公開僅供參考 / 作品集展示,未授權任何使用、複製、修改或散布。Issues / PRs 暫不接受。
+Copyright © 2026 ksliao0314
+
+本專案採 **GNU General Public License v3.0(或更新版本)** 授權 — 詳見 [`LICENSE`](LICENSE)。
+
+你可以自由使用、研究、修改、散布本軟體;但**散布衍生作品時必須同樣以 GPL 開源並附上原始碼**(copyleft)。軟體按「現狀」提供,不負任何擔保責任。
