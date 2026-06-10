@@ -840,6 +840,12 @@ export default function App() {
   // of starting a fresh classify. Saves the 30-60s the user would
   // otherwise wait. Falls back to the normal flow if no prefetch exists.
   async function continueToNextBatch() {
+    // Capture the just-finished execute's start time BEFORE clearing its
+    // state — this is the freshness watermark for the staleness guard
+    // below. We're called from the DoneScreen so phase is 'done'.
+    const executeStartedAt =
+      phase.kind === 'done' ? phase.state.startedAt : null
+
     // Don't clear AI progress yet — we might need to consume a prefetched
     // result. Clear other per-batch state safely.
     void send({ type: 'clearPopupState' })
@@ -848,8 +854,33 @@ export default function App() {
 
     const aiResp = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
     const prefetched = aiResp.ok ? aiResp.data : null
-    if (!prefetched) {
-      // No prefetch available — clean start.
+
+    // STALENESS GUARD (2026-06-03 — root cause of「已歸檔的信混進下一批」).
+    // Session storage still holds the AI progress of the batch we JUST
+    // executed: nothing clears it between classify-done and here
+    // (confirmExecute only clears popupState; preflight only clears it
+    // when the NEXT classify starts). Without this check, prefetch-
+    // disabled users (the default) get that residue promoted as the
+    // "next batch" — the exact same plan whose ids are all dead after
+    // the move, so every row 404s「訊息已不在原位置」. The earlier
+    // recentlyProcessed-ledger fix never fires on this path because no
+    // inbox fetch happens at all.
+    //
+    // Discriminator: the 執行 button is disabled while aiPending, so the
+    // executed cycle's classify ALWAYS finished (last progress write
+    // included) before execute began → its startedAt < execute's
+    // startedAt. A genuine DoneScreen prefetch only starts after the
+    // execute finished → its startedAt > execute's startedAt. Strictly
+    // newer ⇔ genuine prefetch; anything else gets discarded and we
+    // re-classify from a fresh inbox fetch (where the ledger filter
+    // handles Outlook's listing lag).
+    const isFreshPrefetch =
+      prefetched != null &&
+      executeStartedAt != null &&
+      typeof prefetched.startedAt === 'number' &&
+      prefetched.startedAt > executeStartedAt
+    if (!prefetched || !isFreshPrefetch) {
+      // No prefetch available (or stale residue) — clean start.
       await send({ type: 'clearAiClassifyProgress' })
       void startClassify(false)
       return

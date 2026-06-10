@@ -859,15 +859,21 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         const settings = await getSettings()
         const batchSize =
           typeof msg.batchSize === 'number' ? msg.batchSize : settings.batchSize
-        const [rawEmails, skipHistory, recentlyProcessed] = await Promise.all([
-          api.listInboxMessages({
-            top: batchSize,
-            // Id for skip-history match, Flag for skipFlagged filter — that's all.
-            select: 'Id,Flag',
-          }),
+        // Ledgers first, then over-fetch by the ghost count — mirrors the
+        // classifyPreflight compensation so the peek number predicts what
+        // classify will actually act on. Without it, a listing whose top-N
+        // is occupied by just-moved ghosts (Outlook lag) would peek as
+        // "0 封可處理" while fresh mail sits right below.
+        const [skipHistory, recentlyProcessed] = await Promise.all([
           getSkipHistory(),
           getRecentlyProcessedIds(),
         ])
+        const fetchTop = batchSize + Math.min(recentlyProcessed.size, 100)
+        const rawEmails = await api.listInboxMessages({
+          top: fetchTop,
+          // Id for skip-history match, Flag for skipFlagged filter — that's all.
+          select: 'Id,Flag',
+        })
         const skipIds = new Set(Object.keys(skipHistory))
         // Exclude both user-skipped (skipHistory) AND just-moved/deleted
         // (recentlyProcessed) so the peek count matches what classify will
@@ -887,8 +893,10 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         return {
           ok: true,
           data: {
-            eligibleCount: eligible.length,
-            cappedAtBatchSize: rawEmails.length >= batchSize,
+            // One classify run handles at most batchSize — cap the peek
+            // number to what the next batch will really take on.
+            eligibleCount: Math.min(eligible.length, batchSize),
+            cappedAtBatchSize: rawEmails.length >= fetchTop,
             totalFetched: rawEmails.length,
           },
         }
@@ -926,11 +934,18 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         const tree = await getOrFetchFolderTree(forceFresh)
 
         await setClassifyStage({ stage: 'fetching_inbox' })
-        const [rawEmails, skipHistory, recentlyProcessed] = await Promise.all([
-          api.listInboxMessages({ top: batchSize }),
+        // Read the exclusion ledgers BEFORE the fetch so we can over-ask
+        // by the number of just-processed ghosts likely still occupying
+        // the top of Outlook's (eventually-consistent) inbox listing.
+        // With a fixed top=batchSize, a fully-stale top-N would starve
+        // the batch to zero even though fresh mail sits right below.
+        // Post-filter we slice back down to batchSize.
+        const [skipHistory, recentlyProcessed] = await Promise.all([
           getSkipHistory(),
           getRecentlyProcessedIds(),
         ])
+        const fetchTop = batchSize + Math.min(recentlyProcessed.size, 100)
+        const rawEmails = await api.listInboxMessages({ top: fetchTop })
 
         // Reconcile rule paths against the live tree before matching: if a
         // folder was renamed/deleted in Outlook, update or mark orphan so
@@ -996,17 +1011,20 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
 
         // Pre-filter pass 1: drop emails the user already decided to keep in
         // inbox (skip history) OR that we just moved/deleted in a recent
-        // batch (recentlyProcessed). The latter is the root fix for
-        // "already-moved emails reappear in the continue list": Outlook's
-        // store is eventually consistent, so a just-moved email can still
-        // show up in this inbox listing with its now-dead id; acting on it
-        // would 404. Filtering by the ledger drops it before it ever enters
-        // a plan.
+        // batch (recentlyProcessed). The latter guards the fresh-fetch path
+        // against Outlook's eventual consistency: a just-moved email can
+        // still show up in this listing with its now-dead id; acting on it
+        // would 404. (The OTHER entrance of the "已歸檔的信混進下一批" bug —
+        // the popup resurrecting the executed batch's stale classify
+        // progress — is fixed in continueToNextBatch's staleness guard.)
         const skipIds = new Set(Object.keys(skipHistory))
         const afterSkipHistory = rawEmails.filter(
           (m) => !skipIds.has(m.Id) && !recentlyProcessed.has(m.Id),
         )
-        const preFilteredCount = rawEmails.length - afterSkipHistory.length
+        // Banner count = user-skipped only. Ghost drops are invisible
+        // bookkeeping; counting them would tell the user "N 件先前選擇保留"
+        // about emails they never touched.
+        const preFilteredCount = rawEmails.filter((m) => skipIds.has(m.Id)).length
 
         // Pre-filter pass 2: skip Outlook-flagged ("待處理") messages when
         // Skip flagged mail is hardcoded always-on (2026-05-27 reorg).
@@ -1016,10 +1034,17 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         // Outlook fetch above — we do NOT persist a flagged-id list. When
         // the user removes the flag in Outlook, the very next classify run
         // sees FlagStatus !== 'Flagged' and includes the email automatically.
-        const emails = afterSkipHistory.filter(
+        //
+        // Final slice keeps the batch contract (≤ batchSize) after the
+        // over-fetch compensation above.
+        const unflagged = afterSkipHistory.filter(
           (m) => m.Flag?.FlagStatus !== 'Flagged',
         )
-        const flaggedCount = afterSkipHistory.length - emails.length
+        // Count flagged explicitly — the old `afterSkipHistory.length -
+        // emails.length` subtraction would, post-slice, lump the over-fetch
+        // surplus in as "flagged".
+        const flaggedCount = afterSkipHistory.length - unflagged.length
+        const emails = unflagged.slice(0, batchSize)
 
         await setClassifyStage({ stage: 'matching_rules', total: emails.length })
         const rulePlan: PlanItem[] = []
@@ -1256,6 +1281,14 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         chunks.push(reps.slice(i, i + AI_CHUNK_SIZE))
       }
 
+      // Immutable cycle birth time. Every progress write below reuses this
+      // value — it identifies WHICH classify cycle the progress belongs to.
+      // continueToNextBatch + the clearExecuteState purge compare it
+      // against executeState.startedAt to tell a genuine post-execute
+      // prefetch apart from the executed batch's residue; rewriting it
+      // per-chunk (the old behaviour) would blur that boundary.
+      const classifyStartedAt = Date.now()
+
       // Initial progress snapshot (rulePlan + folderTree embedded so popup can
       // resume from this state alone if it reopens mid-run)
       await chrome.storage.session.set({
@@ -1267,7 +1300,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           rulePlan: pf.rulePlan,
           folderTree: pf.tree,
           aiPlan: [],
-          startedAt: Date.now(),
+          startedAt: classifyStartedAt,
           done: chunks.length === 0,
         },
       })
@@ -1403,7 +1436,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                 rulePlan: pf.rulePlan,
                 folderTree: pf.tree,
                 aiPlan,
-                startedAt: Date.now(),
+                startedAt: classifyStartedAt,
                 done: false,
               },
             })
@@ -1449,7 +1482,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
               skippedByUser: skipPlan.length,
               usage: totalUsage,
               aiError: banner,
-              startedAt: Date.now(),
+              startedAt: classifyStartedAt,
               done: true,
             },
           })
@@ -1632,6 +1665,32 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
     }
 
     case 'clearExecuteState': {
+      // Second entrance of the stale-progress bug (2026-06-03): after
+      // 完成 clears the execute state, a popup reopen's resume path
+      // finds no executeState + no popupState but DOES find the
+      // executed batch's leftover AI progress — and promotes it as a
+      // live plan, re-offering already-moved emails. Purge progress
+      // that provably belongs to the just-finished execute before
+      // dropping the state.
+      //
+      // Safe against a running DoneScreen prefetch: its progress was
+      // created AFTER this execute started (startedAt strictly newer),
+      // so the condition below never matches it. The executed cycle's
+      // own classify writer finished long before execute began (執行
+      // button is gated on aiPending), so there's no writer left to
+      // resurrect the key after removal.
+      const doneState = await getExecuteState()
+      if (doneState) {
+        const progRaw = await chrome.storage.session.get(AI_PROGRESS_KEY)
+        const prog = progRaw[AI_PROGRESS_KEY] as { startedAt?: number } | undefined
+        if (
+          prog &&
+          (typeof prog.startedAt !== 'number' ||
+            prog.startedAt <= doneState.startedAt)
+        ) {
+          await chrome.storage.session.remove([AI_PROGRESS_KEY, PREFLIGHT_CACHE_KEY])
+        }
+      }
       await clearExecuteState()
       return { ok: true }
     }

@@ -40,6 +40,31 @@
 
 ---
 
+## 2026-06-03 (二) — 真正的根因:繼續歸類復活了剛執行那批的 classify 殘留
+
+### 更正
+
+同日稍早的「Outlook 最終一致性」修復判斷錯了主因——那只是次要路徑。使用者回報修完後 bug 依舊,徹底重查後找到主因:
+
+**`continueToNextBatch`(popup)直接消費 session storage 裡的 AI classify progress,完全不檢查它屬於哪一輪。** 在 Pipeline 模式關閉(預設)時,session 裡躺著的是**剛執行完那批**的 progress(`confirmExecute` 只清 popupState;progress 要等下一次 preflight 才清),於是「繼續歸檔下一批」把同一批 plan 原封不動復活——這條路徑**根本不抓收件匣**,recentlyProcessed 帳本過濾完全沒機會生效。每個 id 都已搬走 → 整排 404「訊息已不在原位置」。這也解釋了為何症狀是 100% 幽靈而非混雜(真正的列表延遲會是混雜)。
+
+### 修復(四道)
+
+1. **新鮮度守門(主修,popup)**:`continueToNextBatch` 先在清除前捕捉 `executeState.startedAt`,只在 `progress.startedAt > execute.startedAt` 時才消費(= 真正的 DoneScreen prefetch)。判別式無漏洞:執行按鈕在 `aiPending` 時 disabled,被執行那輪的 classify 必定先寫完 → 殘留恆舊於 execute;prefetch 恆新。不新鮮 → 清掉 + 重新 classify(走有帳本過濾的 fresh fetch)。
+2. **第二入口(SW `clearExecuteState`)**:按「完成」清 execute state 前,若現存 progress 可證明屬於剛結束那輪(startedAt ≤ execute.startedAt)→ 連同 preflight cache 一併清除。堵住「完成 → 關 popup → 重開 → resume 把舊 plan 當現行 plan」的復活路徑。對進行中的 prefetch 安全(其 startedAt 較新、不會被誤刪)。
+3. **classifyAi 的 `startedAt` 改不可變**:原本每個 chunk 都重寫 `Date.now()`,語意是「最後寫入時間」;改為迴圈前取一次、全程沿用,嚴格代表「這輪 classify 何時開始」,讓上面兩個比較有明確不變量。
+4. **404 already-moved 也記入 recentlyProcessed**(execute.ts):`ItemOutcome.alreadyGone` 標記 + 批尾統一寫入。修補次要路徑的設計漏洞——幽靈信 404 → soft skip → 原本不記帳 → Outlook 延遲拖久就無限輪迴。uncertain(網路中斷)軟跳過仍**不**記,保留重試空間。
+
+### 順手補強
+
+- **補抓補償**:`classifyPreflight` / `peekNextBatch` 先讀帳本、`top = batchSize + min(幽靈數, 100)`、過濾後再裁回 batchSize——避免幽靈占滿列表頂端時批次縮水成 0;peek 數字同步封頂,banner 的「先前選擇保留」計數不再混入幽靈。
+
+### ⚠️ 升級必讀
+
+修復在 extension 端,**必須到 `chrome://extensions` 重新載入擴充**(指向新 build 的 `dist/`)才會生效。
+
+---
+
 ## 2026-06-03 — 根因修復:已移動的信不再出現在下一批(Outlook 最終一致性)
 
 ### 問題

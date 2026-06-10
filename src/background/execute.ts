@@ -85,6 +85,16 @@ type ItemOutcome = {
    * Surfaced into ExecuteItemResult.message.
    */
   message?: string
+  /**
+   * True when Outlook answered 404 ErrorItemNotFound — POSITIVE
+   * confirmation that this id is dead (already moved / deleted).
+   * Distinct from the uncertain network soft-skip (which gives no
+   * confirmation either way): already-gone ids ARE recorded into the
+   * recentlyProcessed ledger so they stop reappearing in the next
+   * batch while Outlook's inbox listing lags; uncertain ones are NOT,
+   * so a genuinely-unmoved email can still be retried.
+   */
+  alreadyGone?: boolean
 }
 
 // Re-export for backwards compatibility with existing call sites.
@@ -222,6 +232,10 @@ export async function startExecute(
   // Tally rule hits as they happen, flush once at end. Atomic write of the
   // accumulated bumps avoids 50+ sequential read-modify-write cycles.
   const ruleHitTally = new Map<string, number>()
+  // Ids that 404'd ErrorItemNotFound during this batch — provably dead,
+  // recorded into the recentlyProcessed ledger alongside the successful
+  // moves (see the post-loop write).
+  const alreadyGoneIds: string[] = []
   // Rule overrides: a rule fired at classify time but the user edited
   // the resulting PlanItem before execute (changed action / target).
   // Detected via item.source !== 'rule' but item.originalRuleId still
@@ -269,6 +283,11 @@ export async function startExecute(
           // possibly other graceful-degradation cases later).
           ...(message ? { message } : {}),
         }
+        // 404 ErrorItemNotFound = positive confirmation this id is dead.
+        // Collect for the recentlyProcessed ledger below — without this,
+        // a ghost entry that Outlook keeps listing would loop forever:
+        // 404 → soft-skip → never recorded → reappears next batch.
+        if (outcome.alreadyGone) alreadyGoneIds.push(item.emailId)
 
         if (status === 'moved') state.summary.moved++
         else if (status === 'deleted') state.summary.deleted++
@@ -415,15 +434,20 @@ export async function startExecute(
     // outcomes (moved / deleted / folder_created); `skipped` (incl. the
     // uncertain-network soft-skip) is left out so a genuinely-unmoved
     // email can still be retried next batch.
-    const processedIds = state.results
-      .filter(
-        (r) =>
-          r.status === 'moved' ||
-          r.status === 'deleted' ||
-          r.status === 'folder_created',
-      )
-      .map((r) => r.emailId)
-      .filter(Boolean)
+    const processedIds = [
+      ...state.results
+        .filter(
+          (r) =>
+            r.status === 'moved' ||
+            r.status === 'deleted' ||
+            r.status === 'folder_created',
+        )
+        .map((r) => r.emailId),
+      // Plus ids Outlook confirmed dead via 404 this batch (already
+      // moved/deleted earlier) — re-recording refreshes their TTL so a
+      // long-lagging listing keeps them excluded round after round.
+      ...alreadyGoneIds,
+    ].filter(Boolean)
     if (processedIds.length > 0) {
       try {
         await addToRecentlyProcessed(processedIds)
@@ -633,7 +657,7 @@ async function executeItem(
         // Delete target gone = deletion's already done by something
         // else (or by an earlier lost-response delete from us). Soft
         // success — don't surface as red error.
-        return { status: 'skipped', message: ALREADY_MOVED_MESSAGE }
+        return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
       }
       throw e
     }
@@ -652,7 +676,7 @@ async function executeItem(
       }
     } catch (e) {
       if (isAlreadyMovedError(e)) {
-        return { status: 'skipped', message: ALREADY_MOVED_MESSAGE }
+        return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
       }
       throw e
     }
@@ -684,7 +708,7 @@ async function executeItem(
         }
       } catch (e) {
         if (isAlreadyMovedError(e)) {
-          return { status: 'skipped', message: ALREADY_MOVED_MESSAGE }
+          return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
         }
         throw e
       }
@@ -740,6 +764,7 @@ async function executeItem(
         return {
           status: 'skipped',
           message: ALREADY_MOVED_MESSAGE,
+          alreadyGone: true,
           // Keep the folder we created visible to downstream code (so
           // sibling items in the same batch can use it as a target via
           // the spliced-into-tree path lookup).
