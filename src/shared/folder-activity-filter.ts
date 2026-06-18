@@ -5,6 +5,7 @@
 // defaults). Now: empty = no filter = show everything.
 
 import type { FolderActivity } from './types'
+import { encodeFolderName } from './outlook-api'
 
 /**
  * Filter folder activity rows for the IdleScreen panel.
@@ -17,6 +18,13 @@ import type { FolderActivity } from './types'
  *   - Either non-empty → return rows where path starts with any
  *     prefix OR leaf segment matches any leafName.
  *
+ * Leaf-name matching: `row.folderPath` is built with `joinFolderPath`, which
+ * runs each segment through `encodeFolderName` (a literal '/' inside a folder
+ * name becomes '／'). The Options UI stores leaf names as the raw
+ * `node.displayName`, so a folder whose name contains '/' (e.g. "2024/Q1")
+ * would never match a path segment unless we encode the allowlist the same
+ * way. We encode both sides here so the comparison is apples-to-apples.
+ *
  * Pure function; trivially test-able.
  */
 export function filterFolderActivity(
@@ -27,6 +35,8 @@ export function filterFolderActivity(
   if (prefixes.length === 0 && leafNames.size === 0) {
     return rows.slice() // copy to avoid caller-side mutation surprises
   }
+  const encodedLeafNames =
+    leafNames.size > 0 ? new Set([...leafNames].map(encodeFolderName)) : leafNames
   return rows.filter((row) => {
     for (const p of prefixes) {
       if (!p) continue
@@ -45,10 +55,10 @@ export function filterFolderActivity(
         }
       }
     }
-    if (leafNames.size > 0) {
+    if (encodedLeafNames.size > 0) {
       const segments = row.folderPath.split('/').filter(Boolean)
       const leaf = segments[segments.length - 1]
-      if (leaf && leafNames.has(leaf)) return true
+      if (leaf && encodedLeafNames.has(leaf)) return true
     }
     return false
   })

@@ -1341,7 +1341,16 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                 settings,
               )
               if (result.truncated) {
-                truncatedCount += chunks[ci]!.length - result.truncated.parsedCount
+                // Audit: floor at 0. parsedCount is the PRE-dedup raw action
+                // count, so a max_tokens response whose salvaged prefix
+                // repeats an emailIndex (a documented model glitch) can make
+                // this term negative — and a negative term would cancel a
+                // sibling chunk's real positive, silently suppressing the
+                // "部分 chunk 觸頂截斷" warning even though emails WERE cut.
+                truncatedCount += Math.max(
+                  0,
+                  chunks[ci]!.length - result.truncated.parsedCount,
+                )
               }
               const chunkPlan = result.plan.map((p) => {
                 if (p.action !== 'skip' && p.source === 'ai' && p.confidence < threshold) {

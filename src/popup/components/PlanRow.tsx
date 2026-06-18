@@ -170,19 +170,27 @@ export function PlanRow({
 
   // Pre-execute path validation: warn if move target or new_folder parent
   // doesn't resolve against the current tree (would error at execute time).
-  // "pending:" sentinels skip this check — they intentionally resolve at
-  // execute time once the corresponding new_folder runs.
+  //
+  // "pending:" sentinels point at a folder that a *sibling* new_folder item
+  // will create earlier in the same batch. We do NOT blanket-skip the check
+  // for them: `validPaths` is built from buildAugmentedTree, which already
+  // injects a virtual node for every live new_folder destination. So while
+  // the backing new_folder still exists the pending path IS in validPaths and
+  // the normal pathExists check passes. But if the user later changes that
+  // source row's action away from new_folder (or edits its name/parent), the
+  // virtual node disappears — the pending path is no longer in validPaths and
+  // we now (correctly) warn, instead of letting the dependent move error red
+  // at execute time with no prior heads-up.
   const targetIssue = useMemo<string | null>(() => {
     const pathExists = (p: string | undefined) => !!p && validPaths.has(p)
     if (item.action === 'move' && item.targetFolderPath) {
-      if (item.targetFolderId?.startsWith('pending:')) return null
       if (!pathExists(item.targetFolderPath)) return '目標資料夾路徑不在當前資料夾樹中、執行時會失敗'
     }
     if (item.action === 'new_folder' && item.suggestedParentPath) {
       if (!pathExists(item.suggestedParentPath)) return '父資料夾路徑不在當前資料夾樹中、無法在那建立'
     }
     return null
-  }, [item.action, item.targetFolderId, item.targetFolderPath, item.suggestedParentPath, validPaths])
+  }, [item.action, item.targetFolderPath, item.suggestedParentPath, validPaths])
 
   function setAction(action: PlanAction) {
     if (action === item.action) return

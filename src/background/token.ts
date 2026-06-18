@@ -127,11 +127,17 @@ async function doFetchToken(): Promise<TokenResult> {
 }
 
 export async function getOwaToken(opts: { force?: boolean } = {}): Promise<TokenResult> {
-  // Check in-flight refresh BEFORE any await so concurrent callers
+  // Coalesce onto an in-flight refresh BEFORE any await so concurrent callers
   // piggyback immediately instead of each issuing their own storage read.
-  // Without this, 50 simultaneous callers do 50 redundant storage.session
-  // reads before one of them notices the in-flight refresh.
-  if (!opts.force && inFlightRefresh) return inFlightRefresh
+  // This applies to force callers TOO: an in-flight refresh is already
+  // fetching a brand-new token straight from the content script (not the
+  // cache), so it is strictly fresher than whatever token triggered a forced
+  // 401-retry. Letting force callers skip this was the bug — 50 simultaneous
+  // 401s would each start their own doFetchToken and reciprocally clobber the
+  // cache, the exact storm this coalescing exists to prevent (see the
+  // inFlightRefresh comment above). `force` should bypass the *cache*, not an
+  // in-flight fetch.
+  if (inFlightRefresh) return inFlightRefresh
 
   if (!opts.force) {
     const cached = await getCached()

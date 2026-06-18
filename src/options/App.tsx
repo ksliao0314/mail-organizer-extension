@@ -488,12 +488,22 @@ export default function App() {
     setScanState(null)
   }
 
-  async function toggleRuleEnabled(rule: Rule, enabled: boolean) {
-    await send({ type: 'toggleRule', ruleId: rule.id, enabled })
+  // Returns true on success. Audit: the boolean lets bulk actions detect a
+  // backend failure (send resolves to {ok:false} without throwing), instead
+  // of counting every {ok:false} as a success and silently clearing it from
+  // the selection.
+  async function toggleRuleEnabled(rule: Rule, enabled: boolean): Promise<boolean> {
+    const r = await send({ type: 'toggleRule', ruleId: rule.id, enabled })
     void refreshRules()
+    if (!r.ok) {
+      setRuleToast({ kind: 'err', msg: `操作失敗:${r.message || r.code}`, key: Date.now() })
+    }
+    return r.ok
   }
 
-  async function deleteRule(ruleId: string) {
+  // Returns true when the rule is gone (deleted now, or already absent), false
+  // on a backend error (so a bulk delete keeps it selected for retry).
+  async function deleteRule(ruleId: string): Promise<boolean> {
     // Look up signal BEFORE the delete so the toast can name what we removed
     // — the rule is gone from `rules` after refreshRules() runs.
     const before = rules.find((r) => r.id === ruleId)
@@ -506,7 +516,7 @@ export default function App() {
     await refreshRules()
     if (!r.ok) {
       setRuleToast({ kind: 'err', msg: `刪除失敗:${r.message || r.code}`, key: Date.now() })
-      return
+      return false
     }
     if (!r.data?.deleted) {
       setRuleToast({
@@ -514,9 +524,11 @@ export default function App() {
         msg: '規則已不存在 — 可能被其他流程移除過',
         key: Date.now(),
       })
-      return
+      // The rule is gone, which is the goal — treat as success for bulk.
+      return true
     }
     setRuleToast({ kind: 'ok', msg: `已刪除 ${label}`, key: Date.now() })
+    return true
   }
 
   async function upgradeDomainRuleToCompound(rule: Rule, keyword: string) {
@@ -1632,8 +1644,8 @@ type RuleLibraryViewProps = {
   clearScan: () => Promise<void>
   requestedEditRuleId: string | null
   onEditConsumed: () => void
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
-  onDelete: (ruleId: string) => Promise<void>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
+  onDelete: (ruleId: string) => Promise<boolean>
   onCreate: (input: { type: RuleType; signal: string; targetFolderId: string; targetFolderPath: string; confidence: number }) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onResolveConflict: (ruleIds: string[], strategy: 'keep_highest' | 'disable_all') => Promise<void>
@@ -1926,8 +1938,8 @@ function DormantRulesView({
   onDelete,
 }: {
   rules: Rule[]
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
-  onDelete: (ruleId: string) => Promise<void>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
+  onDelete: (ruleId: string) => Promise<boolean>
 }) {
   const dormant = useMemo(
     () =>
@@ -2042,8 +2054,11 @@ type RuleAllViewProps = {
   rules: Rule[]
   tree: MailFolderNode[] | null
   loadTree: () => Promise<MailFolderNode[] | null>
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
-  onDelete: (ruleId: string) => Promise<void>
+  // Return true on success so bulk actions can detect a failed backend write
+  // (audit: a resolved {ok:false} must keep the item selected, not be counted
+  // as a silent success).
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
+  onDelete: (ruleId: string) => Promise<boolean>
   onCreate: (input: { type: RuleType; signal: string; targetFolderId: string; targetFolderPath: string; confidence: number }) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onAfterImport: () => void | Promise<void>
@@ -2143,6 +2158,13 @@ function RuleAllView({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape' && detailId) {
+        // If a nested ConfirmDialog (role="alertdialog") is open on top of
+        // the drawer, let *it* consume Esc (cancel the dialog) — don't tear
+        // down the whole drawer underneath it. This effect's listener is
+        // registered before the dialog's (the drawer mounts first), so
+        // without this guard our stopImmediatePropagation would fire first
+        // and close the drawer, unmounting the dialog mid-confirm.
+        if (document.querySelector('[role="alertdialog"]')) return
         // Stop the event before any outer (iframe-FAB-mode) listener
         // closes the entire Options window — Esc on a drawer should
         // dismiss the drawer, not the whole UI. See the document-level
@@ -2230,16 +2252,21 @@ function RuleAllView({
   // 4–10). Each item runs inside its own try/catch; remaining items
   // are removed from selection (the operation was attempted), failed
   // items stay selected so the user can retry.
-  async function runBulk<T>(
+  // The op resolves to `false` when the backend reported failure (send →
+  // {ok:false} without throwing) — audit fix: that must count as a failure
+  // and keep the item selected, not be silently swallowed as success. `void`
+  // / `undefined` returns still count as success (no signal = no failure).
+  async function runBulk(
     ids: string[],
-    op: (id: string) => Promise<T>,
+    op: (id: string) => Promise<boolean | void>,
   ): Promise<{ ok: number; failed: string[] }> {
     let ok = 0
     const failed: string[] = []
     for (const id of ids) {
       try {
-        await op(id)
-        ok++
+        const res = await op(id)
+        if (res === false) failed.push(id)
+        else ok++
       } catch (e) {
         console.warn('[mail-organizer] bulk action item failed', id, e)
         failed.push(id)
@@ -2254,7 +2281,10 @@ function RuleAllView({
       const ids = Array.from(selected)
       const { failed } = await runBulk(ids, async (id) => {
         const r = rules.find((x) => x.id === id)
-        if (r && r.enabled) await onToggle(r, false)
+        // No-op (already disabled / not found) is success; otherwise the
+        // backend result decides.
+        if (!r || !r.enabled) return true
+        return await onToggle(r, false)
       })
       // Clear the survivors from selection; keep failed for retry.
       setSelected(new Set(failed))
@@ -2268,7 +2298,8 @@ function RuleAllView({
       const ids = Array.from(selected)
       const { failed } = await runBulk(ids, async (id) => {
         const r = rules.find((x) => x.id === id)
-        if (r && !r.enabled) await onToggle(r, true)
+        if (!r || r.enabled) return true
+        return await onToggle(r, true)
       })
       setSelected(new Set(failed))
     } finally {
@@ -2966,7 +2997,7 @@ function RuleDetailDrawer({
   onStartEdit: () => void
   onCancelEdit: () => void
   onClose: () => void
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
   onDelete: (ruleId: string) => Promise<void>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   loadTree: () => Promise<MailFolderNode[] | null>
@@ -3461,7 +3492,7 @@ function RuleGroupedTable({
   allFilteredSelected: boolean
   onSelect: (id: string) => void
   onOpenDetail: (id: string) => void
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
 }) {
   void allRules // currently unused; reserved for future "this folder also has N hidden rules" hint
   const groups = useMemo(() => {
@@ -5367,22 +5398,36 @@ function RecentActivityFilterCard({
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
 
   async function commit(nextPrefixes: string[], nextLeaves: string[]) {
+    // In-flight guard (audit: stale-read race). `prefixes`/`leaves` come from
+    // the `status` prop, which only refreshes after send()+onSaved() finish —
+    // two async round-trips. A second add/remove fired before that refresh
+    // would rebuild its next-array from the STALE snapshot and overwrite the
+    // first write, resurrecting a just-removed pill (or dropping a just-added
+    // one). Block re-entry here, and disable the pill controls + picker while
+    // saving, so each mutation sees fresh state.
+    if (saving) return
+    setSaving(true)
     setSaveError(null)
-    const r = await send({
-      type: 'setSettings',
-      patch: {
-        recentActivityIncludePrefixes: Array.from(new Set(nextPrefixes)),
-        recentActivityIncludeLeafNames: Array.from(new Set(nextLeaves)),
-      },
-    })
-    if (r.ok) {
-      setSavedAt(Date.now())
-      await onSaved()
-      window.setTimeout(() => setSavedAt(null), 2000)
-    } else {
-      setSaveError(r.message || r.code || '儲存失敗')
+    try {
+      const r = await send({
+        type: 'setSettings',
+        patch: {
+          recentActivityIncludePrefixes: Array.from(new Set(nextPrefixes)),
+          recentActivityIncludeLeafNames: Array.from(new Set(nextLeaves)),
+        },
+      })
+      if (r.ok) {
+        setSavedAt(Date.now())
+        await onSaved()
+        window.setTimeout(() => setSavedAt(null), 2000)
+      } else {
+        setSaveError(r.message || r.code || '儲存失敗')
+      }
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -5444,7 +5489,8 @@ function RecentActivityFilterCard({
                 <button
                   type="button"
                   onClick={() => void removePrefix(p)}
-                  className="text-muted-foreground hover:text-destructive shrink-0"
+                  disabled={saving}
+                  className="text-muted-foreground hover:text-destructive shrink-0 disabled:opacity-40 disabled:pointer-events-none"
                   aria-label={`移除 ${p}`}
                 >
                   <X className="size-3.5" />
@@ -5469,7 +5515,8 @@ function RecentActivityFilterCard({
                 <button
                   type="button"
                   onClick={() => void removeLeaf(l)}
-                  className="text-muted-foreground hover:text-destructive shrink-0"
+                  disabled={saving}
+                  className="text-muted-foreground hover:text-destructive shrink-0 disabled:opacity-40 disabled:pointer-events-none"
                   aria-label={`移除 ${l}`}
                 >
                   <X className="size-3.5" />
@@ -5497,7 +5544,9 @@ function RecentActivityFilterCard({
             {tree && tree.length > 0 ? (
               <FolderPicker
                 tree={tree}
-                onSelect={(node) => void addPrefix(node)}
+                onSelect={(node) => {
+                  if (!saving) void addPrefix(node)
+                }}
                 placeholder="搜尋或點選資料夾…"
               />
             ) : (
@@ -5528,7 +5577,9 @@ function RecentActivityFilterCard({
             {tree && tree.length > 0 ? (
               <FolderPicker
                 tree={tree}
-                onSelect={(node) => void addLeaf(node)}
+                onSelect={(node) => {
+                  if (!saving) void addLeaf(node)
+                }}
                 placeholder="搜尋或點選資料夾…"
               />
             ) : (
@@ -5543,7 +5594,7 @@ function RecentActivityFilterCard({
               size="sm"
               variant="outline"
               onClick={() => setAdding('prefix')}
-              disabled={!tree || tree.length === 0}
+              disabled={!tree || tree.length === 0 || saving}
             >
               <Plus className="size-3.5" />
               新增資料夾(含子資料夾)
@@ -5552,7 +5603,7 @@ function RecentActivityFilterCard({
               size="sm"
               variant="outline"
               onClick={() => setAdding('leaf')}
-              disabled={!tree || tree.length === 0}
+              disabled={!tree || tree.length === 0 || saving}
             >
               <Plus className="size-3.5" />
               新增葉節點名稱
@@ -5727,8 +5778,8 @@ function RuleHealthSection({
   onEdit,
 }: {
   rules: Rule[]
-  onToggle: (rule: Rule, enabled: boolean) => Promise<void>
-  onDelete: (ruleId: string) => Promise<void>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
+  onDelete: (ruleId: string) => Promise<boolean>
   /** Jump to Rules section and open the editor on this rule. */
   onEdit: (ruleId: string) => void
 }) {

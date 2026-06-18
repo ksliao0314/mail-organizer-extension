@@ -142,6 +142,28 @@ export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; 
   })
   const stuck = errorCount + cancelledCount
 
+  // Audit G4: the per-batch recentlyProcessed flush runs ONLY after the item
+  // loop completes (in startExecute). If the SW was idle-killed mid-batch,
+  // the emails that DID move/delete before the death were persisted into
+  // state.results (saved each iteration) but never reached the ledger — so
+  // within Outlook's eventual-consistency window the next batch's inbox
+  // listing can still return them with now-dead ids and re-process them →
+  // 404 ghost loop. Replay the ledger from the rows that actually completed.
+  const recoveredProcessedIds = state.results
+    .filter(
+      (r) =>
+        r.status === 'moved' ||
+        r.status === 'deleted' ||
+        r.status === 'folder_created',
+    )
+    .map((r) => r.emailId)
+    .filter(Boolean)
+  if (recoveredProcessedIds.length > 0) {
+    await addToRecentlyProcessed(recoveredProcessedIds).catch((e) =>
+      console.warn('[mail-organizer] recovery recentlyProcessed replay failed (non-fatal)', e),
+    )
+  }
+
   await saveExecuteState({
     ...state,
     inProgress: false,
@@ -505,8 +527,19 @@ export async function startExecute(
 
     // Remember which emails the user chose to keep in inbox — next classify
     // pass auto-excludes them so they don't show up again to be re-decided.
+    //
+    // CRITICAL (audit G1): gate on the plan item's action === 'skip', NOT
+    // just status === 'skipped'. 'skipped' is overloaded: it also covers the
+    // uncertain-network soft-skip (execute.ts catch) and the 404 alreadyGone
+    // soft-skip. Those must NOT land in skipHistory's 60-day suppression — an
+    // uncertain move may have genuinely failed (email still in inbox), and
+    // its own row message promises "下次歸類會再處理". Only a deliberate
+    // action==='skip' is a real "user kept this in inbox" signal. (The dead
+    // ids are already handled by the 15-min recentlyProcessed ledger.)
+    // state.results is index-aligned with plan (initialState maps plan→results
+    // in order; the loop writes state.results[i]).
     const skippedIds = state.results
-      .filter((r) => r.status === 'skipped')
+      .filter((r, i) => r.status === 'skipped' && plan[i]?.action === 'skip')
       .map((r) => r.emailId)
       .filter((id) => id)
     if (skippedIds.length > 0) {

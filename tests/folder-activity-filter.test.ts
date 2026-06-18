@@ -103,6 +103,26 @@ describe('filterFolderActivity', () => {
       // No rows END with "Inbox", so nothing should match.
       expect(out).toEqual([])
     })
+
+    // ---- Regression: leaf name containing a literal "/" -------------------
+    //
+    // folderPath segments are built with joinFolderPath, which runs each
+    // name through encodeFolderName ("/" → "／"). The Options UI stores the
+    // leaf as the raw node.displayName, so a folder literally named "2024/Q1"
+    // is stored as "2024/Q1" but appears in the path as "2024／Q1". Before
+    // the fix the matcher compared the raw allowlist entry against the
+    // encoded segment and never matched. filterFolderActivity now encodes
+    // the allowlist the same way.
+    it('matches a leaf name containing a literal slash (encode both sides)', () => {
+      const rows: FolderActivity[] = [
+        // segment is the encoded form (full-width slash) as it would be in a
+        // real path produced by joinFolderPath.
+        row('Inbox/Sub/2024／Q1'),
+        row('Inbox/Sub/2024／Q2'),
+      ]
+      const out = filterFolderActivity(rows, [], new Set(['2024/Q1']))
+      expect(out.map((r) => r.folderPath)).toEqual(['Inbox/Sub/2024／Q1'])
+    })
   })
 
   describe('combined filters (union semantics)', () => {

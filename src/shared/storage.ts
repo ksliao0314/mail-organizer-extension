@@ -72,21 +72,22 @@ export async function getRules(): Promise<Rule[]> {
   const rules: Rule[] = stored[KEY_RULES] ?? []
 
   // Auto-heal: prior versions saved `pending:` sentinels and other invalid
-  // IDs into rules. Lazily clean them on read so existing users get fixed
-  // without manual action. Persist back only if anything actually changed.
-  let dirty = false
-  const cleaned = rules.map((r) => {
+  // IDs into rules. Clean them IN-MEMORY on every read so all consumers
+  // (matching, UI, export) see valid ids.
+  //
+  // Audit (rules/getRules): we deliberately do NOT persist the cleaned array
+  // here. A bare chrome.storage.local.set would escape the rules mutex
+  // (writeChain in rules.ts) — the only invariant every rule writer relies on
+  // — and a concurrent bumpRuleHits/upsert/reconcile that read pre-clean
+  // could clobber it (or be clobbered), silently losing a finished batch's
+  // hit/confidence bumps. Storage self-heals on the next mutateRules write
+  // (which always persists the cleaned form); until then reads stay clean and
+  // routing is unaffected. Cleaning is idempotent + cheap, so re-cleaning per
+  // read is fine and there is no write loop.
+  return rules.map((r) => {
     const next = sanitizeStoredFolderId(r.targetFolderId)
-    if (next !== r.targetFolderId) {
-      dirty = true
-      return { ...r, targetFolderId: next }
-    }
-    return r
+    return next !== r.targetFolderId ? { ...r, targetFolderId: next } : r
   })
-  if (dirty) {
-    await chrome.storage.local.set({ [KEY_RULES]: cleaned })
-  }
-  return cleaned
 }
 
 export async function setRules(rules: Rule[]): Promise<void> {
@@ -196,15 +197,20 @@ const ALLOWED_SETTINGS_KEYS: ReadonlySet<keyof Settings> = new Set([
   'onboardingDismissed',
 ])
 
-export async function getSettings(): Promise<Settings> {
+/**
+ * PURE read + in-memory migration/sanitize — never writes storage. Shared by
+ * getSettings (which persists the result under the lock when dirty) and
+ * setSettings (which must read fresh INSIDE its own lock; calling the public
+ * getSettings there would re-enter withSettingsLock and deadlock the chain).
+ */
+async function readAndMigrateSettings(): Promise<{ cleaned: Settings; dirty: boolean }> {
   const stored = await chrome.storage.local.get(KEY_SETTINGS)
   const raw = (stored[KEY_SETTINGS] ?? {}) as Record<string, unknown>
-  // Migration (G1 generification, 2026-05-22): existing users — those
-  // with ANY prior settings in storage but no `internalDomains` field —
-  // get the previously-hardcoded values backfilled. Fresh installs (raw
-  // is `{}`) skip backfill and land on empty defaults, which triggers
-  // the onboarding banner in the popup. Once the field exists in raw,
-  // this branch is a no-op forever.
+  // Migration (G1 generification, 2026-05-22): existing users — those with
+  // ANY prior settings in storage but no `internalDomains` field — get the
+  // previously-hardcoded values backfilled. Fresh installs (raw is `{}`) skip
+  // backfill and land on empty defaults, which triggers the onboarding
+  // banner. Once the field exists in raw, this branch is a no-op forever.
   let migrated = false
   if (Object.keys(raw).length > 0 && !('internalDomains' in raw)) {
     raw.internalDomains = ['example.com']
@@ -213,22 +219,36 @@ export async function getSettings(): Promise<Settings> {
     migrated = true
   }
   const cleaned = sanitizeSettings(raw)
-  // Persist back if storage had legacy fields, so the diagnostic export
-  // (and any other dump) stops surfacing them — OR if we just backfilled
-  // the migration, so the next read is fast and the values appear in
-  // the options UI as the current canonical values.
   const hasExtraKeys = Object.keys(raw).some(
     (k) => !ALLOWED_SETTINGS_KEYS.has(k as keyof Settings),
   )
-  if (hasExtraKeys || migrated) {
-    await chrome.storage.local.set({ [KEY_SETTINGS]: cleaned })
-  }
-  return cleaned
+  return { cleaned, dirty: hasExtraKeys || migrated }
+}
+
+export async function getSettings(): Promise<Settings> {
+  const { cleaned, dirty } = await readAndMigrateSettings()
+  if (!dirty) return cleaned
+  // Audit G5: persist the one-time migration / legacy-key cleanup UNDER the
+  // settings lock so the write-back can't clobber (or be clobbered by) a
+  // concurrent setSettings RMW — the bare write-back used to race
+  // setSettings({lastSyncAt}) and silently revert it. Re-read fresh inside
+  // the lock in case a setSettings already cleaned+patched while we were
+  // computing. Self-terminating: after this lands, future reads see clean
+  // state (dirty=false) and take the lock-free fast path above.
+  return withSettingsLock(async () => {
+    const fresh = await readAndMigrateSettings()
+    if (fresh.dirty) {
+      await chrome.storage.local.set({ [KEY_SETTINGS]: fresh.cleaned })
+    }
+    return fresh.cleaned
+  })
 }
 
 export async function setSettings(patch: Partial<Settings>): Promise<Settings> {
   return withSettingsLock(async () => {
-    const next = { ...(await getSettings()), ...patch }
+    // Use the PURE reader, not getSettings(), to avoid re-entering the lock.
+    const { cleaned } = await readAndMigrateSettings()
+    const next = { ...cleaned, ...patch }
     await chrome.storage.local.set({ [KEY_SETTINGS]: next })
     return next
   })
@@ -606,7 +626,13 @@ export async function recordRuleEvents(events: RuleEvent[]): Promise<void> {
 }
 
 export async function clearRuleHistory(): Promise<void> {
-  await chrome.storage.local.remove(KEY_RULE_HISTORY)
+  // Audit G2: take withHistoryLock so a clean-slate wipe can't land between a
+  // concurrent recordRuleEvents's read and its write — otherwise the append's
+  // set() re-materializes the log we just cleared. Mirrors clearSkipHistory /
+  // clearAllRuleTombstones, which already hold their locks.
+  await withHistoryLock(async () => {
+    await chrome.storage.local.remove(KEY_RULE_HISTORY)
+  })
 }
 
 /**
@@ -630,7 +656,18 @@ export async function clearRuleHistory(): Promise<void> {
  *     audit history.
  */
 export async function clearAllAiMemory(): Promise<void> {
-  await chrome.storage.local.remove([KEY_CONVERSATION_MEMORY, KEY_SUBJECT_MEMORY])
+  // Audit G2: take BOTH memory locks so the clear is serialized against the
+  // locked record* writers (recordConversationFilings / recordSubjectFilings).
+  // A bare remove() could land between a still-flushing batch's read and its
+  // set(), and the batch's write would re-persist the pre-clear map —
+  // resurrecting the routing memory the clean-slate wipe just deleted. Acquire
+  // them in a fixed order (conversation → subject) to avoid any future
+  // lock-ordering hazard; these two locks are never held together elsewhere.
+  await withConversationMemoryLock(async () => {
+    await withSubjectMemoryLock(async () => {
+      await chrome.storage.local.remove([KEY_CONVERSATION_MEMORY, KEY_SUBJECT_MEMORY])
+    })
+  })
 }
 
 // ---- Folder activity (recent-activity quick-jump panel) -------------------

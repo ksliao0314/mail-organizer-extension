@@ -533,11 +533,33 @@ export default function App() {
     const phaseKey = String(phase.state.startedAt)
     if (prefetchStartedRef.current === phaseKey) return
     prefetchStartedRef.current = phaseKey
+    // Capture the just-finished execute's start time while phase is narrowed
+    // to 'done' — the freshness watermark for the staleness check below.
+    const execStartedAt = phase.state.startedAt
 
     void (async () => {
-      // Don't disturb existing in-flight ai progress.
+      // Audit: the just-executed batch leaves ITS OWN (older) AI classify
+      // progress in session storage — nothing clears it between classify-done
+      // and DoneScreen mount. The old guard bailed on ANY progress, so it
+      // mistook that stale residue for a live prefetch and never started one
+      // → pipeline mode was a silent no-op on every AI batch. Only bail when
+      // the progress is strictly NEWER than the execute we just finished (a
+      // genuine in-flight/done prefetch); otherwise clear the residue and
+      // proceed. Mirrors continueToNextBatch's startedAt staleness guard.
       const existing = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
-      if (existing.ok && existing.data) return // something already running/done — leave it
+      if (
+        existing.ok &&
+        existing.data &&
+        typeof existing.data.startedAt === 'number' &&
+        existing.data.startedAt > execStartedAt
+      ) {
+        return // a genuine prefetch is already running / done — leave it
+      }
+      if (existing.ok && existing.data) {
+        // Stale residue from the batch we just executed — clear it so the
+        // resume path can't promote it and so our prefetch starts clean.
+        await send({ type: 'clearAiClassifyProgress' })
+      }
       // Headless preflight + classifyAi. Same SW handlers the foreground
       // path uses; just don't touch popup phase so DoneScreen stays put.
       const pf = await send<PreflightData>({

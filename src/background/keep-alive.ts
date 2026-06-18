@@ -49,8 +49,30 @@ export async function withKeepAlive<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
+ * Clear a keepalive alarm orphaned by a previous SW generation.
+ *
+ * `activeHolders` lives in memory and resets to 0 every time the SW is
+ * idle-killed, but `chrome.alarms` persists across generations. If the SW
+ * was killed mid-execute (before `releaseKeepAlive` ran), the alarm survives
+ * and keeps firing every ~24s forever — pointlessly waking the SW and
+ * draining battery — because no in-memory holder remains to release it, and
+ * recovery marks stale work *failed* rather than resuming it under a fresh
+ * hold. Call this once at startup, before any work can re-acquire a hold.
+ * Guarded on `activeHolders === 0` so it never clears a live alarm.
+ */
+export async function clearOrphanKeepAlive(): Promise<void> {
+  if (activeHolders > 0) return
+  try {
+    await chrome.alarms.clear(KEEPALIVE_ALARM_NAME)
+  } catch (e) {
+    console.warn('[mail-organizer] keep-alive orphan clear failed', e)
+  }
+}
+
+/**
  * Register a no-op alarm listener so the alarm event actually wakes /
- * pings the SW. Called once at module load.
+ * pings the SW. Called once at module load. Also clears any alarm orphaned
+ * by a previous SW generation (see clearOrphanKeepAlive).
  */
 export function installKeepAliveListener(): void {
   chrome.alarms.onAlarm.addListener((alarm) => {
@@ -59,4 +81,9 @@ export function installKeepAliveListener(): void {
       // (Logging here would flood the console.)
     }
   })
+  // Best-effort: drop an orphaned alarm from a prior generation. Safe because
+  // module-load recovery does not resume work under a keepalive hold, so
+  // activeHolders is still 0 here; if real work starts later it re-creates
+  // the alarm through holdKeepAlive.
+  void clearOrphanKeepAlive()
 }

@@ -833,18 +833,6 @@ async function doPush(
         k.startsWith(SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX) &&
         chunkIndex(k, SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX) >= activityChunks.length,
     )
-    if (
-      orphanRuleKeys.length > 0 ||
-      orphanTombKeys.length > 0 ||
-      orphanActivityKeys.length > 0
-    ) {
-      await chrome.storage.sync.remove([
-        ...orphanRuleKeys,
-        ...orphanTombKeys,
-        ...orphanActivityKeys,
-      ])
-    }
-
     const writes: Record<string, unknown> = {
       [SYNC_META_KEY]: meta,
       [SYNC_SETTINGS_KEY]: settingsToSync,
@@ -855,6 +843,17 @@ async function doPush(
       writes[`${SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX}${c.index}`] = c
 
     try {
+      // Audit G3: write the new meta + chunks FIRST, then remove orphans.
+      // The new meta carries a SMALLER chunk count when the library shrank;
+      // a puller only ever reads chunk indices < that count, so the orphan
+      // chunks (old indices at/after the new count) are harmless dead data
+      // once the new meta lands. Removing them BEFORE the set was a silent-
+      // data-loss hazard: if this set failed (quota/network) or the SW died
+      // in between, the OLD meta (larger count) survived in cloud while the
+      // chunks it referenced were already deleted, so a replace-mode pull on
+      // another machine read undefined chunks and dropped those rules with
+      // no tombstone. Set-first means a partial failure leaves a fully valid
+      // cloud (just some extra dead chunks).
       await chrome.storage.sync.set(writes)
     } catch (e) {
       // Quota / network errors. Surface in console + persistent error so
@@ -865,6 +864,21 @@ async function doPush(
       await recordSyncError({ source: 'push', reason: errMsg })
       await logError('sync:push', errMsg, { reason })
       return { pushed: false, reason: errMsg }
+    }
+
+    // Orphan cleanup AFTER the authoritative write — non-fatal. If it fails
+    // or the SW dies here, cloud stays valid (extra unreferenced chunks are
+    // never read); the next successful push recomputes and removes them.
+    if (
+      orphanRuleKeys.length > 0 ||
+      orphanTombKeys.length > 0 ||
+      orphanActivityKeys.length > 0
+    ) {
+      await chrome.storage.sync
+        .remove([...orphanRuleKeys, ...orphanTombKeys, ...orphanActivityKeys])
+        .catch((e) =>
+          console.warn('[mail-organizer] orphan chunk cleanup failed (non-fatal)', e),
+        )
     }
 
     await setSettings({ lastSyncAt: meta.updatedAt })

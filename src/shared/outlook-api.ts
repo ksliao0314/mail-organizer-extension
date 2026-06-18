@@ -28,13 +28,19 @@ const bucket = new TokenBucket(10, 1)
 // from stalling the user indefinitely.
 const MAX_RETRY_AFTER_MS = 60_000
 
-/** Compute backoff wait, honouring Retry-After but clamped to a sane max. */
+/** Compute backoff wait, honouring Retry-After but clamped to a sane range. */
 function computeRetryWaitMs(retryAfterHeader: string | null, attempt: number): number {
+  // Audit (retry clamp): only treat a POSITIVE parsed Retry-After as valid.
+  // A header like '-30' parses to a finite -30, which (without this guard)
+  // bypassed the exponential fallback AND survived the upper clamp as a
+  // negative wait → setTimeout fires next-tick → backoff collapses to an
+  // immediate retry burst against a server that just asked us to slow down.
   const retryAfterSec = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN
-  const base = Number.isFinite(retryAfterSec)
+  const base = Number.isFinite(retryAfterSec) && retryAfterSec > 0
     ? retryAfterSec * 1000
     : 1000 * Math.pow(3, attempt)
-  return Math.min(base, MAX_RETRY_AFTER_MS)
+  // Clamp both ends: never negative, never longer than the max.
+  return Math.min(Math.max(base, 0), MAX_RETRY_AFTER_MS)
 }
 
 const MESSAGE_SELECT_DEFAULT = [

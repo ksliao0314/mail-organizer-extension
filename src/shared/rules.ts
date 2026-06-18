@@ -841,6 +841,12 @@ export async function addRulesFilteringTombstones(
             ...e,
             enabled: true,
             autoDisabledAt: undefined,
+            // Audit: also clear autoDisabledReason to honour the types.ts
+            // contract ("Cleared along with autoDisabledAt on re-enable")
+            // and match toggleRule — otherwise the rule ends up enabled
+            // with a stale 'high-error-rate'/'legacy_token' reason that
+            // round-trips through export/sync and misreports the rule.
+            autoDisabledReason: undefined,
           })
         }
         return false
