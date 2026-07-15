@@ -5,6 +5,8 @@ import {
   FOLDER_ACTIVITY_MAX_AGE_MS,
   LOCAL_STORAGE_QUOTA_BYTES,
   LOCAL_STORAGE_WARN_THRESHOLD,
+  MOVED_BY_US_LEDGER_CAP,
+  MOVED_BY_US_LEDGER_TTL_MS,
   RECENTLY_PROCESSED_CAP,
   RECENTLY_PROCESSED_TTL_MS,
   RULE_HISTORY_CAP,
@@ -44,6 +46,7 @@ const KEY_WEEKLY_DIGEST = 'weeklyDigest'
 const KEY_CONVERSATION_MEMORY = 'conversationMemory'
 const KEY_SUBJECT_MEMORY = 'subjectMemory'
 const KEY_RECENTLY_PROCESSED = 'recentlyProcessed'
+const KEY_MOVED_BY_US_LEDGER = 'movedByUsLedger'
 const KEY_BATCH_STATS = 'batchStats'
 
 // FOLDER_ACTIVITY_CAP / FOLDER_ACTIVITY_MAX_AGE_MS / TOMBSTONE_CAP /
@@ -523,6 +526,57 @@ export async function addToRecentlyProcessed(emailIds: string[]): Promise<void> 
         [KEY_RECENTLY_PROCESSED]: pruneRecentlyProcessed(existing),
       })
     }
+  })
+}
+
+// ---- Moved-by-us ledger (harvester provenance) -----------------------------
+//
+// Records the DESTINATION-side new message id of every mail WE moved, plus its
+// conversation id / normalized subject, so the manual-filing harvester can
+// exclude our own moves (a move creates a NEW id, so recentlyProcessed's
+// source-side ids can never match what the harvester scans). Local-only, never
+// synced; weeks-long TTL since a harvest may run days after the batch.
+
+/** One mail we moved, keyed for harvester provenance exclusion. */
+export type MovedByUsEntry = {
+  newMessageId: string
+  destinationFolderId: string
+  conversationId?: string
+  normalizedSubject?: string
+  movedAt: number
+}
+
+const withMovedByUsLedgerLock = createWriteMutex()
+
+function pruneMovedByUsLedger(entries: MovedByUsEntry[]): MovedByUsEntry[] {
+  const cutoff = Date.now() - MOVED_BY_US_LEDGER_TTL_MS
+  const fresh = entries.filter((e) => typeof e.movedAt === 'number' && e.movedAt >= cutoff)
+  if (fresh.length > MOVED_BY_US_LEDGER_CAP) {
+    fresh.sort((a, b) => b.movedAt - a.movedAt) // newest first
+    fresh.length = MOVED_BY_US_LEDGER_CAP
+  }
+  return fresh
+}
+
+export async function getMovedByUsLedger(): Promise<MovedByUsEntry[]> {
+  const stored = await chrome.storage.local.get(KEY_MOVED_BY_US_LEDGER)
+  const raw = stored[KEY_MOVED_BY_US_LEDGER] as MovedByUsEntry[] | undefined
+  return Array.isArray(raw) ? raw : []
+}
+
+/** Append mails we just moved. Dedups by newMessageId (refreshing movedAt),
+ *  prunes TTL + cap. No-op on empty input. */
+export async function addToMovedByUsLedger(entries: MovedByUsEntry[]): Promise<void> {
+  const usable = entries.filter((e) => e.newMessageId && e.destinationFolderId)
+  if (usable.length === 0) return
+  await withMovedByUsLedgerLock(async () => {
+    const existing = await getMovedByUsLedger()
+    const byId = new Map<string, MovedByUsEntry>()
+    for (const e of existing) byId.set(e.newMessageId, e)
+    for (const e of usable) byId.set(e.newMessageId, e) // newer wins
+    await chrome.storage.local.set({
+      [KEY_MOVED_BY_US_LEDGER]: pruneMovedByUsLedger([...byId.values()]),
+    })
   })
 }
 

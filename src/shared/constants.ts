@@ -91,6 +91,14 @@ export const SKIP_HISTORY_CAP = 5000
 export const RECENTLY_PROCESSED_TTL_MS = 15 * 60 * 1000 // 15 min
 export const RECENTLY_PROCESSED_CAP = 2000
 
+// Moved-by-us ledger (harvester provenance). Records the DESTINATION-side new
+// message id of every mail WE moved, so the manual-filing harvester can exclude
+// our own moves. Unlike recentlyProcessed (source-side ids, 15-min TTL to
+// outlast propagation), the harvester may run days after a batch, so this
+// keeps entries for weeks.
+export const MOVED_BY_US_LEDGER_TTL_MS = 21 * 24 * 60 * 60 * 1000 // 21 days
+export const MOVED_BY_US_LEDGER_CAP = 5000
+
 /** Recent-activity panel data store cap. */
 export const FOLDER_ACTIVITY_CAP = 200
 /** Retention for folderActivity entries. */

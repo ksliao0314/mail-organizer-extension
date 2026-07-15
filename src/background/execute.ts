@@ -36,7 +36,9 @@ import {
 } from '@/shared/rules'
 import {
   addFolderToCache,
+  addToMovedByUsLedger,
   addToRecentlyProcessed,
+  type MovedByUsEntry,
   appendBatchStat,
   addToSkipHistory,
   bumpMetrics,
@@ -304,6 +306,9 @@ export async function startExecute(
     folderId: string
     folderPath: string
   }> = []
+  // Moved-by-us ledger entries (harvester provenance) — the DESTINATION-side
+  // new id of every mail we move, so the harvester can exclude our own moves.
+  const movedByUsEntries: MovedByUsEntry[] = []
 
   try {
     for (const i of indexOrder) {
@@ -414,6 +419,17 @@ export async function startExecute(
               normalizedSubject: normalized,
               folderId: destinationFolderId,
               folderPath: destinationFolderPath,
+            })
+          }
+          // Ledger uses the DESTINATION-side new id (harvester scans the
+          // destination folder, so only the post-move id can match).
+          if (newMessageId) {
+            movedByUsEntries.push({
+              newMessageId,
+              destinationFolderId,
+              conversationId: item.conversationId,
+              normalizedSubject: normalized.length > 0 ? normalized : undefined,
+              movedAt: Date.now(),
             })
           }
         }
@@ -562,6 +578,14 @@ export async function startExecute(
         await recordSubjectFilings(subjectFilings)
       } catch (e) {
         console.warn('[mail-organizer] recordSubjectFilings failed (non-fatal)', e)
+      }
+    }
+    // Record our own moves so the manual-filing harvester can exclude them.
+    if (movedByUsEntries.length > 0) {
+      try {
+        await addToMovedByUsLedger(movedByUsEntries)
+      } catch (e) {
+        console.warn('[mail-organizer] addToMovedByUsLedger failed (non-fatal)', e)
       }
     }
 
