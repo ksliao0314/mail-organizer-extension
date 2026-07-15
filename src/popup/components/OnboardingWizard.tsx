@@ -282,7 +282,7 @@ function ExistingOptionsStep({
           </div>
           <p className="text-[11px] text-emerald-900/80 pl-5">
             另一台機器（ID {cloud.sourceMachineId.slice(0, 8)}…）已推送
-            <span className="font-medium"> {cloud.ruleCount} 條規則 + {cloud.tombstoneCount} 條墓碑</span>，
+            <span className="font-medium"> {cloud.ruleCount} 條規則 + {cloud.tombstoneCount} 筆刪除紀錄</span>，
             最後寫入於 {new Date(cloud.updatedAt).toLocaleString('zh-TW')}。
           </p>
           <p className="text-[11px] text-emerald-900/80 pl-5">

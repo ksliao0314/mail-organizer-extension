@@ -5,7 +5,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { FolderPicker } from '@/popup/components/FolderPicker'
-import { AlertTriangle, BarChart3, CheckCircle2, ChevronDown, Download, KeyRound, ListChecks, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, Radar, RotateCcw, Search, Settings as SettingsIcon, ShieldAlert, Trash2, Upload, X } from 'lucide-react'
+import { AlertTriangle, BarChart3, CheckCircle2, ChevronDown, ChevronRight, Download, KeyRound, LayoutGrid, List, ListChecks, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, Radar, RotateCcw, Search, Settings as SettingsIcon, ShieldAlert, SlidersHorizontal, Trash2, Upload, User, X } from 'lucide-react'
 import {
   decodeCompound,
   encodeCompound,
@@ -34,7 +34,7 @@ type Err = { ok: false; code: string; message: string }
 type RuleLibrarySubView =
   | 'all' // every rule, with filters / search / bulk actions
   | 'conflicts' // current rule conflicts (most are auto-resolved now)
-  | 'dormant' // auto-disabled rules (legacy_token, high-error-rate)
+  | 'dormant' // 已停用 rules — manual + auto-disabled (id kept for hash compat)
   | 'health' // top hits / low accuracy / stale dashboards
   | 'scan' // initial scan tool
   | 'history' // rule edit audit log
@@ -47,6 +47,57 @@ const RULE_LIBRARY_SUBVIEWS: RuleLibrarySubView[] = [
   'scan',
   'history',
 ]
+
+/**
+ * 全部規則 view 的預設分類 chips(2026-07 UX 重整)。
+ * 分類判定與規則健康度共用同一套邏輯(computeRuleHealth),健康度的
+ * 分類列點下去就是跳到「全部」view + 套用對應 chip — 清單只有一份。
+ * 'disabled' 對應「已停用」(手動 + 自動停用都算);'all' 表示不套用。
+ */
+type RulePresetChip = 'all' | 'sleeping' | 'orphaned' | 'overBroad' | 'hotVague' | 'disabled'
+
+const RULE_PRESET_CHIPS: RulePresetChip[] = [
+  'all',
+  'sleeping',
+  'orphaned',
+  'overBroad',
+  'hotVague',
+  'disabled',
+]
+
+const PRESET_CHIP_LABEL: Record<RulePresetChip, string> = {
+  all: '全部',
+  sleeping: '長期未命中',
+  orphaned: '目標遺失',
+  overBroad: '過於廣泛',
+  hotVague: '模糊熱門',
+  disabled: '已停用',
+}
+
+/**
+ * 衝突頁「編輯」的往返(round trip)— requestEditRule 一律把使用者帶到
+ * rules-library/all 開抽屜;從衝突頁進來的話記住來源 hash,抽屜關閉時
+ * 跳回去,省掉手動導航回衝突清單的一步。Module-level、消費一次即清空。
+ */
+const editReturn: { returnToHash: string | null } = { returnToHash: null }
+
+/** sessionStorage 讀寫小工具 — 篩選狀態跨 sub-view 導航保留用。 */
+function readSessionValue(key: string): string | null {
+  if (typeof sessionStorage === 'undefined') return null
+  try {
+    return sessionStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+function writeSessionValue(key: string, value: string) {
+  if (typeof sessionStorage === 'undefined') return
+  try {
+    sessionStorage.setItem(key, value)
+  } catch {
+    /* ignore quota / disabled storage */
+  }
+}
 async function send<T>(req: unknown): Promise<Ok<T> | Err> {
   return chrome.runtime.sendMessage(req)
 }
@@ -175,7 +226,7 @@ function describeSyncError(
   if (r.includes('quota_bytes') || (r.includes('quota') && r.includes('exceed'))) {
     return {
       hint:
-        '同步資料量超過 100KB 上限。建議到下方規則庫清掉長期沒命中的「休眠規則」、再重試上傳。',
+        '同步資料量超過 100KB 上限。建議到下方規則庫清掉「長期未命中」的規則、再重試上傳。',
       cta: { label: '到規則庫清理', action: 'cleanup' },
     }
   }
@@ -316,12 +367,16 @@ export default function App() {
   // to open the editor on a specific rule. Set the id here, RulesSection's
   // useEffect picks it up, expands the editor, and scrolls the row into view.
   const [requestedEditRuleId, setRequestedEditRuleId] = useState<string | null>(null)
-  const requestEditRule = useCallback((ruleId: string) => {
+  const requestEditRule = useCallback((ruleId: string, opts?: { returnTo?: string }) => {
     setRuleSearch('') // clear search so the row is visible if filtered out
+    // 衝突頁的「編輯」帶 returnTo(來源 hash),抽屜關閉時跳回去;其他
+    // 入口(健康度 / 已停用 / popup 深連結)不帶 → 一律清空,避免殘留
+    // 上一次的往返目的地。
+    editReturn.returnToHash = opts?.returnTo ?? null
     setRequestedEditRuleId(ruleId)
     // Route into the full-screen Rule Library 「全部」 view — only that
     // view mounts RuleAllView, which consumes requestedEditRuleId.
-    // Without this, clicking "編輯" from 健康度 / 自動休眠 / 衝突 sub-views
+    // Without this, clicking "編輯" from 健康度 / 已停用 / 衝突 sub-views
     // queued the id but the editor never opened until the user later
     // navigated back to the 全部 view, where the drawer then popped
     // open for a possibly-stale rule id.
@@ -534,7 +589,7 @@ export default function App() {
     const before = rules.find((r) => r.id === ruleId)
     const label = before
       ? before.type === 'compound'
-        ? '複合規則'
+        ? '組合規則'
         : before.signal
       : ''
     const r = await send<{ deleted: boolean }>({ type: 'deleteRule', ruleId })
@@ -589,7 +644,7 @@ export default function App() {
     if (!del.ok) {
       setRuleToast({
         kind: 'warn',
-        msg: '已建立複合規則,但原 domain 規則刪除失敗、請手動刪除',
+        msg: '已建立組合規則,但原網域規則刪除失敗、請手動刪除',
         key: Date.now(),
       })
       return
@@ -1211,6 +1266,7 @@ export default function App() {
         <RuleLibrarySummaryCard
           rules={rules}
           conflicts={conflicts}
+          onToggle={toggleRuleEnabled}
           onOpenLibrary={(sub) => {
             const target = sub ? `rules-library/${sub}` : 'rules-library'
             window.location.hash = target
@@ -1250,10 +1306,9 @@ export default function App() {
           </CollapsibleSection>
         )}
 
-        {/* Rule edit history — audit log; collapsed by default */}
-        <CollapsibleSection title="規則編輯紀錄" icon={<ListChecks className="size-4" />}>
-          <RuleHistorySection />
-        </CollapsibleSection>
+        {/* 規則編輯紀錄的唯一入口在規則庫的「編輯紀錄」sub-view —
+            這裡原本重複掛了一份(2026-07 UX 重整移除),避免同一份
+            audit log 有兩個家。 */}
 
         {/* Centralised error log — surfaces silent SW failures. Moved
             from the engine tab (2026-05-27 reorg) — it's a diagnostic
@@ -1378,7 +1433,7 @@ export default function App() {
 const TYPE_LABEL: Record<RuleType, string> = {
   case_code: '案件代號',
   domain: '網域',
-  compound: '複合',
+  compound: '組合規則',
   subject_keyword: '主旨關鍵字',
   sender: '寄件人',
 }
@@ -1438,41 +1493,53 @@ const SOURCE_LABEL: Record<RuleSource, string> = {
 function RuleLibrarySummaryCard({
   rules,
   conflicts,
+  onToggle,
   onOpenLibrary,
 }: {
   rules: Rule[]
   conflicts: Array<{ type: string; signal: string; ruleIds: string[]; targets: string[] }>
+  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
   onOpenLibrary: (sub?: RuleLibrarySubView) => void
 }) {
   const stats = useMemo(() => {
     const enabled = rules.filter((r) => r.enabled).length
-    const dormant = rules.filter((r) => !r.enabled && r.autoDisabledAt).length
     const totalHits = rules.reduce((sum, r) => sum + r.matchCount, 0)
     const totalOverrides = rules.reduce((sum, r) => sum + (r.overrideCount ?? 0), 0)
     const accuracy = totalHits > 0 ? (totalHits - totalOverrides) / totalHits : 1
-    return { total: rules.length, enabled, dormant, totalHits, accuracy }
+    return { total: rules.length, enabled, totalHits, accuracy }
   }, [rules])
 
-  // Per-type breakdown for the chart-like row, sorted by count desc.
-  const typeBreakdown = useMemo(() => {
-    const counts: Record<string, number> = {}
-    for (const r of rules) {
-      if (!r.enabled) continue
-      counts[r.type] = (counts[r.type] ?? 0) + 1
+  // 建議清理 TOP 5(2026-07 UX 重整,取代舊的命中 TOP 5)。排序:
+  //   1) 目標遺失(orphaned)— 命中也會被跳過,留著只佔空間
+  //   2) 錯誤率 > 30% 且命中 ≥ 5 — 有實績的壞規則,錯誤率高的排前面
+  //   3) 從未命中、閒置最久(lastUsedAt fallback createdAt 最舊)
+  // 只列啟用中的規則 — 已停用的不需要再「清理」。
+  const cleanupTop = useMemo(() => {
+    type CleanupItem = { rule: Rule; reason: 'orphaned' | 'errorRate' | 'neverUsed' }
+    const items: CleanupItem[] = []
+    const seen = new Set<string>()
+    const push = (r: Rule, reason: CleanupItem['reason']) => {
+      if (seen.has(r.id)) return
+      seen.add(r.id)
+      items.push({ rule: r, reason })
     }
-    return Object.entries(counts).sort((a, b) => b[1] - a[1])
+    for (const r of rules) {
+      if (r.enabled && r.orphaned) push(r, 'orphaned')
+    }
+    const errRate = (r: Rule) => (r.overrideCount ?? 0) / r.matchCount
+    const badAccuracy = rules
+      .filter((r) => r.enabled && !r.orphaned && r.matchCount >= 5 && errRate(r) > 0.3)
+      .sort((a, b) => errRate(b) - errRate(a))
+    for (const r of badAccuracy) push(r, 'errorRate')
+    const neverUsed = rules
+      .filter((r) => r.enabled && !r.orphaned && r.matchCount === 0)
+      .sort(
+        (a, b) =>
+          Date.parse(a.lastUsedAt ?? a.createdAt) - Date.parse(b.lastUsedAt ?? b.createdAt),
+      )
+    for (const r of neverUsed) push(r, 'neverUsed')
+    return items.slice(0, 5)
   }, [rules])
-
-  // Top hits in the last "all time" (we don't have time-windowed hits
-  // here — surface top by total matchCount as a reasonable proxy).
-  const topHits = useMemo(
-    () =>
-      [...rules]
-        .filter((r) => r.matchCount > 0)
-        .sort((a, b) => b.matchCount - a.matchCount)
-        .slice(0, 5),
-    [rules],
-  )
 
   // Warning: rules with low empirical accuracy (effectiveConfidence
   // would demote them, but they're still firing).
@@ -1513,102 +1580,79 @@ function RuleLibrarySummaryCard({
           ? 'text-amber-700'
           : 'text-red-700'
 
+  // 建議清理清單的「查看全部」deep-link — 依 TOP 1 的原因挑最相關的
+  // chip 寫進 sessionStorage,RuleLibraryView mount 時讀取套用。
+  // (dashboard 與完整規則庫互斥顯示,不能用 props 傳,只能走 storage)
+  const cleanupChip: RulePresetChip =
+    cleanupTop[0]?.reason === 'orphaned'
+      ? 'orphaned'
+      : cleanupTop[0]?.reason === 'neverUsed'
+        ? 'sleeping'
+        : 'all'
+  function openCleanupList() {
+    writeSessionValue('mo-rule-preset-chip', cleanupChip)
+    onOpenLibrary('all')
+  }
+
+  const reasonTag = (item: (typeof cleanupTop)[number]): string => {
+    if (item.reason === 'orphaned') return '目標遺失'
+    if (item.reason === 'errorRate') {
+      const pct = Math.round(((item.rule.overrideCount ?? 0) / item.rule.matchCount) * 100)
+      return `錯誤率 ${pct}%`
+    }
+    return '從未命中'
+  }
+
   return (
     <Card>
       <CardHeader>
         <CardTitle className="text-sm">規則庫概況</CardTitle>
-        <CardDescription>
-          看一眼整體健康度。詳細管理、編輯、衝突解決請點下方按鈕進入完整規則庫。
-        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        {/* ---- KPI row ----------------------------------------- */}
-        <div className="grid grid-cols-3 gap-4">
-          <div className="space-y-0.5">
-            <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
-            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
-              總規則數
-            </div>
-            <div className="text-[10px] text-muted-foreground tabular-nums">
-              {stats.enabled} 啟用 · {stats.dormant} 休眠
-            </div>
-          </div>
-          <div className="space-y-0.5">
-            <div className="text-2xl font-semibold tabular-nums">{stats.totalHits.toLocaleString()}</div>
-            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
-              累積命中
-            </div>
-            <div className="text-[10px] text-muted-foreground tabular-nums">
-              覆蓋率自動跑
-            </div>
-          </div>
-          <div className="space-y-0.5">
-            <div className={cn('text-2xl font-semibold tabular-nums', accuracyClass)}>
-              {accuracyLabel}
-            </div>
-            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">
-              準確率
-            </div>
-            <div className="text-[10px] text-muted-foreground tabular-nums">
-              命中扣除 override
-            </div>
-          </div>
+        {/* ---- Stats line -------------------------------------- */}
+        <div className="text-sm tabular-nums">
+          {stats.total} 條規則 · 啟用 {stats.enabled} · 整體準確率{' '}
+          <span className={cn('font-medium', accuracyClass)}>{accuracyLabel}</span>
         </div>
 
-        {/* ---- Type breakdown (mini bar chart) ----------------- */}
-        {typeBreakdown.length > 0 && (
-          <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
-            <div className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium">
-              啟用規則類型分佈
-            </div>
-            <div className="space-y-1.5">
-              {typeBreakdown.map(([type, count]) => {
-                const pct = stats.enabled > 0 ? (count / stats.enabled) * 100 : 0
-                return (
-                  <div key={type} className="flex items-center gap-3 text-[11px]">
-                    <Badge variant="outline" className="font-mono text-[9px] shrink-0 w-16 justify-center">
-                      {TYPE_LABEL[type as RuleType] ?? type}
-                    </Badge>
-                    <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
-                      <div
-                        className="h-full bg-foreground/70 transition-all"
-                        style={{ width: `${pct}%` }}
-                      />
-                    </div>
-                    <span className="tabular-nums font-mono text-muted-foreground w-8 text-right">
-                      {count}
-                    </span>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* ---- Top 5 hits ------------------------------------- */}
-        {topHits.length > 0 && (
+        {/* ---- 建議清理 TOP 5 ---------------------------------- */}
+        {cleanupTop.length > 0 && (
           <div className="space-y-2">
             <div className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium">
-              命中 TOP 5
+              建議清理 TOP 5
             </div>
             <ul className="space-y-1">
-              {topHits.map((r) => (
-                <li key={r.id} className="flex items-center gap-2 text-xs">
-                  <Badge variant="success" className="tabular-nums w-10 justify-center text-[10px]">
-                    {r.matchCount}
-                  </Badge>
+              {cleanupTop.map((item) => (
+                <li key={item.rule.id} className="flex items-center gap-2 text-xs">
                   <Badge variant="outline" className="font-mono text-[9px] shrink-0">
-                    {refinedTypeLabel(r.type, r.signal)}
+                    {refinedTypeLabel(item.rule.type, item.rule.signal)}
                   </Badge>
                   <span className="font-mono truncate min-w-0 flex-1">
-                    {r.type === 'compound' ? formatCompoundSignal(r.signal) : r.signal}
+                    {item.rule.type === 'compound'
+                      ? formatCompoundSignal(item.rule.signal)
+                      : item.rule.signal}
                   </span>
-                  <span className="text-muted-foreground truncate hidden md:inline">
-                    → {r.targetFolderPath}
-                  </span>
+                  <Badge variant="warning" className="text-[9px] shrink-0">
+                    {reasonTag(item)}
+                  </Badge>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[10px] shrink-0"
+                    onClick={() => void onToggle(item.rule, false)}
+                  >
+                    停用
+                  </Button>
                 </li>
               ))}
             </ul>
+            <button
+              type="button"
+              onClick={openCleanupList}
+              className="text-[11px] text-muted-foreground underline hover:text-foreground"
+            >
+              查看全部 →
+            </button>
           </div>
         )}
 
@@ -1667,10 +1711,7 @@ function RuleLibrarySummaryCard({
         )}
 
         {/* ---- Primary CTA ------------------------------------- */}
-        <div className="flex items-center justify-between pt-2 border-t border-border">
-          <span className="text-[11px] text-muted-foreground">
-            完整管理、搜尋、批次操作、衝突處理等都在完整規則庫
-          </span>
+        <div className="flex justify-end pt-2 border-t border-border">
           <Button onClick={() => onOpenLibrary()}>
             查看完整規則庫 →
           </Button>
@@ -1719,7 +1760,7 @@ type RuleLibraryViewProps = {
   onClearDisabled: () => Promise<{ ok: true; data?: { deleted: number } } | { ok: false; code: string; message: string }>
   onWipeAll: () => Promise<{ ok: true; data?: { cleared: number; cloudCleared?: boolean; syncEnabled?: boolean } } | { ok: false; code: string; message: string }>
   onUpgradeToCompound: (rule: Rule, keyword: string) => Promise<void>
-  onEditRule: (ruleId: string) => void
+  onEditRule: (ruleId: string, opts?: { returnTo?: string }) => void
   onBack: () => void
   onChangeView: (v: RuleLibrarySubView) => void
 }
@@ -1727,11 +1768,24 @@ type RuleLibraryViewProps = {
 function RuleLibraryView(props: RuleLibraryViewProps) {
   const { view, rules, conflicts, onBack, onChangeView } = props
 
-  // Sidebar item counts — surface conflicts / dormant as live badges.
-  const dormantCount = useMemo(
-    () => rules.filter((r) => !r.enabled && r.autoDisabledAt).length,
-    [rules],
-  )
+  // Sidebar item counts — surface conflicts / disabled as live badges.
+  // 已停用 = 手動 + 自動停用都算(2026-07 詞彙分家:「休眠」一詞退場)。
+  const disabledCount = useMemo(() => rules.filter((r) => !r.enabled).length, [rules])
+
+  // 全部規則 view 的預設分類 chip — 放在這層(而不是 RuleAllView)讓
+  // 健康度 view 可以「點分類 → 跳到全部 view + 套 chip」;RuleAllView
+  // 在切換 sub-view 時會 unmount,state 放它身上會丟。sessionStorage
+  // 讓 dashboard 的「查看全部 →」深連結也能在 mount 前預設 chip。
+  const [presetChip, setPresetChip] = useState<RulePresetChip>(() => {
+    const stored = readSessionValue('mo-rule-preset-chip')
+    if (stored && (RULE_PRESET_CHIPS as string[]).includes(stored)) {
+      return stored as RulePresetChip
+    }
+    return 'all'
+  })
+  useEffect(() => {
+    writeSessionValue('mo-rule-preset-chip', presetChip)
+  }, [presetChip])
 
   type NavItem = {
     id: RuleLibrarySubView
@@ -1743,7 +1797,7 @@ function RuleLibraryView(props: RuleLibraryViewProps) {
   const navItems: NavItem[] = [
     { id: 'all', label: '全部規則', count: rules.length, section: 'main' },
     { id: 'conflicts', label: '衝突', count: conflicts.length, badge: conflicts.length > 0 ? 'danger' : 'muted', section: 'main' },
-    { id: 'dormant', label: '自動休眠', count: dormantCount, section: 'main' },
+    { id: 'dormant', label: '已停用', count: disabledCount, section: 'main' },
     { id: 'health', label: '規則健康度', section: 'main' },
     { id: 'scan', label: '初次掃描', section: 'admin' },
     { id: 'history', label: '編輯紀錄', section: 'admin' },
@@ -1812,7 +1866,7 @@ function RuleLibraryView(props: RuleLibraryViewProps) {
       {/* Main content */}
       <div className="flex-1 min-w-0 overflow-y-auto">
         <div className="max-w-6xl mx-auto p-6 space-y-4">
-          <RuleLibraryViewBody {...props} />
+          <RuleLibraryViewBody {...props} presetChip={presetChip} onChipChange={setPresetChip} />
         </div>
       </div>
     </div>
@@ -1825,7 +1879,12 @@ function RuleLibraryView(props: RuleLibraryViewProps) {
  * each view — the long-term plan rebuilds the "all" view as a wider
  * table with side detail drawer. Other views are mostly relocated.
  */
-function RuleLibraryViewBody(props: RuleLibraryViewProps) {
+function RuleLibraryViewBody(
+  props: RuleLibraryViewProps & {
+    presetChip: RulePresetChip
+    onChipChange: (chip: RulePresetChip) => void
+  },
+) {
   const {
     view,
     rules,
@@ -1854,6 +1913,9 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
     onClearDisabled,
     onWipeAll,
     onEditRule,
+    onChangeView,
+    presetChip,
+    onChipChange,
   } = props
 
   if (view === 'all') {
@@ -1871,6 +1933,8 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
         onWipeAll={onWipeAll}
         requestedEditId={requestedEditRuleId}
         onEditConsumed={onEditConsumed}
+        presetChip={presetChip}
+        onChipChange={onChipChange}
       />
     )
   }
@@ -1885,7 +1949,9 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
         onSplitConflict={onSplitConflict}
         onAutoUpgradeConflict={onAutoUpgradeConflict}
         onSuggestKeywords={onSuggestKeywords}
-        onEditRule={onEditRule}
+        // 衝突頁的編輯要能「編完跳回衝突頁」— 帶目前 hash 當 returnTo,
+        // RuleAllView 的抽屜關閉時消費(見 editReturn)。
+        onEditRule={(id) => onEditRule(id, { returnTo: window.location.hash })}
       />
     )
   }
@@ -1898,9 +1964,13 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
     return (
       <RuleHealthSection
         rules={rules}
-        onToggle={onToggle}
-        onDelete={onDelete}
-        onEdit={onEditRule}
+        onOpenChip={(chip) => {
+          // 健康度分類點下去 = 跳到全部 view + 套用對應 chip。
+          // 清單只有一份(在全部 view),健康度只負責分流。
+          onChipChange(chip)
+          onChangeView('all')
+        }}
+        onOpenConflicts={() => onChangeView('conflicts')}
       />
     )
   }
@@ -1988,13 +2058,15 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
 }
 
 // ============================================================
-// Rule Library — Dormant rules view (new)
+// Rule Library — 已停用 view(原「自動休眠」,2026-07 詞彙分家)
 // ============================================================
 
 /**
- * Lists rules that were auto-disabled (legacy_token / high-error-rate).
- * Stale-100d rules are hard-deleted by design, so they never show up
- * here. Each row exposes [復活] + [永久刪除] actions.
+ * Lists ALL disabled rules in two sections:「手動停用」(user toggled
+ * off) and「自動停用」(legacy_token / high-error-rate, shows the
+ * reason). Stale-100d rules are 自動清除(hard-deleted)by design, so
+ * they never show up here. Each row exposes [重新啟用] + [刪除]
+ * actions;刪除走 ConfirmDialog(墓碑不可逆,不給單擊誤刪)。
  */
 function DormantRulesView({
   rules,
@@ -2005,7 +2077,19 @@ function DormantRulesView({
   onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
   onDelete: (ruleId: string) => Promise<boolean>
 }) {
-  const dormant = useMemo(
+  const [pendingDelete, setPendingDelete] = useState<Rule | null>(null)
+
+  // 手動停用 — enabled=false 且沒有 autoDisabledAt。沒有「停用時間」
+  // 可排,用建立時間倒序當穩定順序。
+  const manual = useMemo(
+    () =>
+      rules
+        .filter((r) => !r.enabled && !r.autoDisabledAt)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+    [rules],
+  )
+  // 自動停用 — 按停用時間倒序。
+  const auto = useMemo(
     () =>
       rules
         .filter((r) => !r.enabled && r.autoDisabledAt)
@@ -2016,25 +2100,7 @@ function DormantRulesView({
         }),
     [rules],
   )
-
-  if (dormant.length === 0) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">自動休眠</CardTitle>
-          <CardDescription>
-            被系統自動停用的規則(舊版拆詞型或長期高錯誤率)。可一鍵復活或永久刪除。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="text-center py-8 text-sm text-muted-foreground">
-            <CheckCircle2 className="size-8 mx-auto mb-2 text-emerald-600" />
-            <p>沒有休眠的規則</p>
-          </div>
-        </CardContent>
-      </Card>
-    )
-  }
+  const total = manual.length + auto.length
 
   const reasonLabel = (reason?: string): string => {
     if (reason === 'legacy_token') return '舊版拆詞型(可能誤命中)'
@@ -2043,56 +2109,121 @@ function DormantRulesView({
     return '未知'
   }
 
+  const row = (r: Rule, meta: ReactNode) => (
+    <li key={r.id} className="py-2 flex items-start gap-3 text-xs">
+      <div className="flex-1 min-w-0 space-y-0.5">
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="font-mono text-[9px] shrink-0">
+            {refinedTypeLabel(r.type, r.signal)}
+          </Badge>
+          <span className="font-mono truncate min-w-0">
+            {r.type === 'compound' ? formatCompoundSignal(r.signal) : r.signal}
+          </span>
+        </div>
+        <div className="text-muted-foreground truncate">→ {r.targetFolderPath}</div>
+        <div className="text-[10px] text-muted-foreground">{meta}</div>
+      </div>
+      <div className="flex items-center gap-1 shrink-0">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void onToggle(r, true)}
+          className="text-[10px] h-7"
+        >
+          重新啟用
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setPendingDelete(r)}
+          aria-label={`刪除規則 ${r.signal}`}
+          className="text-[10px] h-7 text-destructive hover:text-destructive"
+        >
+          <Trash2 className="size-3" />
+        </Button>
+      </div>
+    </li>
+  )
+
+  if (total === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">已停用</CardTitle>
+          <CardDescription>
+            手動停用與系統自動停用的規則。可重新啟用或刪除。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="text-center py-8 text-sm text-muted-foreground">
+            <CheckCircle2 className="size-8 mx-auto mb-2 text-emerald-600" />
+            <p>沒有已停用的規則</p>
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">自動休眠({dormant.length})</CardTitle>
+        <CardTitle className="text-sm">已停用({total})</CardTitle>
         <CardDescription>
-          按休眠時間倒序。100 天未命中規則已硬刪不在此列。
+          手動停用與系統自動停用的規則。100 天未命中的規則已被「自動清除」(硬刪除)不在此列。
         </CardDescription>
       </CardHeader>
-      <CardContent>
-        <ul className="divide-y divide-border">
-          {dormant.map((r) => (
-            <li key={r.id} className="py-2 flex items-start gap-3 text-xs">
-              <div className="flex-1 min-w-0 space-y-0.5">
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline" className="font-mono text-[9px] shrink-0">
-                    {refinedTypeLabel(r.type, r.signal)}
-                  </Badge>
-                  <span className="font-mono truncate min-w-0">
-                    {r.type === 'compound' ? formatCompoundSignal(r.signal) : r.signal}
-                  </span>
-                </div>
-                <div className="text-muted-foreground truncate">→ {r.targetFolderPath}</div>
-                <div className="text-[10px] text-muted-foreground">
-                  原因:{reasonLabel(r.autoDisabledReason)}
-                  {r.autoDisabledAt && ` · ${formatDate(r.autoDisabledAt)}`}
-                  {r.matchCount > 0 && ` · 過去命中 ${r.matchCount} 次`}
-                </div>
-              </div>
-              <div className="flex items-center gap-1 shrink-0">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void onToggle(r, true)}
-                  className="text-[10px] h-7"
-                >
-                  復活
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => void onDelete(r.id)}
-                  className="text-[10px] h-7 text-destructive hover:text-destructive"
-                >
-                  <Trash2 className="size-3" />
-                </Button>
-              </div>
-            </li>
-          ))}
-        </ul>
+      <CardContent className="space-y-4">
+        {manual.length > 0 && (
+          <div>
+            <h3 className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium mb-1">
+              手動停用({manual.length})
+            </h3>
+            <ul className="divide-y divide-border">
+              {manual.map((r) =>
+                row(
+                  r,
+                  <>
+                    建立於 {formatDate(r.createdAt)}
+                    {r.matchCount > 0 && ` · 過去命中 ${r.matchCount} 次`}
+                  </>,
+                ),
+              )}
+            </ul>
+          </div>
+        )}
+        {auto.length > 0 && (
+          <div>
+            <h3 className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium mb-1">
+              自動停用({auto.length})
+            </h3>
+            <ul className="divide-y divide-border">
+              {auto.map((r) =>
+                row(
+                  r,
+                  <>
+                    原因:{reasonLabel(r.autoDisabledReason)}
+                    {r.autoDisabledAt && ` · ${formatDate(r.autoDisabledAt)}`}
+                    {r.matchCount > 0 && ` · 過去命中 ${r.matchCount} 次`}
+                  </>,
+                ),
+              )}
+            </ul>
+          </div>
+        )}
       </CardContent>
+      {pendingDelete && (
+        <ConfirmDialog
+          title="刪除這條規則?"
+          description="刪除後 AI 不會再自動學回同樣的規則。"
+          confirmLabel="刪除"
+          danger
+          onConfirm={async () => {
+            await onDelete(pendingDelete.id)
+            setPendingDelete(null)
+          }}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </Card>
   )
 }
@@ -2130,12 +2261,21 @@ type RuleAllViewProps = {
   onWipeAll: () => Promise<{ ok: true; data?: { cleared: number; cloudCleared?: boolean; syncEnabled?: boolean } } | { ok: false; code: string; message: string }>
   requestedEditId: string | null
   onEditConsumed: () => void
+  /** 預設分類 chip — state 由 RuleLibraryView 持有(健康度 view 深連結用)。 */
+  presetChip: RulePresetChip
+  onChipChange: (chip: RulePresetChip) => void
 }
+
+// 篩選 select 的合法值 — sessionStorage 讀回時驗證用(手改 storage /
+// 舊版殘值不會炸型別)。
+const RULE_TYPE_VALUES: RuleType[] = ['case_code', 'compound', 'domain', 'subject_keyword', 'sender']
+const RULE_SOURCE_VALUES: RuleSource[] = ['user_manual', 'ai_overridden', 'ai_confirmed', 'auto_scan']
 
 /**
  * Wide-table rule library view. Replaces the cramped `RulesSection`
  * for the 「全部」 sub-view. Features:
- *   - Toolbar: search + 3 filter dropdowns + sort + actions
+ *   - Preset chips row(與健康度共用分類邏輯)+ per-chip counts
+ *   - Toolbar: search + 篩選 popover + view toggle + actions
  *   - Wide table with checkbox column for bulk select
  *   - Right-side detail drawer (slide-in) when clicking a row
  *   - Bulk action bar floats when selection > 0
@@ -2155,11 +2295,34 @@ function RuleAllView({
   onWipeAll,
   requestedEditId,
   onEditConsumed,
+  presetChip,
+  onChipChange,
 }: RuleAllViewProps) {
   const [search, setSearch] = useState('')
-  const [typeFilter, setTypeFilter] = useState<RuleType | 'all'>('all')
-  const [sourceFilter, setSourceFilter] = useState<RuleSource | 'all'>('all')
-  const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('enabled')
+  // 篩選狀態存 sessionStorage(C4)— 跳去衝突 view 再回來(RuleAllView
+  // unmount / remount)篩選不歸零。search text 刻意不存:搜尋是一次性
+  // 動作,殘留的搜尋字串比殘留的篩選更容易讓人「咦怎麼少這麼多」。
+  const [typeFilter, setTypeFilter] = useState<RuleType | 'all'>(() => {
+    const stored = readSessionValue('mo-rule-filter-type')
+    return stored && (RULE_TYPE_VALUES as string[]).includes(stored) ? (stored as RuleType) : 'all'
+  })
+  const [sourceFilter, setSourceFilter] = useState<RuleSource | 'all'>(() => {
+    const stored = readSessionValue('mo-rule-filter-source')
+    return stored && (RULE_SOURCE_VALUES as string[]).includes(stored) ? (stored as RuleSource) : 'all'
+  })
+  const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>(() => {
+    const stored = readSessionValue('mo-rule-filter-status')
+    return stored === 'all' || stored === 'disabled' ? stored : 'enabled'
+  })
+  useEffect(() => {
+    writeSessionValue('mo-rule-filter-type', typeFilter)
+  }, [typeFilter])
+  useEffect(() => {
+    writeSessionValue('mo-rule-filter-source', sourceFilter)
+  }, [sourceFilter])
+  useEffect(() => {
+    writeSessionValue('mo-rule-filter-status', statusFilter)
+  }, [statusFilter])
   const [sortKey, setSortKey] = useState<'matchCount' | 'created' | 'lastUsed' | 'confidence'>('matchCount')
   // View mode toggle — grouped by target folder (default, matches the
   // lawyer's "see all rules for this case at once" mental model) or
@@ -2178,22 +2341,24 @@ function RuleAllView({
     }
   }, [viewMode])
   // Per-folder collapse state for grouped view. Same sessionStorage policy.
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
-    if (typeof sessionStorage !== 'undefined') {
-      const stored = sessionStorage.getItem('mo-rule-collapsed-folders')
-      if (stored) {
-        try {
-          const arr = JSON.parse(stored) as unknown
-          if (Array.isArray(arr) && arr.every((x) => typeof x === 'string')) {
-            return new Set(arr)
-          }
-        } catch {
-          /* ignore malformed */
+  // useMemo(而不是直接寫在 useState initializer)是為了留住「這個
+  // session 是否已存過摺疊狀態」的旗標 — 沒存過才套用 D4 的預設摺疊
+  // (>10 群組時全摺、只留有問題的群組),避免蓋掉使用者手動展開的結果。
+  const initialCollapsed = useMemo<string[] | null>(() => {
+    const stored = readSessionValue('mo-rule-collapsed-folders')
+    if (stored) {
+      try {
+        const arr = JSON.parse(stored) as unknown
+        if (Array.isArray(arr) && arr.every((x) => typeof x === 'string')) {
+          return arr as string[]
         }
+      } catch {
+        /* ignore malformed */
       }
     }
-    return new Set()
-  })
+    return null
+  }, [])
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(initialCollapsed ?? []))
   useEffect(() => {
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.setItem('mo-rule-collapsed-folders', JSON.stringify([...collapsed]))
@@ -2204,15 +2369,44 @@ function RuleAllView({
   const [editingId, setEditingId] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [bulkBusy, setBulkBusy] = useState(false)
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
 
-  // External edit request from dashboard / health view — auto-open
-  // detail drawer in edit mode.
+  // 這次抽屜是不是 requestedEditId 開的 — 是的話關閉時要消費
+  // editReturn.returnToHash(衝突頁編輯往返,見 module-level 註解)。
+  const openedViaRequestRef = useRef(false)
+
+  // External edit request from dashboard / health / conflicts view —
+  // auto-open detail drawer in edit mode.
   useEffect(() => {
     if (!requestedEditId) return
+    openedViaRequestRef.current = true
     setDetailId(requestedEditId)
     setEditingId(requestedEditId)
     onEditConsumed()
   }, [requestedEditId, onEditConsumed])
+
+  // 統一的抽屜關閉路徑(Esc / 關閉鈕 / 抽屜內刪除)— 若這次是衝突頁
+  // 「編輯」開的,關閉時跳回來源 hash,完成 round trip。
+  const closeDrawer = useCallback(() => {
+    setDetailId(null)
+    setEditingId(null)
+    if (openedViaRequestRef.current) {
+      openedViaRequestRef.current = false
+      const back = editReturn.returnToHash
+      editReturn.returnToHash = null
+      if (back && back !== window.location.hash) {
+        window.location.hash = back
+      }
+    }
+  }, [])
+
+  // 手動點列開抽屜 — 覆蓋任何殘留的往返狀態(手動瀏覽不該在關閉時
+  // 突然被帶去衝突頁)。stable callback,維持 memoized RuleRow 契約。
+  const openDetail = useCallback((id: string) => {
+    openedViaRequestRef.current = false
+    editReturn.returnToHash = null
+    setDetailId(id)
+  }, [])
 
   // Keyboard shortcuts (Phase 4):
   //   - Esc: close detail drawer (also clears any in-progress edit)
@@ -2242,8 +2436,7 @@ function RuleAllView({
         // FAB iframe parent.
         e.stopImmediatePropagation()
         e.preventDefault()
-        setDetailId(null)
-        setEditingId(null)
+        closeDrawer()
         return
       }
       if (e.key === '/' && !detailId) {
@@ -2262,15 +2455,57 @@ function RuleAllView({
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [detailId])
+  }, [detailId, closeDrawer])
+
+  // 健康度分類的判定結果 — chips 與健康度 view 共用同一套邏輯
+  // (computeRuleHealth),這裡轉成 id set 供過濾用。
+  const health = useMemo(() => computeRuleHealth(rules), [rules])
+  const chipIdSets = useMemo(
+    () => ({
+      sleeping: new Set(health.sleeping.map((r) => r.id)),
+      orphaned: new Set(health.orphaned.map((r) => r.id)),
+      overBroad: new Set(health.overBroad.map((r) => r.id)),
+      hotVague: new Set(health.hotVague.map((r) => r.id)),
+    }),
+    [health],
+  )
+  const disabledCount = useMemo(() => rules.filter((r) => !r.enabled).length, [rules])
+  const chipCount = (chip: RulePresetChip): number => {
+    if (chip === 'all') return rules.length
+    if (chip === 'disabled') return disabledCount
+    return chipIdSets[chip].size
+  }
+
+  // Chip 單選:點已選中的 chip 回到「全部」。「已停用」chip 同步把
+  // 狀態篩選切到停用(離開時切回啟用),其他 chip 走自己的分類判定、
+  // 不動狀態 select(過濾時會直接略過狀態篩選,見 filtered)。
+  function applyChip(chip: RulePresetChip) {
+    const next = chip === presetChip ? 'all' : chip
+    if (next === 'disabled') setStatusFilter('disabled')
+    else if (presetChip === 'disabled') setStatusFilter('enabled')
+    onChipChange(next)
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
+    // 搜尋救援(G):有搜尋字時略過狀態篩選 — 找一條「怎麼沒生效」的
+    // 規則時,它常常就是被停用的那條;被預設的「狀態:啟用」藏起來
+    // 會讓人誤以為規則不存在。健康 chip 啟用時也略過(分類本身已定義
+    // 了狀態語意,例如目標遺失可能含停用規則)。
+    const searching = q.length > 0
+    const statusApplies = !searching && (presetChip === 'all' || presetChip === 'disabled')
     let list = rules.filter((r) => {
+      if (presetChip === 'disabled') {
+        if (r.enabled) return false
+      } else if (presetChip !== 'all') {
+        if (!chipIdSets[presetChip].has(r.id)) return false
+      }
       if (typeFilter !== 'all' && r.type !== typeFilter) return false
       if (sourceFilter !== 'all' && r.source !== sourceFilter) return false
-      if (statusFilter === 'enabled' && !r.enabled) return false
-      if (statusFilter === 'disabled' && r.enabled) return false
+      if (statusApplies) {
+        if (statusFilter === 'enabled' && !r.enabled) return false
+        if (statusFilter === 'disabled' && r.enabled) return false
+      }
       if (q) {
         const signalLower = (r.type === 'compound' ? formatCompoundSignal(r.signal) : r.signal).toLowerCase()
         if (!signalLower.includes(q) && !r.targetFolderPath.toLowerCase().includes(q)) {
@@ -2296,7 +2531,7 @@ function RuleAllView({
       }
     })
     return list
-  }, [rules, search, typeFilter, sourceFilter, statusFilter, sortKey])
+  }, [rules, search, typeFilter, sourceFilter, statusFilter, sortKey, presetChip, chipIdSets])
 
   const allFilteredSelected =
     filtered.length > 0 && filtered.every((r) => selected.has(r.id))
@@ -2384,8 +2619,9 @@ function RuleAllView({
       setBulkBusy(false)
     }
   }
+  // 批次刪除本體 — 由 ConfirmDialog 的 onConfirm 呼叫(B4:chip →
+  // 全選 → 批次刪除 → 一個 ConfirmDialog;原本的 native confirm 換掉)。
   async function bulkDelete() {
-    if (!confirm(`確定刪除選取的 ${selected.size} 條規則?(寫入墓碑、AI 不會再生成)`)) return
     setBulkBusy(true)
     try {
       const ids = Array.from(selected)
@@ -2393,10 +2629,13 @@ function RuleAllView({
       // about to delete, close it first so the user doesn't see a
       // ghost drawer pointing at a deleted id (the drawer's
       // `detailRule` lookup returns undefined → unmounts cleanly,
-      // but editing state would linger).
+      // but editing state would linger). 靜默關閉、不走 closeDrawer
+      // 的往返導航 — 批次刪除中途被跳頁很突兀。
       if (detailId && ids.includes(detailId)) {
         setDetailId(null)
         setEditingId(null)
+        openedViaRequestRef.current = false
+        editReturn.returnToHash = null
       }
       const { failed } = await runBulk(ids, (id) => onDelete(id))
       setSelected(new Set(failed))
@@ -2412,6 +2651,30 @@ function RuleAllView({
 
   return (
     <div className="space-y-4">
+      {/* ---- Preset chips(與健康度共用分類邏輯)------------------ */}
+      <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="快速分類">
+        {RULE_PRESET_CHIPS.map((chip) => {
+          const active = presetChip === chip
+          return (
+            <button
+              key={chip}
+              type="button"
+              onClick={() => applyChip(chip)}
+              aria-pressed={active}
+              className={cn(
+                'rounded-full border px-2.5 py-1 text-[11px] flex items-center gap-1 transition-colors',
+                active
+                  ? 'border-foreground bg-foreground text-background'
+                  : 'border-border bg-background text-muted-foreground hover:text-foreground hover:bg-accent/50',
+              )}
+            >
+              {PRESET_CHIP_LABEL[chip]}
+              <span className="font-mono tabular-nums">{chipCount(chip)}</span>
+            </button>
+          )
+        })}
+      </div>
+
       {/* ---- Toolbar -------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-[200px] max-w-md">
@@ -2420,58 +2683,69 @@ function RuleAllView({
             ref={searchInputRef}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="搜尋 signal 或目標資料夾…（/ 快速聚焦)"
+            placeholder="搜尋條件或目標資料夾…（/ 快速聚焦)"
             className="pl-7 text-xs h-8"
           />
         </div>
-        <select
-          value={typeFilter}
-          onChange={(e) => setTypeFilter(e.target.value as RuleType | 'all')}
-          className="text-xs h-8 rounded-md border border-border bg-background px-2"
-        >
-          <option value="all">類型:全部</option>
-          {(['case_code', 'compound', 'domain', 'subject_keyword', 'sender'] as RuleType[]).map((t) => (
-            <option key={t} value={t}>類型:{TYPE_LABEL[t]}</option>
-          ))}
-        </select>
-        <select
-          value={sourceFilter}
-          onChange={(e) => setSourceFilter(e.target.value as RuleSource | 'all')}
-          className="text-xs h-8 rounded-md border border-border bg-background px-2"
-        >
-          <option value="all">來源:全部</option>
-          {(['user_manual', 'ai_overridden', 'ai_confirmed', 'auto_scan'] as RuleSource[]).map((s) => (
-            <option key={s} value={s}>來源:{SOURCE_LABEL[s]}</option>
-          ))}
-        </select>
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value as 'all' | 'enabled' | 'disabled')}
-          className="text-xs h-8 rounded-md border border-border bg-background px-2"
-        >
-          <option value="enabled">狀態:啟用</option>
-          <option value="disabled">狀態:停用</option>
-          <option value="all">狀態:全部</option>
-        </select>
-        <select
-          value={sortKey}
-          onChange={(e) => setSortKey(e.target.value as typeof sortKey)}
-          className="text-xs h-8 rounded-md border border-border bg-background px-2"
-        >
-          <option value="matchCount">排序:命中數</option>
-          <option value="lastUsed">排序:最近使用</option>
-          <option value="created">排序:建立時間</option>
-          <option value="confidence">排序:Confidence</option>
-        </select>
-        <select
-          value={viewMode}
-          onChange={(e) => setViewMode(e.target.value as 'grouped' | 'flat')}
-          className="text-xs h-8 rounded-md border border-border bg-background px-2"
+        <RuleFilterPopover
+          typeFilter={typeFilter}
+          setTypeFilter={setTypeFilter}
+          sourceFilter={sourceFilter}
+          setSourceFilter={setSourceFilter}
+          statusFilter={statusFilter}
+          setStatusFilter={setStatusFilter}
+        />
+        {/* 排序只在平面清單有意義 — 分組檢視的排序由群組邏輯決定,
+            grouped 模式下這個 select 是死的,乾脆不畫(C1)。 */}
+        {viewMode === 'flat' && (
+          <select
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as typeof sortKey)}
+            className="text-xs h-8 rounded-md border border-border bg-background px-2"
+          >
+            <option value="matchCount">排序:命中數</option>
+            <option value="lastUsed">排序:最近使用</option>
+            <option value="created">排序:建立時間</option>
+            <option value="confidence">排序:Confidence</option>
+          </select>
+        )}
+        {/* 檢視模式 — 兩鍵 segmented toggle(取代舊的 select) */}
+        <div
+          role="group"
           aria-label="檢視模式"
+          className="flex h-8 rounded-md border border-border overflow-hidden"
         >
-          <option value="grouped">檢視:按資料夾分組</option>
-          <option value="flat">檢視:平面清單</option>
-        </select>
+          <button
+            type="button"
+            onClick={() => setViewMode('flat')}
+            aria-label="平面列表"
+            aria-pressed={viewMode === 'flat'}
+            title="平面列表"
+            className={cn(
+              'px-2.5 flex items-center transition-colors',
+              viewMode === 'flat'
+                ? 'bg-foreground text-background'
+                : 'bg-background text-muted-foreground hover:text-foreground hover:bg-accent/50',
+            )}
+          >
+            <List className="size-3.5" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('grouped')}
+            aria-label="按資料夾分組"
+            aria-pressed={viewMode === 'grouped'}
+            title="按資料夾分組"
+            className={cn(
+              'px-2.5 flex items-center border-l border-border transition-colors',
+              viewMode === 'grouped'
+                ? 'bg-foreground text-background'
+                : 'bg-background text-muted-foreground hover:text-foreground hover:bg-accent/50',
+            )}
+          >
+            <LayoutGrid className="size-3.5" aria-hidden="true" />
+          </button>
+        </div>
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="outline"
@@ -2488,7 +2762,7 @@ function RuleAllView({
             onClearDisabled={onClearDisabled}
             onWipeAll={onWipeAll}
             rulesCount={rules.length}
-            disabledCount={rules.filter((r) => !r.enabled).length}
+            disabledCount={disabledCount}
           />
         </div>
       </div>
@@ -2499,7 +2773,7 @@ function RuleAllView({
           顯示 {filtered.length} / {rules.length} 條
           {selected.size > 0 && ` · 已選 ${selected.size}`}
         </span>
-        {(search || typeFilter !== 'all' || sourceFilter !== 'all' || statusFilter !== 'enabled') && (
+        {(search || typeFilter !== 'all' || sourceFilter !== 'all' || statusFilter !== 'enabled' || presetChip !== 'all') && (
           <button
             type="button"
             onClick={() => {
@@ -2507,6 +2781,7 @@ function RuleAllView({
               setTypeFilter('all')
               setSourceFilter('all')
               setStatusFilter('enabled')
+              onChipChange('all')
             }}
             className="text-muted-foreground hover:text-foreground underline"
           >
@@ -2547,7 +2822,21 @@ function RuleAllView({
           ) : (
             <>
               <p>沒有符合篩選條件的規則</p>
-              <p className="text-[11px] mt-1">試試重設篩選</p>
+              {/* G2:一鍵放寬 — 狀態切「全部」+ 清掉類型 / 來源 / chip,
+                  但保留搜尋字串(使用者正在找的東西不能被吃掉)。 */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-3"
+                onClick={() => {
+                  setStatusFilter('all')
+                  setTypeFilter('all')
+                  setSourceFilter('all')
+                  onChipChange('all')
+                }}
+              >
+                顯示全部狀態並清除篩選
+              </Button>
             </>
           )}
         </div>
@@ -2559,10 +2848,11 @@ function RuleAllView({
           detailId={detailId}
           collapsed={collapsed}
           setCollapsed={setCollapsed}
+          allowDefaultCollapse={initialCollapsed === null}
           onToggleSelectAll={toggleSelectAll}
           allFilteredSelected={allFilteredSelected}
           onSelect={toggleOne}
-          onOpenDetail={setDetailId}
+          onOpenDetail={openDetail}
           onToggle={onToggle}
         />
       ) : (
@@ -2580,11 +2870,10 @@ function RuleAllView({
                   />
                 </th>
                 <th className="px-2 py-2 w-20">類型</th>
-                <th className="px-2 py-2">Signal</th>
+                <th className="px-2 py-2">條件</th>
                 <th className="px-2 py-2">→ 目標資料夾</th>
                 <th className="px-2 py-2 w-16 text-right">命中</th>
-                <th className="px-2 py-2 w-20 text-right">Conf</th>
-                <th className="px-2 py-2 w-20">來源</th>
+                <th className="px-2 py-2 w-24 text-right">最近使用</th>
                 <th className="px-2 py-2 w-12"></th>
               </tr>
             </thead>
@@ -2597,7 +2886,7 @@ function RuleAllView({
                   highlighted={detailId === r.id}
                   showTarget
                   onSelect={toggleOne}
-                  onOpenDetail={setDetailId}
+                  onOpenDetail={openDetail}
                   onToggle={handleToggleRule}
                 />
               ))}
@@ -2605,6 +2894,16 @@ function RuleAllView({
           </table>
         </div>
       )}
+
+      {/* G1:搜尋救援生效提示 — 搜尋時略過狀態篩選,結果裡真的混進
+          停用規則才顯示,免得使用者以為篩選壞了。 */}
+      {search.trim().length > 0 &&
+        statusFilter === 'enabled' &&
+        filtered.some((r) => !r.enabled) && (
+          <p className="text-[11px] text-muted-foreground">
+            搜尋結果包含停用規則(搜尋時不套用狀態篩選)
+          </p>
+        )}
 
       {/* ---- Bulk action bar (floating) ------------------------- */}
       {selected.size > 0 && (
@@ -2638,7 +2937,7 @@ function RuleAllView({
                 size="sm"
                 variant="ghost"
                 className="text-red-300 hover:text-red-200 hover:bg-background/10 text-[11px] h-7"
-                onClick={() => void bulkDelete()}
+                onClick={() => setConfirmBulkDelete(true)}
                 disabled={bulkBusy}
               >
                 <Trash2 className="size-3" />
@@ -2657,6 +2956,21 @@ function RuleAllView({
         </div>
       )}
 
+      {/* ---- Bulk delete confirm(取代舊的 native confirm)------- */}
+      {confirmBulkDelete && (
+        <ConfirmDialog
+          title={`刪除選取的 ${selected.size} 條規則?`}
+          description="刪除後 AI 不會再自動學回同樣的規則。"
+          confirmLabel="刪除"
+          danger
+          onConfirm={async () => {
+            await bulkDelete()
+            setConfirmBulkDelete(false)
+          }}
+          onCancel={() => setConfirmBulkDelete(false)}
+        />
+      )}
+
       {/* ---- Detail drawer -------------------------------------- */}
       {detailRule && (
         <RuleDetailDrawer
@@ -2666,15 +2980,11 @@ function RuleAllView({
           editing={editingId === detailRule.id}
           onStartEdit={() => setEditingId(detailRule.id)}
           onCancelEdit={() => setEditingId(null)}
-          onClose={() => {
-            setDetailId(null)
-            setEditingId(null)
-          }}
+          onClose={closeDrawer}
           onToggle={onToggle}
           onDelete={async (id) => {
             await onDelete(id)
-            setDetailId(null)
-            setEditingId(null)
+            closeDrawer()
           }}
           onUpsert={async (rule) => {
             const r = await onUpsert(rule)
@@ -2683,6 +2993,136 @@ function RuleAllView({
           }}
           loadTree={loadTree}
         />
+      )}
+    </div>
+  )
+}
+
+// ============================================================
+// Rule Library — 篩選 popover(類型 / 來源 / 狀態 合併,C2)
+// ============================================================
+
+/**
+ * 把原本三顆常駐的 select(類型 / 來源 / 狀態)收進一顆「篩選」鈕 +
+ * 小面板,工具列瘦身。任何篩選非預設值時鈕上顯示數字 badge。
+ * 互動慣例照 RuleLibraryActionsMenu:外點關閉、Esc 關閉並還焦點。
+ */
+function RuleFilterPopover({
+  typeFilter,
+  setTypeFilter,
+  sourceFilter,
+  setSourceFilter,
+  statusFilter,
+  setStatusFilter,
+}: {
+  typeFilter: RuleType | 'all'
+  setTypeFilter: (v: RuleType | 'all') => void
+  sourceFilter: RuleSource | 'all'
+  setSourceFilter: (v: RuleSource | 'all') => void
+  statusFilter: 'all' | 'enabled' | 'disabled'
+  setStatusFilter: (v: 'all' | 'enabled' | 'disabled') => void
+}) {
+  const [open, setOpen] = useState(false)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+
+  // 非預設的篩選數(狀態的預設是「啟用」)
+  const activeCount =
+    (typeFilter !== 'all' ? 1 : 0) +
+    (sourceFilter !== 'all' ? 1 : 0) +
+    (statusFilter !== 'enabled' ? 1 : 0)
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return
+    function onClick(e: MouseEvent) {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [open])
+
+  // Esc closes + restores focus to the trigger(與操作選單同一套慣例)
+  useEffect(() => {
+    if (!open) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        e.preventDefault()
+        setOpen(false)
+        triggerRef.current?.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
+
+  return (
+    <div className="relative" ref={panelRef}>
+      <Button
+        ref={triggerRef}
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        className="h-8"
+      >
+        <SlidersHorizontal className="size-3.5" />
+        篩選
+        {activeCount > 0 && (
+          <span className="ml-0.5 rounded-full bg-foreground text-background text-[10px] font-mono tabular-nums px-1.5 leading-4">
+            {activeCount}
+          </span>
+        )}
+        <ChevronDown className="size-3" />
+      </Button>
+      {open && (
+        <div
+          className="absolute left-0 top-full mt-1 z-20 min-w-[200px] rounded-md border border-border bg-background shadow-md p-3 space-y-2.5 text-xs"
+          aria-label="篩選條件"
+        >
+          <label className="block space-y-1">
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wide">類型</span>
+            <select
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value as RuleType | 'all')}
+              className="w-full text-xs h-8 rounded-md border border-border bg-background px-2"
+            >
+              <option value="all">全部</option>
+              {RULE_TYPE_VALUES.map((t) => (
+                <option key={t} value={t}>{TYPE_LABEL[t]}</option>
+              ))}
+            </select>
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wide">來源</span>
+            <select
+              value={sourceFilter}
+              onChange={(e) => setSourceFilter(e.target.value as RuleSource | 'all')}
+              className="w-full text-xs h-8 rounded-md border border-border bg-background px-2"
+            >
+              <option value="all">全部</option>
+              {RULE_SOURCE_VALUES.map((s) => (
+                <option key={s} value={s}>{SOURCE_LABEL[s]}</option>
+              ))}
+            </select>
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wide">狀態</span>
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as 'all' | 'enabled' | 'disabled')}
+              className="w-full text-xs h-8 rounded-md border border-border bg-background px-2"
+            >
+              <option value="enabled">啟用</option>
+              <option value="disabled">停用</option>
+              <option value="all">全部</option>
+            </select>
+          </label>
+        </div>
       )}
     </div>
   )
@@ -2966,7 +3406,7 @@ function RuleLibraryActionsMenu({
       {confirmClear && (
         <ConfirmDialog
           title={`刪除 ${disabledCount} 條已停用規則?`}
-          description="會寫入墓碑、AI 不會再自動生成。"
+          description="刪除後 AI 不會再自動學回。"
           confirmLabel="刪除"
           danger
           onConfirm={async () => {
@@ -2979,7 +3419,7 @@ function RuleLibraryActionsMenu({
       {confirmWipe && (
         <ConfirmDialog
           title={`刪除全部 ${rulesCount} 條規則?`}
-          description="同時清空 AI 記憶 + 墓碑庫 + 審計日誌。不可復原。已啟用同步時會自動觸發其他機器在下次同步時一併清除。"
+          description="同時清空 AI 記憶、刪除紀錄與編輯紀錄。不可復原。已啟用同步時會自動觸發其他機器在下次同步時一併清除。"
           confirmLabel="全部刪除"
           danger
           onConfirm={async () => {
@@ -3254,7 +3694,7 @@ function RuleDetailDrawer({
                     {refinedTypeLabel(rule.type, rule.signal)}
                   </Badge>
                 </Field>
-                <Field label="Signal">
+                <Field label="條件">
                   <code className="font-mono break-all text-[11px]">
                     {rule.type === 'compound' ? formatCompoundSignal(rule.signal) : rule.signal}
                   </code>
@@ -3366,7 +3806,7 @@ function RuleDetailDrawer({
       {confirmDelete && (
         <ConfirmDialog
           title="刪除這條規則?"
-          description="會寫入墓碑、AI 不會再自動生成同樣的規則。"
+          description="刪除後 AI 不會再自動學回同樣的規則。"
           confirmLabel="刪除"
           danger
           onConfirm={async () => {
@@ -3508,8 +3948,17 @@ const RuleRow = memo(function RuleRow({
         </Badge>
       </td>
       <td className="px-2 py-1.5 cursor-pointer max-w-0" onClick={openDetail}>
-        <div className="font-mono truncate" title={rule.signal}>
-          {rule.type === 'compound' ? formatCompoundSignal(rule.signal) : rule.signal}
+        <div className="flex items-center gap-1 min-w-0">
+          {/* 手動建立的規則掛小人 icon — 批次清理時一眼認出「這是我
+              自己設的」,避免跟 AI 生成規則一起被粗手掃掉(D3)。 */}
+          {rule.source === 'user_manual' && (
+            <span title="手動建立" className="shrink-0 text-muted-foreground inline-flex">
+              <User className="size-3" aria-label="手動建立" />
+            </span>
+          )}
+          <span className="font-mono truncate" title={rule.signal}>
+            {rule.type === 'compound' ? formatCompoundSignal(rule.signal) : rule.signal}
+          </span>
         </div>
       </td>
       {showTarget && (
@@ -3533,16 +3982,13 @@ const RuleRow = memo(function RuleRow({
           </span>
         )}
       </td>
+      {/* 最近使用 — lastUsedAt,沒用過就退回建立時間(D2)。
+          Conf / 來源 欄已移除,細節留在抽屜裡看。 */}
       <td
-        className="px-2 py-1.5 text-right font-mono tabular-nums cursor-pointer"
+        className="px-2 py-1.5 text-right text-[10px] text-muted-foreground whitespace-nowrap cursor-pointer"
         onClick={openDetail}
       >
-        {rule.confidence.toFixed(2)}
-      </td>
-      <td className="px-2 py-1.5 cursor-pointer" onClick={openDetail}>
-        <span className="text-[10px] text-muted-foreground">
-          {SOURCE_LABEL[rule.source]}
-        </span>
+        {formatRelativeTime(rule.lastUsedAt ?? rule.createdAt) || '—'}
       </td>
       <td className="px-2 py-1.5">
         <button
@@ -3585,6 +4031,7 @@ function RuleGroupedTable({
   detailId,
   collapsed,
   setCollapsed,
+  allowDefaultCollapse,
   onToggleSelectAll,
   allFilteredSelected,
   onSelect,
@@ -3597,6 +4044,8 @@ function RuleGroupedTable({
   detailId: string | null
   collapsed: Set<string>
   setCollapsed: (v: Set<string>) => void
+  /** 本 session 尚未存過摺疊狀態時 true — 才套用 >10 群組的預設摺疊。 */
+  allowDefaultCollapse: boolean
   onToggleSelectAll: () => void
   allFilteredSelected: boolean
   onSelect: (id: string) => void
@@ -3650,6 +4099,24 @@ function RuleGroupedTable({
     return out
   }, [rules, allRules])
 
+  // D4:>10 個群組時預設全摺,只留「有問題」的群組(含目標遺失或
+  // 準確率 <70% 的規則)展開 — 大量資料夾時先看該處理的。只在本
+  // session 還沒有摺疊紀錄時套用一次,不蓋掉使用者手動調整的結果。
+  const defaultCollapseApplied = useRef(false)
+  useEffect(() => {
+    if (!allowDefaultCollapse || defaultCollapseApplied.current) return
+    if (groups.length === 0) return
+    defaultCollapseApplied.current = true
+    if (groups.length <= 10) return
+    const needsAttention = (g: (typeof groups)[number]) =>
+      g.rules.some((r) => {
+        if (r.orphaned) return true
+        if (r.matchCount === 0) return false
+        return (r.matchCount - (r.overrideCount ?? 0)) / r.matchCount < 0.7
+      })
+    setCollapsed(new Set(groups.filter((g) => !needsAttention(g)).map((g) => g.path)))
+  }, [groups, allowDefaultCollapse, setCollapsed])
+
   function toggleCollapse(path: string) {
     const next = new Set(collapsed)
     if (next.has(path)) next.delete(path)
@@ -3657,134 +4124,151 @@ function RuleGroupedTable({
     setCollapsed(next)
   }
 
+  // 全部摺疊 / 全部展開 — 依目前狀態二擇一(全摺了就展開,否則摺起)。
+  const allCollapsed = groups.length > 0 && groups.every((g) => collapsed.has(g.path))
+  function toggleCollapseAll() {
+    if (allCollapsed) setCollapsed(new Set())
+    else setCollapsed(new Set(groups.map((g) => g.path)))
+  }
+
   return (
-    <div className="space-y-3">
-      {/* Top-level select-all row, mirrors the flat-table thead */}
-      <div className="flex items-center gap-2 text-[11px] text-muted-foreground px-1">
-        <input
-          type="checkbox"
-          checked={allFilteredSelected}
-          onChange={onToggleSelectAll}
-          className="accent-foreground"
-          aria-label="全選顯示中的規則"
-        />
-        <span>選取顯示中的全部規則 ({rules.length} 條)</span>
+    <div className="space-y-2">
+      {/* Grouped-mode 工具列:群組數 + 全部摺疊/展開 */}
+      <div className="flex items-center justify-between text-[11px] text-muted-foreground px-1">
+        <span className="tabular-nums">{groups.length} 個資料夾</span>
+        <button
+          type="button"
+          onClick={toggleCollapseAll}
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          {allCollapsed ? '全部展開' : '全部摺疊'}
+        </button>
       </div>
 
-      {groups.map((g) => {
-        const isCollapsed = collapsed.has(g.path)
-        const accPct =
-          g.totalHits > 0
-            ? Math.round(((g.totalHits - g.totalOverrides) / g.totalHits) * 100)
-            : null
-        const accClass =
-          accPct === null
-            ? 'text-muted-foreground'
-            : accPct >= 90
-              ? 'text-emerald-700'
-              : accPct >= 70
-                ? 'text-amber-700'
-                : 'text-red-700'
-        return (
-          <div
-            key={g.path}
-            className="rounded-md border border-border overflow-hidden bg-background"
-          >
-            {/* Folder header — collapse toggle is the main button; bulk
-                action is a sibling button (not nested) to keep the HTML
-                semantically valid. Both live in a flex row that handles
-                hover styling via the `group` class on the wrapper. */}
-            <div className="bg-muted/40 hover:bg-muted/60 transition-colors flex items-center gap-2 px-3 py-2 group">
-              <button
-                type="button"
-                onClick={() => toggleCollapse(g.path)}
-                className="flex items-center gap-2 text-left flex-1 min-w-0"
-                aria-expanded={!isCollapsed}
-                aria-label={`${isCollapsed ? '展開' : '摺疊'} ${g.path}`}
-              >
-                <ChevronDown
-                  className={cn(
-                    'size-3.5 text-muted-foreground transition-transform shrink-0',
-                    isCollapsed && '-rotate-90',
-                  )}
-                  aria-hidden="true"
+      {/* 單一 table:一個 thead 管全部群組(欄位相同,不必每個資料夾
+          重複表頭),群組標題列用 colSpan 撐滿 — 欄寬也因此對齊。 */}
+      <div className="rounded-md border border-border overflow-hidden bg-background">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/50">
+            <tr className="text-left text-[10px] uppercase tracking-wide text-muted-foreground">
+              <th className="px-2 py-2 w-8">
+                <input
+                  type="checkbox"
+                  checked={allFilteredSelected}
+                  onChange={onToggleSelectAll}
+                  className="accent-foreground"
+                  aria-label="全選顯示中的規則"
                 />
-                <span className="font-mono text-xs truncate flex-1" title={g.path}>
-                  {g.path}
-                </span>
-                <span className="text-[10px] tabular-nums text-muted-foreground shrink-0 hidden sm:inline">
-                  {g.rules.length} 條 · {g.totalHits.toLocaleString()} 命中
-                  {accPct !== null && (
-                    <>
-                      {' · '}
-                      <span className={accClass}>{accPct}%</span>
-                    </>
-                  )}
-                </span>
-              </button>
-              {/* Bulk-disable: hover-reveal on pointer; always visible
-                  via focus so keyboard users still reach it. */}
-              {g.enabledCount > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!confirm(`停用「${g.path}」底下 ${g.enabledCount} 條啟用中的規則?`)) return
-                    void (async () => {
-                      for (const r of g.rules) {
-                        if (r.enabled) {
-                          try {
-                            await onToggle(r, false)
-                          } catch (err) {
-                            console.warn(
-                              '[mail-organizer] folder bulk-disable item failed',
-                              r.id,
-                              err,
-                            )
-                          }
-                        }
-                      }
-                    })()
-                  }}
-                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-[10px] px-2 py-0.5 rounded border border-border bg-background hover:bg-accent shrink-0"
-                  title="停用此資料夾的所有啟用規則"
-                >
-                  全部停用
-                </button>
-              )}
-            </div>
-            {/* Body — table without the target column */}
-            {!isCollapsed && (
-              <table className="w-full text-xs">
-                <thead className="bg-muted/20 border-t border-border">
-                  <tr className="text-left text-[10px] uppercase tracking-wide text-muted-foreground">
-                    <th className="px-2 py-1.5 w-8"></th>
-                    <th className="px-2 py-1.5 w-20">類型</th>
-                    <th className="px-2 py-1.5">Signal</th>
-                    <th className="px-2 py-1.5 w-16 text-right">命中</th>
-                    <th className="px-2 py-1.5 w-20 text-right">Conf</th>
-                    <th className="px-2 py-1.5 w-20">來源</th>
-                    <th className="px-2 py-1.5 w-12"></th>
+              </th>
+              <th className="px-2 py-2 w-20">類型</th>
+              <th className="px-2 py-2">條件</th>
+              <th className="px-2 py-2 w-16 text-right">命中</th>
+              <th className="px-2 py-2 w-24 text-right">最近使用</th>
+              <th className="px-2 py-2 w-12"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((g) => {
+              const isCollapsed = collapsed.has(g.path)
+              const accPct =
+                g.totalHits > 0
+                  ? Math.round(((g.totalHits - g.totalOverrides) / g.totalHits) * 100)
+                  : null
+              const accClass =
+                accPct === null
+                  ? 'text-muted-foreground'
+                  : accPct >= 90
+                    ? 'text-emerald-700'
+                    : accPct >= 70
+                      ? 'text-amber-700'
+                      : 'text-red-700'
+              return (
+                <Fragment key={g.path}>
+                  {/* Folder header — collapse toggle is the main button; bulk
+                      action is a sibling button (not nested) to keep the HTML
+                      semantically valid. Both live in a flex row that handles
+                      hover styling via the `group` class on the wrapper. */}
+                  <tr className="border-t border-border">
+                    <td colSpan={6} className="p-0">
+                      <div className="bg-muted/40 hover:bg-muted/60 transition-colors flex items-center gap-2 px-3 py-2 group">
+                        <button
+                          type="button"
+                          onClick={() => toggleCollapse(g.path)}
+                          className="flex items-center gap-2 text-left flex-1 min-w-0"
+                          aria-expanded={!isCollapsed}
+                          aria-label={`${isCollapsed ? '展開' : '摺疊'} ${g.path}`}
+                        >
+                          <ChevronDown
+                            className={cn(
+                              'size-3.5 text-muted-foreground transition-transform shrink-0',
+                              isCollapsed && '-rotate-90',
+                            )}
+                            aria-hidden="true"
+                          />
+                          <span className="font-mono text-xs truncate flex-1" title={g.path}>
+                            {g.path}
+                          </span>
+                          <span className="text-[10px] tabular-nums text-muted-foreground shrink-0 hidden sm:inline">
+                            {g.rules.length} 條 · {g.totalHits.toLocaleString()} 命中
+                            {accPct !== null && (
+                              <>
+                                {' · '}
+                                <span className={accClass}>{accPct}%</span>
+                              </>
+                            )}
+                          </span>
+                        </button>
+                        {/* Bulk-disable: hover-reveal on pointer; always visible
+                            via focus so keyboard users still reach it. */}
+                        {g.enabledCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!confirm(`停用「${g.path}」底下 ${g.enabledCount} 條啟用中的規則?`)) return
+                              void (async () => {
+                                for (const r of g.rules) {
+                                  if (r.enabled) {
+                                    try {
+                                      await onToggle(r, false)
+                                    } catch (err) {
+                                      console.warn(
+                                        '[mail-organizer] folder bulk-disable item failed',
+                                        r.id,
+                                        err,
+                                      )
+                                    }
+                                  }
+                                }
+                              })()
+                            }}
+                            className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-[10px] px-2 py-0.5 rounded border border-border bg-background hover:bg-accent shrink-0"
+                            title="停用此資料夾的所有啟用規則"
+                          >
+                            全部停用
+                          </button>
+                        )}
+                      </div>
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {g.rules.map((r) => (
-                    <RuleRow
-                      key={r.id}
-                      rule={r}
-                      selected={selected.has(r.id)}
-                      highlighted={detailId === r.id}
-                      showTarget={false}
-                      onSelect={onSelect}
-                      onOpenDetail={onOpenDetail}
-                      onToggle={handleToggleRule}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        )
-      })}
+                  {!isCollapsed &&
+                    g.rules.map((r) => (
+                      <RuleRow
+                        key={r.id}
+                        rule={r}
+                        selected={selected.has(r.id)}
+                        highlighted={detailId === r.id}
+                        showTarget={false}
+                        onSelect={onSelect}
+                        onOpenDetail={onOpenDetail}
+                        onToggle={handleToggleRule}
+                      />
+                    ))}
+                </Fragment>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -3953,7 +4437,7 @@ function ConflictsView({
                               const others = group.length - 1
                               if (
                                 !confirm(
-                                  `保留「${r.targetFolderPath}」這條、刪除其餘 ${others} 條?\n(刪除會寫入墓碑、AI 不會再自動學回同樣的規則)`,
+                                  `保留「${r.targetFolderPath}」這條、刪除其餘 ${others} 條?\n(刪除後 AI 不會再自動學回同樣的規則)`,
                                 )
                               ) {
                                 return
@@ -4050,7 +4534,7 @@ function ConflictsView({
                           if (!winner) return
                           if (
                             !confirm(
-                              `保留信心最高的「${winner.targetFolderPath}」(conf ${winner.confidence.toFixed(2)})、刪除其餘 ${group.length - 1} 條?\n(刪除會寫入墓碑、AI 不會再自動學回同樣的規則)`,
+                              `保留信心最高的「${winner.targetFolderPath}」(conf ${winner.confidence.toFixed(2)})、刪除其餘 ${group.length - 1} 條?\n(刪除後 AI 不會再自動學回同樣的規則)`,
                             )
                           ) {
                             return
@@ -4229,7 +4713,7 @@ function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
         return
       }
     } else if (!signal.trim()) {
-      setError('signal 不可空')
+      setError('條件不可空')
       return
     }
     const r = await onSubmit({
@@ -5070,8 +5554,8 @@ function CrossMachineSyncCard({
         // a transient OK message — keep on screen until user reads.
         setError(
           `已上傳、但有 ${truncRules} 條規則` +
-            (truncTombs > 0 ? ` + ${truncTombs} 條墓碑` : '') +
-            ' 因為超過 chunk 上限沒同步上去。請清理「自動休眠」規則。',
+            (truncTombs > 0 ? ` + ${truncTombs} 筆刪除紀錄` : '') +
+            ' 因為超過 chunk 上限沒同步上去。請清理「已停用」規則。',
         )
       } else {
         setOk('已上傳到雲端')
@@ -5128,10 +5612,10 @@ function CrossMachineSyncCard({
         <CardTitle className="text-sm">跨機器同步</CardTitle>
         <CardDescription className="space-y-1">
           <span className="block">
-            把規則、墓碑、設定(扣 API key){accountDesc}同步到你另一台裝同款瀏覽器的機器。
+            把規則、刪除紀錄、設定(扣 API key){accountDesc}同步到你另一台裝同款瀏覽器的機器。
           </span>
           <span className="block text-[10px] text-muted-foreground">
-            ✓ 同步:user_manual / ai_confirmed / ai_overridden 規則、墓碑、設定 ·
+            ✓ 同步:手動與 AI 學習規則、刪除紀錄、設定 ·
             ✗ 不同步:auto_scan 規則(各機器各自跑初始掃描)、API key、本機快取
           </span>
           <span className="block text-[10px] text-muted-foreground">
@@ -5195,7 +5679,7 @@ function CrossMachineSyncCard({
                 </div>
                 <div className="text-[11px] text-amber-950">
                   本機已自動同步清除 {remoteWipeNotice.droppedRuleCount} 條
-                  跨機器規則 + 全部墓碑(發生於{' '}
+                  跨機器規則 + 全部刪除紀錄(發生於{' '}
                   {new Date(remoteWipeNotice.at).toLocaleString('zh-TW')})。
                 </div>
                 <div className="text-[10px] text-amber-900/80">
@@ -5302,7 +5786,7 @@ function CrossMachineSyncCard({
                 <div>上次同步:{syncStatus?.lastSyncAt ? new Date(syncStatus.lastSyncAt).toLocaleString('zh-TW') : '從未'}</div>
                 {syncStatus?.cloud && (
                   <div>
-                    雲端狀態:{syncStatus.cloud.ruleCount} 條規則 · {syncStatus.cloud.tombstoneCount} 條墓碑 ·
+                    雲端狀態:{syncStatus.cloud.ruleCount} 條規則 · {syncStatus.cloud.tombstoneCount} 筆刪除紀錄 ·
                     {syncStatus.cloud.isUs ? '本機' : '另一台機器'}寫入於{' '}
                     {new Date(syncStatus.cloud.updatedAt).toLocaleString('zh-TW')}
                   </div>
@@ -5406,7 +5890,7 @@ function CrossMachineSyncCard({
                           <span className="text-muted-foreground">{dirLabel}</span>
                           <span>{new Date(b.snapshotAt).toLocaleString('zh-TW')}</span>
                           <span className="text-muted-foreground tabular-nums">
-                            規則 {b.ruleCount} / 墓碑 {b.tombstoneCount}
+                            規則 {b.ruleCount} / 刪除紀錄 {b.tombstoneCount}
                           </span>
                           <button
                             type="button"
@@ -6000,7 +6484,7 @@ function StaleSweepActionRow() {
       // Report BOTH outcomes — stale rules are hard-deleted (not disabled),
       // so a sweep that only deleted used to read as "nothing to do".
       const parts: string[] = []
-      if (deleted > 0) parts.push(`已刪除 ${deleted} 條休眠規則`)
+      if (deleted > 0) parts.push(`已自動清除 ${deleted} 條長期未命中規則`)
       if (disabled > 0) parts.push(`已自動停用 ${disabled} 條規則`)
       setResult(parts.length > 0 ? parts.join('、') : '沒有符合條件的規則需要清理')
       window.setTimeout(() => setResult(null), 4000)
@@ -6016,9 +6500,9 @@ function StaleSweepActionRow() {
         onClick={() => void run()}
         disabled={running}
         className="underline underline-offset-2 hover:text-foreground disabled:opacity-50"
-        title="現在執行一次休眠規則掃除(平時每天背景自動跑一次)"
+        title="現在執行一次自動清除(平時每天背景自動跑一次,刪除 100 天未命中的規則)"
       >
-        {running ? '掃除中…' : '立即執行休眠掃除'}
+        {running ? '清除中…' : '立即執行自動清除'}
       </button>
       {result && <span className="text-emerald-700">{result}</span>}
     </div>
@@ -6027,25 +6511,16 @@ function StaleSweepActionRow() {
 
 function RuleHealthSection({
   rules,
-  onToggle,
-  onDelete,
-  onEdit,
+  onOpenChip,
+  onOpenConflicts,
 }: {
   rules: Rule[]
-  onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
-  onDelete: (ruleId: string) => Promise<boolean>
-  /** Jump to Rules section and open the editor on this rule. */
-  onEdit: (ruleId: string) => void
+  /** 跳到「全部規則」view 並套用對應的預設分類 chip。 */
+  onOpenChip: (chip: 'sleeping' | 'hotVague' | 'orphaned' | 'overBroad') => void
+  /** 跳到衝突 view — ConflictsView 是衝突處理的唯一介面。 */
+  onOpenConflicts: () => void
 }) {
   const health = useMemo(() => computeRuleHealth(rules), [rules])
-  const [openBucket, setOpenBucket] = useState<
-    null | 'sleeping' | 'hotVague' | 'orphaned' | 'overBroad' | 'conflicts'
-  >(null)
-
-  const conflictRules = useMemo(
-    () => rules.filter((r) => health.conflictRuleIds.has(r.id)),
-    [rules, health.conflictRuleIds],
-  )
 
   const totalSignals =
     health.counts.sleeping +
@@ -6070,206 +6545,62 @@ function RuleHealthSection({
           )}
         </CardTitle>
         <CardDescription>
-          長期未命中、命中多但路徑模糊、彼此衝突、目標資料夾不存在等情況。點分類展開檢視與處理。
-          每天背景自動把 100 天未命中的「休眠」規則刪除(不可復原、不留紀錄;同訊號日後可重新學回)、不影響手動規則。
+          規則庫的例外狀況,點分類跳轉處理。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2 text-xs">
         <StaleSweepActionRow />
+        {/* 分類列是跳轉入口(2026-07 UX 重整):點了帶到「全部規則」
+            view + 套用同名 chip,在完整表格裡處理(全選 / 批次刪除都
+            在那邊)— 這裡不再內嵌各分類的規則清單。說明文字收進
+            tooltip(hover 分類列可見)。 */}
         <HealthBucketButton
-          label="休眠"
+          label="長期未命中"
           count={health.counts.sleeping}
-          active={openBucket === 'sleeping'}
-          onClick={() => setOpenBucket((b) => (b === 'sleeping' ? null : 'sleeping'))}
-          description="從未命中 30 天 / 或上次命中 ≥ 90 天前。每日自動掃除會把 ≥ 100 天未命中的規則刪除(不可復原、不留紀錄;同訊號日後可重新學回)"
+          onClick={() => onOpenChip('sleeping')}
+          description="從未命中 30 天 / 或上次命中 ≥ 90 天前。每日「自動清除」會把 ≥ 100 天未命中的規則刪除(不可復原、不留紀錄;同訊號日後可重新學回)"
         />
         <HealthBucketButton
           label="模糊熱門"
           count={health.counts.hotVague}
-          active={openBucket === 'hotVague'}
-          onClick={() => setOpenBucket((b) => (b === 'hotVague' ? null : 'hotVague'))}
+          onClick={() => onOpenChip('hotVague')}
           description="高命中數但目標含「未分類 / 其他 / 雜項」等通用資料夾 — 建議細分"
         />
         <HealthBucketButton
           label="衝突"
           count={health.counts.conflicts}
-          active={openBucket === 'conflicts'}
-          onClick={() => setOpenBucket((b) => (b === 'conflicts' ? null : 'conflicts'))}
+          onClick={onOpenConflicts}
           description="同類型同條件對應不同資料夾 — 衝突時改由 AI 逐封判斷"
         />
         <HealthBucketButton
           label="目標遺失"
           count={health.counts.orphaned}
-          active={openBucket === 'orphaned'}
-          onClick={() => setOpenBucket((b) => (b === 'orphaned' ? null : 'orphaned'))}
+          onClick={() => onOpenChip('orphaned')}
           description="規則指定的目標資料夾在 Outlook 中已不存在 — 命中時會被跳過"
         />
         <HealthBucketButton
           label="過於廣泛"
           count={health.counts.overBroad}
-          active={openBucket === 'overBroad'}
-          onClick={() => setOpenBucket((b) => (b === 'overBroad' ? null : 'overBroad'))}
+          onClick={() => onOpenChip('overBroad')}
           description="純 domain 規則綁在 gmail.com / yahoo.com 等通用信箱 — 建議升級為複合或刪除"
         />
-
-        {openBucket === 'sleeping' && (
-          <HealthRuleList
-            rules={health.sleeping}
-            emptyText="沒有休眠規則"
-            actions={(r) => (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => onEdit(r.id)}
-                  title="在規則庫展開編輯"
-                >
-                  <Pencil className="size-3" /> 編輯
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => void onToggle(r, false)}
-                >
-                  停用
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px] text-red-700 hover:text-red-700"
-                  onClick={() => void onDelete(r.id)}
-                >
-                  刪除
-                </Button>
-              </>
-            )}
-          />
-        )}
-        {openBucket === 'hotVague' && (
-          <HealthRuleList
-            rules={health.hotVague}
-            emptyText="沒有模糊熱門規則"
-            actions={(r) => (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => onEdit(r.id)}
-                  title="在規則庫展開編輯 — 可改 signal 或 target"
-                >
-                  <Pencil className="size-3" /> 編輯
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px] text-red-700 hover:text-red-700"
-                  onClick={() => void onDelete(r.id)}
-                >
-                  刪除
-                </Button>
-              </>
-            )}
-          />
-        )}
-        {openBucket === 'conflicts' && (
-          <HealthRuleList
-            rules={conflictRules}
-            emptyText="沒有衝突"
-            actions={(r) => (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => onEdit(r.id)}
-                  title="在規則庫展開編輯"
-                >
-                  <Pencil className="size-3" /> 編輯
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px] text-red-700 hover:text-red-700"
-                  onClick={() => void onDelete(r.id)}
-                >
-                  刪除
-                </Button>
-              </>
-            )}
-          />
-        )}
-        {openBucket === 'orphaned' && (
-          <HealthRuleList
-            rules={health.orphaned}
-            emptyText="沒有目標遺失"
-            actions={(r) => (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => onEdit(r.id)}
-                  title="在規則庫展開編輯 — 重新指定 target"
-                >
-                  <Pencil className="size-3" /> 重新指定 target
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px] text-red-700 hover:text-red-700"
-                  onClick={() => void onDelete(r.id)}
-                >
-                  刪除
-                </Button>
-              </>
-            )}
-          />
-        )}
-        {openBucket === 'overBroad' && (
-          <HealthRuleList
-            rules={health.overBroad}
-            emptyText="沒有過於廣泛的 domain 規則"
-            actions={(r) => (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 px-2 text-[10px]"
-                  onClick={() => onEdit(r.id)}
-                  title="在規則庫展開編輯 — 可改成複合規則(domain + 主旨關鍵字)"
-                >
-                  <Pencil className="size-3" /> 編輯
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-2 text-[10px] text-red-700 hover:text-red-700"
-                  onClick={() => void onDelete(r.id)}
-                >
-                  刪除
-                </Button>
-              </>
-            )}
-          />
-        )}
       </CardContent>
     </Card>
   )
 }
 
+/**
+ * 健康度分類列 — 跳轉入口樣式:label + count + →。說明文字放 title
+ * tooltip(F:copy diet,常駐說明改 hover 看)。count = 0 時 disabled。
+ */
 function HealthBucketButton({
   label,
   count,
-  active,
   onClick,
   description,
 }: {
   label: string
   count: number
-  active: boolean
   onClick: () => void
   description: string
 }) {
@@ -6279,63 +6610,31 @@ function HealthBucketButton({
       type="button"
       onClick={onClick}
       disabled={isClean}
+      title={description}
       className={cn(
-        'w-full text-left rounded-md border px-2.5 py-1.5 transition-colors',
+        'w-full text-left rounded-md border px-2.5 py-2 transition-colors',
         isClean
           ? 'border-border bg-muted/30 text-muted-foreground cursor-default'
-          : active
-            ? 'border-foreground bg-accent'
-            : 'border-border bg-card hover:bg-accent/50 cursor-pointer',
+          : 'border-border bg-card hover:bg-accent/50 cursor-pointer',
       )}
     >
-      <div className="flex items-baseline justify-between gap-2">
+      <div className="flex items-center justify-between gap-2">
         <span className="font-medium">{label}</span>
-        <span
-          className={cn(
-            'font-mono tabular-nums',
-            isClean ? 'text-muted-foreground' : count > 0 ? 'text-amber-800' : '',
+        <span className="flex items-center gap-1.5">
+          <span
+            className={cn(
+              'font-mono tabular-nums',
+              isClean ? 'text-muted-foreground' : 'text-amber-800',
+            )}
+          >
+            {count}
+          </span>
+          {!isClean && (
+            <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
           )}
-        >
-          {count}
         </span>
       </div>
-      <div className="text-[10px] text-muted-foreground mt-0.5">{description}</div>
     </button>
-  )
-}
-
-function HealthRuleList({
-  rules,
-  emptyText,
-  actions,
-}: {
-  rules: Rule[]
-  emptyText: string
-  actions: (r: Rule) => ReactNode
-}) {
-  if (rules.length === 0) {
-    return <p className="text-[11px] text-muted-foreground italic px-2">{emptyText}</p>
-  }
-  return (
-    <ul className="space-y-1 max-h-72 overflow-y-auto rounded-md border border-border bg-muted/20 p-2">
-      {rules.map((r) => (
-        <li key={r.id} className="flex items-center gap-2 text-[11px]">
-          <Badge variant="outline" className="font-mono text-[9px]">
-            {refinedTypeLabel(r.type, r.signal)}
-          </Badge>
-          <span className="font-mono truncate min-w-0 flex-1" title={r.signal}>
-            {r.type === 'compound' ? formatCompoundSignal(r.signal) : r.signal}
-          </span>
-          <span className="font-mono text-[10px] text-muted-foreground truncate">
-            → {r.targetFolderPath}
-          </span>
-          <span className="font-mono text-[10px] tabular-nums text-muted-foreground shrink-0">
-            {r.matchCount} 中
-          </span>
-          <span className="flex gap-1 shrink-0">{actions(r)}</span>
-        </li>
-      ))}
-    </ul>
   )
 }
 

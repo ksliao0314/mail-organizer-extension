@@ -533,7 +533,7 @@ const RULE_TYPE_LABEL: Record<string, string> = {
   sender: '寄件人',
   case_code: '案件代號',
   subject_keyword: '主旨關鍵字',
-  compound: '複合條件',
+  compound: '組合規則',
 }
 
 function formatRelativeTime(iso: string | undefined): string | null {
@@ -689,7 +689,7 @@ export function RuleTraceBlock({
           </div>
           {item.threadMatch?.kind === 'subject' && (
             <div className="text-[9px] text-muted-foreground">
-              主旨匹配為較寬鬆的 fallback;若該主旨後續被歸到不同資料夾(衝突),則此機制自動停止建議。
+              主旨比對是較寬鬆的備援方式;若同主旨之後被歸到不同資料夾,系統會自動停止這類建議。
             </div>
           )}
           {item.reason && (
