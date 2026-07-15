@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   actionToPlanItem,
+  buildActiveFoldersBlock,
+  buildCaseMapBlock,
   buildEmailBlock,
   buildFolderBlock,
   classifyBatch,
@@ -195,6 +197,113 @@ describe('buildEmailBlock', () => {
     const longText = 'A'.repeat(500)
     const block = buildEmailBlock([email({ Id: 'e', BodyPreview: longText })])
     expect(block).not.toContain('A'.repeat(201))
+  })
+
+  // B2-B: case-number detection line
+  it('surfaces a detected court case number from the subject', () => {
+    const block = buildEmailBlock([
+      email({ Id: 'e', Subject: '關於 112年度訴字第204號 開庭通知' }),
+    ])
+    expect(block).toMatch(/識別碼:.*112訴204/)
+  })
+
+  it('detects a case number from the body preview when the subject has none', () => {
+    const block = buildEmailBlock([
+      email({ Id: 'e', Subject: '開庭通知', BodyPreview: '案號 112訴204 敬請出席' }),
+    ])
+    expect(block).toMatch(/識別碼:.*112訴204/)
+  })
+
+  it('omits the 識別碼 line when no case number is present', () => {
+    const block = buildEmailBlock([email({ Id: 'e', Subject: '午餐揪團' })])
+    expect(block).not.toContain('識別碼:')
+  })
+
+  // B2-C: soft thread hint line, keyed by email Id
+  it('renders a thread hint for the matching email only', () => {
+    const block = buildEmailBlock(
+      [email({ Id: 'e1', Subject: 'a' }), email({ Id: 'e2', Subject: 'b' })],
+      { threadHints: { e2: '此對話近期曾歸於「客戶A/訴訟」（僅供參考）' } },
+    )
+    const [rec0, rec1] = block.split('\n\n')
+    expect(rec0).not.toContain('線索:')
+    expect(rec1).toContain('線索:此對話近期曾歸於「客戶A/訴訟」')
+  })
+})
+
+// ---- buildCaseMapBlock (B2-B) ----------------------------------------------
+
+function caseRule(over: Partial<Rule>): Rule {
+  return {
+    id: 'r-' + Math.random().toString(36).slice(2),
+    type: 'case_code',
+    signal: '25A0067A',
+    targetFolderId: 'fid',
+    targetFolderPath: '03/X 案',
+    confidence: 0.9,
+    matchCount: 10,
+    enabled: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    source: 'user_manual',
+    ...over,
+  } as Rule
+}
+
+describe('buildCaseMapBlock', () => {
+  it('is empty when no case rules exist', () => {
+    expect(buildCaseMapBlock([caseRule({ type: 'domain', signal: 'x.com' })])).toBe('')
+  })
+
+  it('maps case_code and court-case subject rules to their folders', () => {
+    const block = buildCaseMapBlock([
+      caseRule({ type: 'case_code', signal: '25a0067a', targetFolderPath: '03/X 案' }),
+      caseRule({ type: 'subject_keyword', signal: '112訴204', targetFolderPath: '03/Y 案' }),
+    ])
+    expect(block).toMatch(/25A0067A → 03\/X 案/) // case_code upper-cased
+    expect(block).toMatch(/112訴204 → 03\/Y 案/)
+  })
+
+  it('excludes a subject_keyword rule whose signal is not a bare case number', () => {
+    const block = buildCaseMapBlock([
+      caseRule({ type: 'subject_keyword', signal: '請款通知', targetFolderPath: '05/發票' }),
+    ])
+    expect(block).toBe('')
+  })
+
+  it('skips disabled / orphaned rules', () => {
+    const block = buildCaseMapBlock([
+      caseRule({ signal: '25A0001A', enabled: false }),
+      caseRule({ signal: '25A0002A', orphaned: true }),
+    ])
+    expect(block).toBe('')
+  })
+})
+
+// ---- buildActiveFoldersBlock (B2-D) ----------------------------------------
+
+describe('buildActiveFoldersBlock', () => {
+  it('is empty for undefined / empty input', () => {
+    expect(buildActiveFoldersBlock(undefined, [])).toBe('')
+    expect(buildActiveFoldersBlock([], [])).toBe('')
+  })
+
+  it('lists folders and drops excluded / duplicate paths', () => {
+    const block = buildActiveFoldersBlock(
+      ['03/進行中', '05已完成案件/old', '03/進行中', '03/另一案'],
+      ['05已完成案件'],
+    )
+    expect(block).toContain('本工具近期歸檔的資料夾')
+    expect(block).toContain('- 03/進行中')
+    expect(block).toContain('- 03/另一案')
+    expect(block).not.toContain('05已完成案件')
+    // de-duplicated
+    expect(block.match(/03\/進行中/g)).toHaveLength(1)
+  })
+
+  it('caps the list at 15 folders', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `F/${i}`)
+    const block = buildActiveFoldersBlock(many, [])
+    expect(block.split('\n').filter((l) => l.startsWith('- '))).toHaveLength(15)
   })
 })
 

@@ -15,7 +15,7 @@
 // input tokens per call.
 
 import { flattenFolderTree } from './outlook-api'
-import { decodeCompound } from './rules'
+import { courtCaseSignal, decodeCompound, extractCaseCodes, extractCourtCaseNumbers } from './rules'
 import type { Email, MailFolderNode, PlanItem, Rule, Settings } from './types'
 
 const API_URL = 'https://api.anthropic.com/v1/messages'
@@ -68,7 +68,7 @@ function buildSystemPrompt(settings: Settings): string {
     ...(internalLine ? [internalLine] : []),
     '外部寄件人 / 收件人:用網域對應到主題相關的資料夾',
     '主旨含明確識別碼(編號、案號、訂單號等)的、優先用該識別碼定位',
-    'reason 30 字內、講明判斷的 key signal',
+    'reason 50 字內、先講判斷的 key signal 再下結論',
   ]
     .map((line, i) => `${i + 1}. ${line}`)
     .join('\n')
@@ -84,10 +84,11 @@ function buildSystemPrompt(settings: Settings): string {
 判斷原則:
 ${numberedRules}
 
-嚴格 JSON array、不要任何前後文、不要 markdown fence:
+嚴格 JSON array、不要任何前後文、不要 markdown fence。
+每筆先寫 reason(判斷依據)再寫 action —— 讓結論被自己的推理制約、提高準確度:
 [
-  { "emailIndex": 0, "action": "move", "targetFolderPath": "${exampleRoot}/<分類>/<子分類>", "confidence": 0.9, "reason": "寄件網域 @<外部網域>" },
-  { "emailIndex": 1, "action": "delete", "confidence": 0.95, "reason": "電子報通訊" }
+  { "emailIndex": 0, "reason": "寄件網域 @<外部網域>、主旨提及該客戶案件", "action": "move", "targetFolderPath": "${exampleRoot}/<分類>/<子分類>", "confidence": 0.9 },
+  { "emailIndex": 1, "reason": "電子報通訊、與案件無關", "action": "delete", "confidence": 0.95 }
 ]
 `
 }
@@ -142,6 +143,20 @@ export type ClassifierInput = {
    * loses in-context learning).
    */
   rules?: Rule[]
+  /**
+   * Per-email soft hints keyed by `email.Id` (B2-C). The preflight attaches a
+   * short note for emails whose conversation / subject was recently filed
+   * somewhere but was too ambiguous (conflictCount>0) to auto-route — a weak
+   * nudge the AI can weigh, explicitly framed as uncertain.
+   */
+  threadHints?: Record<string, string>
+  /**
+   * Folder paths this tool has recently filed mail into, most-recent first
+   * (B2-D). Rendered as a reference-only block so the AI biases toward
+   * still-active case folders instead of misfiling into a closed case's
+   * folder. Excluded / capped further inside; omit or [] to skip the block.
+   */
+  recentFolders?: string[]
 }
 
 // ---- Prompt building -------------------------------------------------------
@@ -156,8 +171,26 @@ function pathExcluded(path: string, excludePrefixes: string[]): boolean {
 
 // ---- Few-shot examples -----------------------------------------------------
 
-const EXEMPLAR_MAX = 8
-const EXEMPLAR_MIN_MATCH_COUNT = 5
+const EXEMPLAR_MAX = 12
+// Source-aware eligibility (優化 2026-07): user-validated rules need no
+// statistical proof — a rule the user hand-built or corrected AI to is
+// authoritative at matchCount 0. Only auto-derived rules must earn their
+// spot with hits.
+const EXEMPLAR_MIN_MATCH: Record<Rule['source'], number> = {
+  user_manual: 0,
+  ai_overridden: 0,
+  ai_confirmed: 3,
+  auto_scan: 5,
+}
+// Reserve a few slots for RECENT user corrections regardless of matchCount —
+// "AI erred on this class last week and the user fixed it" is the single most
+// instructive example, but ai_overridden rules are born at matchCount 0 and
+// would otherwise never qualify.
+const EXEMPLAR_RECENT_RESERVED = 3
+const EXEMPLAR_RECENT_AGE_MS = 30 * 24 * 60 * 60 * 1000
+// Cap examples pointing at the SAME folder so a high-traffic folder can't
+// monopolize the block and skew the AI toward 1-2 destinations.
+const EXEMPLAR_PER_FOLDER_CAP = 2
 
 /**
  * Pick a small set of high-quality rules to use as in-context examples.
@@ -165,45 +198,85 @@ const EXEMPLAR_MIN_MATCH_COUNT = 5
  *   - Prefer user-validated sources (user_manual > ai_overridden) over
  *     auto-scan or AI-confirmed (which can be noisy).
  *   - Skip disabled / orphaned rules — they teach the wrong thing.
- *   - Hit at least one example per rule type when available so the AI sees
- *     domain / case_code / subject_keyword / sender / compound diversity.
- *   - Cap at EXEMPLAR_MAX so prompt-cache stays warm and we don't pay for
- *     a wall of examples.
+ *   - Reserve slots for recent user corrections (in-context learning's
+ *     highest-value signal).
+ *   - Diversity: one per type first, then cap per target folder.
+ *   - Cap at EXEMPLAR_MAX so prompt-cache stays warm.
+ * `nowMs` is injectable for deterministic tests.
  */
-export function selectExemplars(rules: Rule[]): Rule[] {
-  const candidates = rules.filter(
-    (r) => r.enabled && !r.orphaned && r.matchCount >= EXEMPLAR_MIN_MATCH_COUNT,
-  )
-  // Source priority: user_manual = 3 (gold standard, hand-built),
-  // ai_overridden = 2 (user corrected AI), ai_confirmed = 1, auto_scan = 0.
+export function selectExemplars(rules: Rule[], nowMs: number = Date.now()): Rule[] {
   const sourceRank: Record<Rule['source'], number> = {
     user_manual: 3,
     ai_overridden: 2,
     ai_confirmed: 1,
     auto_scan: 0,
   }
-  const sorted = [...candidates].sort((a, b) => {
+  // Secondary sort key: log-bucket the matchCount so tiny per-batch changes
+  // (a rule ticking 41→42) don't reshuffle the exemplar set and needlessly
+  // invalidate the prompt cache.
+  const matchBucket = (r: Rule): number => Math.floor(Math.log2(r.matchCount + 1))
+  const bySalience = (a: Rule, b: Rule): number => {
     const s = sourceRank[b.source] - sourceRank[a.source]
     if (s !== 0) return s
-    if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount
+    const m = matchBucket(b) - matchBucket(a)
+    if (m !== 0) return m
     return a.signal.localeCompare(b.signal)
-  })
+  }
 
-  // Greedy fill, prefer type diversity. Walk the sorted list twice: first
-  // pass picks at most one per type, second pass fills remaining slots from
-  // whatever's left.
+  const usable = rules.filter((r) => r.enabled && !r.orphaned)
   const picked: Rule[] = []
+  const folderCount = new Map<string, number>()
+  const canTake = (r: Rule, enforceFolderCap: boolean): boolean => {
+    if (picked.includes(r)) return false
+    if (enforceFolderCap && (folderCount.get(r.targetFolderPath) ?? 0) >= EXEMPLAR_PER_FOLDER_CAP) {
+      return false
+    }
+    return true
+  }
+  const take = (r: Rule) => {
+    picked.push(r)
+    folderCount.set(r.targetFolderPath, (folderCount.get(r.targetFolderPath) ?? 0) + 1)
+  }
+
+  // Pass 0: reserve slots for recent user corrections (matchCount-exempt).
+  const recent = usable
+    .filter(
+      (r) =>
+        (r.source === 'ai_overridden' || r.source === 'user_manual') &&
+        nowMs - Date.parse(r.createdAt) <= EXEMPLAR_RECENT_AGE_MS,
+    )
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  for (const r of recent) {
+    if (picked.length >= EXEMPLAR_RECENT_RESERVED) break
+    if (canTake(r, true)) take(r)
+  }
+
+  // Candidates for the main fill: meet the source-aware match threshold.
+  const candidates = usable
+    .filter((r) => r.matchCount >= EXEMPLAR_MIN_MATCH[r.source])
+    .sort(bySalience)
+
+  // Pass 1: type diversity (one per type), honouring the per-folder cap.
   const seenTypes = new Set<string>()
-  for (const r of sorted) {
+  for (const r of candidates) {
     if (picked.length >= EXEMPLAR_MAX) break
     if (seenTypes.has(r.type)) continue
-    picked.push(r)
+    if (!canTake(r, true)) continue
+    take(r)
     seenTypes.add(r.type)
   }
-  for (const r of sorted) {
+  // Pass 2: fill remaining slots, still capping per folder.
+  for (const r of candidates) {
     if (picked.length >= EXEMPLAR_MAX) break
-    if (picked.includes(r)) continue
-    picked.push(r)
+    if (!canTake(r, true)) continue
+    take(r)
+  }
+  // Pass 3: if still short (small library where the folder cap starved us),
+  // relax the folder cap so we don't ship a near-empty examples block.
+  for (const r of candidates) {
+    if (picked.length >= EXEMPLAR_MAX) break
+    if (!canTake(r, false)) continue
+    take(r)
   }
   return picked
 }
@@ -240,6 +313,37 @@ export function buildExamplesBlock(exemplars: Rule[]): string {
   ].join('\n')
 }
 
+// Case-number → folder map (B2-B). Unlike `selectExemplars` (a diverse SAMPLE
+// capped per folder / per type), this lists EVERY known case identifier so a
+// subject bearing case 「112訴500」 can be routed even when the sampled
+// exemplars didn't happen to include a sibling case in that folder. Capped so
+// a heavy user with hundreds of case rules can't blow the prompt budget.
+const CASE_MAP_MAX = 25
+
+export function buildCaseMapBlock(rules: Rule[]): string {
+  const seen = new Set<string>()
+  const entries: { code: string; path: string; matchCount: number }[] = []
+  for (const r of rules) {
+    if (!r.enabled || r.orphaned) continue
+    // case_code rules store the canonical code as their signal; other types
+    // (subject_keyword learned from a court-case subject) qualify only when
+    // the whole signal IS a court case number.
+    const code = r.type === 'case_code' ? r.signal.trim().toUpperCase() : courtCaseSignal(r.signal)
+    if (!code) continue
+    const key = code + '→' + r.targetFolderPath
+    if (seen.has(key)) continue
+    seen.add(key)
+    entries.push({ code, path: r.targetFolderPath, matchCount: r.matchCount })
+  }
+  if (entries.length === 0) return ''
+  entries.sort((a, b) => b.matchCount - a.matchCount || a.code.localeCompare(b.code))
+  const lines = entries.slice(0, CASE_MAP_MAX).map((e) => `- ${e.code} → ${e.path}`)
+  return [
+    '已知案號 / 代號對照（同一案號的新郵件通常歸同一資料夾；相近號碼可當推斷線索，但仍需依內容判斷）：',
+    lines.join('\n'),
+  ].join('\n')
+}
+
 export function buildFolderBlock(tree: MailFolderNode[], excludePrefixes: string[]): string {
   const flat = flattenFolderTree(tree)
   const lines = flat
@@ -252,6 +356,35 @@ export function buildFolderBlock(tree: MailFolderNode[], excludePrefixes: string
     '',
     '排除清單（不可作為 target）：',
     excludeLines.join('\n'),
+  ].join('\n')
+}
+
+// Recently-active folders (B2-D). folderActivity tells us which case folders
+// this tool has been filing into lately; a lawyer's closed cases keep their
+// folders forever, so without this the AI happily routes a new email into a
+// case that wrapped up two years ago. Reference-only framing — this is a bias
+// signal, not a constraint. NOT cached: activity churns every batch, and
+// pinning it into the cached prefix would thrash the cache. Capped + exclude-
+// filtered (defence in depth; the caller pre-filters too).
+const ACTIVE_FOLDERS_MAX = 15
+
+export function buildActiveFoldersBlock(
+  recentFolders: string[] | undefined,
+  excludePrefixes: string[],
+): string {
+  if (!recentFolders || recentFolders.length === 0) return ''
+  const seen = new Set<string>()
+  const picked: string[] = []
+  for (const p of recentFolders) {
+    if (!p || pathExcluded(p, excludePrefixes) || seen.has(p)) continue
+    seen.add(p)
+    picked.push(p)
+    if (picked.length >= ACTIVE_FOLDERS_MAX) break
+  }
+  if (picked.length === 0) return ''
+  return [
+    '本工具近期歸檔的資料夾（僅供參考，代表這些案子仍在進行中；不代表這批郵件一定屬於它們）：',
+    picked.map((p) => '- ' + p).join('\n'),
   ].join('\n')
 }
 
@@ -270,7 +403,35 @@ function recipientAddrs(list?: Email['ToRecipients']): string {
 // subject blowing up the request budget.
 const MAX_SUBJECT_LEN = 200
 
-export function buildEmailBlock(emails: Email[]): string {
+/**
+ * Extract structured case identifiers (Taiwan court case numbers + Latin case
+ * codes) from an email's subject and body preview (B2-B). Subject matches
+ * first (higher precision), preview second (fallback coverage). Deduped,
+ * capped at 4 so a body listing many cases can't blow up the line. These are
+ * high-precision regexes, so surfacing them explicitly stops the AI from
+ * missing a case number buried in a long subject.
+ */
+function detectCaseSignals(subject: string, preview: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const add = (arr: string[]) => {
+    for (const s of arr) {
+      if (seen.has(s)) continue
+      seen.add(s)
+      out.push(s)
+    }
+  }
+  add(extractCourtCaseNumbers(subject))
+  add(extractCaseCodes(subject))
+  add(extractCourtCaseNumbers(preview))
+  add(extractCaseCodes(preview))
+  return out.slice(0, 4)
+}
+
+export function buildEmailBlock(
+  emails: Email[],
+  opts?: { threadHints?: Record<string, string> },
+): string {
   return emails
     .map((m, i) => {
       // Whitespace-collapse Subject and the From display name, same as
@@ -290,11 +451,19 @@ export function buildEmailBlock(emails: Email[]): string {
           ? subjectRaw.slice(0, MAX_SUBJECT_LEN) + '…'
           : subjectRaw
       const preview = (m.BodyPreview ?? '').slice(0, 200).replace(/\s+/g, ' ').trim()
+      // B2-B: surface detected case identifiers as their own line so the AI
+      // treats them as a strong routing signal even when the subject is noisy.
+      const cases = detectCaseSignals(subjectRaw, preview)
+      const caseLine = cases.length ? `\n    識別碼:${cases.join(', ')}` : ''
+      // B2-C: soft thread hint (uncertain — the preflight already auto-routed
+      // the confident ones; anything reaching the AI is ambiguous).
+      const hint = opts?.threadHints?.[m.Id]
+      const hintLine = hint ? `\n    線索:${hint}` : ''
       return `[${i}] 主旨:${subject || '(空主旨)'}
     寄件:${fromName ? fromName + ' ' : ''}<${fromAddr}>
     收件:${to}${cc ? ' / CC: ' + cc : ''}
     日期:${date}
-    預覽:${preview || '(無預覽)'}`
+    預覽:${preview || '(無預覽)'}${caseLine}${hintLine}`
     })
     .join('\n\n')
 }
@@ -583,7 +752,7 @@ export async function classifyBatch(
   }
 
   const folderBlock = buildFolderBlock(input.folderTree, input.excludePrefixes)
-  const emailBlock = buildEmailBlock(input.emails)
+  const emailBlock = buildEmailBlock(input.emails, { threadHints: input.threadHints })
   // Few-shot mining is privacy-sensitive: user rule target paths (e.g.
   // "客戶X 離婚案") would round-trip through the LLM. Honour the
   // settings.aiIncludeFewShotExamples flag — defaults to ON because
@@ -593,13 +762,26 @@ export async function classifyBatch(
   // block hides excluded paths from the AI, but an exemplar line
   // "寄件人網域 @x → 排除的資料夾" actively steered the model into naming
   // exactly those paths.
-  const exemplars =
-    input.rules && settings.aiIncludeFewShotExamples
-      ? selectExemplars(input.rules).filter(
-          (r) => !pathExcluded(r.targetFolderPath, input.excludePrefixes),
-        )
-      : []
+  const fewShot = Boolean(input.rules && settings.aiIncludeFewShotExamples)
+  const exemplars = fewShot
+    ? selectExemplars(input.rules!).filter(
+        (r) => !pathExcluded(r.targetFolderPath, input.excludePrefixes),
+      )
+    : []
   const examplesBlock = buildExamplesBlock(exemplars)
+  // Case-number → folder map (B2-B). Same privacy gate as exemplars (it
+  // exposes target paths) and the same exclude filter. Built from the full
+  // rule set so every known case identifier is routable, not just the
+  // sampled exemplars.
+  const caseMapBlock = fewShot
+    ? buildCaseMapBlock(
+        input.rules!.filter((r) => !pathExcluded(r.targetFolderPath, input.excludePrefixes)),
+      )
+    : ''
+  // Recently-active folders (B2-D). NOT gated on aiIncludeFewShotExamples: it
+  // exposes only folder PATHS the tool has been filing into (already visible
+  // in the folder block), no rule signals. Rendered fresh (uncached) below.
+  const activeFoldersBlock = buildActiveFoldersBlock(input.recentFolders, input.excludePrefixes)
 
   // Output budget scales with batch. Chinese tokens are ~1.5× English in
   // Anthropic's tokenizer; folder paths + reasons are mostly Chinese, so we
@@ -638,6 +820,23 @@ export async function classifyBatch(
                   cache_control: { type: 'ephemeral' as const, ttl: '1h' as const },
                 },
               ]
+            : []),
+          // Case-number → folder map (B2-B). Cached alongside the examples;
+          // it's derived from the (slow-changing) rule set, not the batch.
+          ...(caseMapBlock
+            ? [
+                {
+                  type: 'text' as const,
+                  text: caseMapBlock,
+                  cache_control: { type: 'ephemeral' as const, ttl: '1h' as const },
+                },
+              ]
+            : []),
+          // Recently-active folders (B2-D) — FRESH (uncached): folderActivity
+          // churns every batch, so caching it would thrash the prefix cache
+          // and cost more than it saves. Placed just before the email batch.
+          ...(activeFoldersBlock
+            ? [{ type: 'text' as const, text: activeFoldersBlock }]
             : []),
           {
             type: 'text',
