@@ -16,17 +16,15 @@ const ACTION_LABEL: Record<PlanAction, string> = {
   skip: '保留',
 }
 
-const ACTION_TONE: Record<PlanAction, string> = {
-  move: 'border-emerald-300 bg-emerald-50/70',
-  delete: 'border-red-300 bg-red-50/70',
-  new_folder: 'border-amber-300 bg-amber-50/70',
-  skip: 'border-border bg-muted/40',
-}
-
+// UI/UX 檢討 (2026-07)：拿掉滿版粉彩底色 — 80 列的批次裡全彩卡片形成
+// 「色牆」，例外列（待確認/刪除/路徑失效）反而不突出。動作類型只由左側
+// 4px 色條傳達；正常列近乎無色，警示色才有召喚力。
+// new_folder 改用 sky —— amber 從此保留給「需要人工注意」單一語意
+// （待確認徽章、警示 banner），一色一義。
 const ACTION_RAIL: Record<PlanAction, string> = {
   move: 'bg-emerald-500',
   delete: 'bg-red-500',
-  new_folder: 'bg-amber-500',
+  new_folder: 'bg-sky-500',
   skip: 'bg-muted-foreground/40',
 }
 
@@ -247,20 +245,6 @@ export function PlanRow({
       ? '永久刪除'
       : '保留在收件夾'
 
-  // Only unresolved items earn an inline badge in the collapsed view —
-  // rule/AI tone is carried by the action rail; full source detail is
-  // shown on expand. Keeps rows scannable in 50-100 batches.
-  const collapsedAttentionBadge =
-    item.source === 'unresolved' ? (
-      <Badge
-        variant="outline"
-        className="text-[9px] border-amber-300 bg-amber-50 text-amber-800"
-        title="AI 信心低於門檻、未產生明確分類，請你逐封決定"
-      >
-        待決
-      </Badge>
-    ) : null
-
   const sourceDetailBadge = renderSourceBadge(item.source)
 
   // Show the confidence raw number only inside the trace block (on expand).
@@ -268,6 +252,25 @@ export function PlanRow({
   // running list of 0.62 / 0.78 / 0.83 numbers is visual noise and the
   // user can dig into the exact value when they care.
   const lowConfidence = item.source !== 'rule' && item.confidence < 0.5
+
+  // ONE attention badge in the collapsed view (UI/UX 檢討 2026-07)：
+  // 「待決」(unresolved) 與「低信心」對律師是同一個語意 —「這封需要你
+  // 親自決定」。兩顆分開的 amber 徽章稀釋彼此；合併成一顆「待確認」，
+  // 原因放 hover title。其餘 rule/AI tone 由色條與展開後的判斷依據承擔。
+  const needsAttention = item.source === 'unresolved' || lowConfidence
+  const collapsedAttentionBadge = needsAttention ? (
+    <Badge
+      variant="outline"
+      className="text-[9px] border-amber-300 bg-amber-50 text-amber-800"
+      title={
+        item.source === 'unresolved'
+          ? 'AI 信心低於門檻、未產生明確分類，請你決定'
+          : `AI 信心 ${item.confidence.toFixed(2)} 偏低 — 展開看判斷依據`
+      }
+    >
+      待確認
+    </Badge>
+  ) : null
 
   const fromCompact = (() => {
     const raw = item.emailFrom?.trim() ?? ''
@@ -281,21 +284,31 @@ export function PlanRow({
       ref={rowRef}
       onClick={onActivate}
       className={cn(
-        'relative rounded-md border overflow-hidden transition-colors',
-        ACTION_TONE[item.action],
-        selected && 'ring-2 ring-foreground ring-offset-1 ring-offset-background',
-        focused && !selected && 'ring-2 ring-foreground/50 ring-offset-1 ring-offset-background',
+        // 勾選與游標分離的視覺語言（UI/UX 檢討 2026-07）：
+        //   勾選 = checkbox 打勾 + accent 底色 tint（不再用 ring）
+        //   游標 = ink ring — 兩者可同時顯示、互不遮蔽。
+        // 舊版兩者都是 ring 只差 50% 透明度，且游標落在已勾選列時被整個
+        // 隱藏 — 批次鍵盤操作時 d/s 會打到一列使用者定位不到的信。
+        'group relative rounded-md border border-border bg-card overflow-hidden transition-colors',
+        selected && 'bg-accent/60',
+        focused && 'ring-2 ring-foreground/60 ring-offset-1 ring-offset-background',
       )}
     >
       <div className={cn('absolute left-0 top-0 bottom-0 w-1', ACTION_RAIL[item.action])} />
       <div className="flex items-start gap-2 pl-3 pr-3 py-2">
-        {/* Checkbox — own click area, doesn't toggle the expand */}
+        {/* Checkbox — own click area, doesn't toggle the expand. Hover /
+            focus / selected 時才浮現，平時隱形 — 80 列的常駐方框是純噪音 */}
         <div onClick={(e) => e.stopPropagation()} className="pt-0.5">
           <input
             type="checkbox"
             checked={selected}
             onChange={onToggleSelect}
-            className="accent-foreground cursor-pointer"
+            className={cn(
+              'accent-foreground cursor-pointer transition-opacity',
+              selected || focused
+                ? 'opacity-100'
+                : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+            )}
             aria-label="選取此項以套用批次動作"
           />
         </div>
@@ -304,15 +317,20 @@ export function PlanRow({
           onClick={() => setExpanded((v) => !v)}
           className="flex-1 min-w-0 flex items-start gap-2 text-left -mx-1 px-1 py-0.5 -my-0.5 rounded hover:bg-black/[0.02]"
         >
-          <div className="pt-0.5">
+          {/* 展開箭頭同樣 hover / focused / 已展開時才現身（佔位不變、
+              純 opacity — 版面不跳動） */}
+          <div
+            className={cn(
+              'pt-0.5 transition-opacity',
+              expanded || focused ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+            )}
+          >
             {expanded ? <ChevronDown className="size-3.5 text-muted-foreground" /> : <ChevronRight className="size-3.5 text-muted-foreground" />}
           </div>
           <div className="flex-1 min-w-0 space-y-0.5">
             {isWide ? (
               // Wide (reading-pane mode): subject + from share one line with
-              // plenty of horizontal room, action + path on the second line
-              // — total two lines instead of the cramped three-line stack
-              // used in the 540px Chrome popup.
+              // plenty of horizontal room, action + path on the second line.
               <>
                 <div className="flex items-baseline gap-3">
                   <div className="font-medium text-sm flex-1 min-w-0 truncate">
@@ -324,16 +342,6 @@ export function PlanRow({
                   >
                     {item.emailFrom}
                   </div>
-                  {lowConfidence && (
-                    <Badge
-                      variant="outline"
-                      className="text-[9px] border-amber-300 bg-amber-50 text-amber-800 gap-0.5 shrink-0"
-                      title={`AI 信心 ${item.confidence.toFixed(2)} — 展開看判斷依據`}
-                    >
-                      <AlertTriangle className="size-2.5" />
-                      低信心
-                    </Badge>
-                  )}
                 </div>
                 <div className="flex items-baseline gap-2 text-[12px]">
                   <span className="font-medium shrink-0">{ACTION_LABEL[item.action]}</span>
@@ -342,9 +350,6 @@ export function PlanRow({
                   >
                     {display ?? '—'}
                   </span>
-                  {targetIssue && (
-                    <AlertTriangle className="size-3.5 text-red-600 shrink-0" aria-label={targetIssue} />
-                  )}
                   {collapsedAttentionBadge && (
                     <span className="shrink-0">{collapsedAttentionBadge}</span>
                   )}
@@ -357,35 +362,28 @@ export function PlanRow({
                 )}
               </>
             ) : (
-              // Narrow (Chrome toolbar popup at 540px): three-line stack.
+              // Narrow (Chrome toolbar popup at 540px)：兩行制（UI/UX 檢討
+              // 2026-07）— 舊版三行 stack 讓 80 封批次變成 ~9 個滿版畫面的
+              // 捲動牆。第一行 = 主旨（撐滿）＋寄件網域（右靠 mono）；
+              // 第二行 = 動作＋路徑＋待確認徽章。決策所需的三個事實
+              // （誰寄的／什麼信／要放哪）一眼掃完。
               <>
-                <div className="flex items-baseline justify-between gap-2">
-                  <div className="font-medium text-xs truncate">{item.emailSubject || '（無主旨）'}</div>
-                  {lowConfidence && (
-                    <Badge
-                      variant="outline"
-                      className="text-[9px] border-amber-300 bg-amber-50 text-amber-800 gap-0.5 shrink-0"
-                      title={`AI 信心 ${item.confidence.toFixed(2)} — 展開看判斷依據`}
-                    >
-                      <AlertTriangle className="size-2.5" />
-                      低信心
-                    </Badge>
-                  )}
-                </div>
-                <div
-                  className="font-mono text-[10px] text-muted-foreground truncate"
-                  title={item.emailFrom}
-                >
-                  {fromCompact}
+                <div className="flex items-baseline gap-2">
+                  <div className="font-medium text-xs flex-1 min-w-0 truncate">
+                    {item.emailSubject || '（無主旨）'}
+                  </div>
+                  <div
+                    className="font-mono text-[10px] text-muted-foreground shrink-0 max-w-[140px] truncate"
+                    title={item.emailFrom}
+                  >
+                    {fromCompact}
+                  </div>
                 </div>
                 <div className="flex items-baseline gap-1.5 text-[11px]">
                   <span className="font-medium">{ACTION_LABEL[item.action]}</span>
                   <span className={cn('truncate', targetIssue ? 'text-red-700' : 'text-muted-foreground')}>
                     {display ?? '—'}
                   </span>
-                  {targetIssue && (
-                    <AlertTriangle className="size-3 text-red-600 shrink-0" aria-label={targetIssue} />
-                  )}
                   {collapsedAttentionBadge && (
                     <span className="ml-auto shrink-0">{collapsedAttentionBadge}</span>
                   )}
@@ -413,11 +411,9 @@ export function PlanRow({
               {item.bodyPreview.length > 350 && '…'}
             </div>
           )}
-          <RuleTraceBlock
-            item={item}
-            sourceDetailBadge={sourceDetailBadge}
-            onToggleRule={onToggleRule}
-          />
+          {/* 動作按鈕緊跟摘要（UI/UX 檢討 2026-07）：展開的第一目的是改
+              動作/目標，舊排序把按鈕壓在判斷依據面板之下，每次修正都要
+              先掃過兩塊資訊區。 */}
           <div className="flex gap-1 flex-wrap">
             {ACTIONS.map((a) => (
               <button
@@ -471,9 +467,24 @@ export function PlanRow({
             </div>
           )}
 
-          {item.reason && (
-            <div className="text-[10px] text-muted-foreground italic">{item.reason}</div>
-          )}
+          {/* 判斷依據降為 disclosure（預設收合）：修正目標時多半不需要
+              重讀規則統計；一行摘要（來源＋信心）已足夠，展開才給完整
+              trace 與停用按鈕。獨立的 item.reason 行已刪 — RuleTraceBlock
+              內部本來就渲染同一句，展開卡不再出現重複文字。 */}
+          <details className="rounded border border-border/60 bg-muted/20 px-2.5 py-1.5 text-[10px]">
+            <summary className="cursor-pointer select-none flex items-center gap-2 text-muted-foreground hover:text-foreground">
+              <span className="font-medium">判斷依據</span>
+              {sourceDetailBadge}
+              <span className="font-mono tabular-nums">信心 {item.confidence.toFixed(2)}</span>
+            </summary>
+            <div className="mt-1.5">
+              <RuleTraceBlock
+                item={item}
+                sourceDetailBadge={sourceDetailBadge}
+                onToggleRule={onToggleRule}
+              />
+            </div>
+          </details>
 
           <div className="flex items-center justify-between gap-2 pt-1">
             <div className="flex-1">

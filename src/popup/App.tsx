@@ -20,6 +20,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { PlanRow } from './components/PlanRow'
+import { FolderPicker } from './components/FolderPicker'
 import { cn } from '@/lib/utils'
 import { flattenFolderTree, joinFolderPath } from '@/shared/outlook-api'
 import { OnboardingWizard } from './components/OnboardingWizard'
@@ -250,6 +251,20 @@ function planSummary(items: PlanItem[]) {
  * runs new_folder items first, so by the time the dependent move executes the
  * real folder exists in the in-memory tree (spliced) and path lookup succeeds.
  */
+// Banner code → 律師可讀標題（UI/UX 檢討 2026-07）：舊版把 TRUNCATED /
+// PRE_FILTERED 這種機器碼直接渲染成粗體標題。原始 code 移入 title 屬性，
+// 回報問題時 hover 仍查得到。
+const BANNER_TITLE: Record<string, string> = {
+  TRUNCATED: 'AI 回應被截斷、部分郵件未分類',
+  PRE_FILTERED: '部分郵件已預先排除',
+  CONFIDENCE_GATED: '部分郵件 AI 信心不足、已自動保留',
+}
+function bannerTitle(code: string): string {
+  if (BANNER_TITLE[code]) return BANNER_TITLE[code]
+  if (code.startsWith('CLASSIFIER_') || code === 'AI_FAILED') return 'AI 分類發生問題'
+  return '分類時發生問題'
+}
+
 function buildAugmentedTree(tree: MailFolderNode[], items: PlanItem[]): MailFolderNode[] {
   const cloned: MailFolderNode[] = JSON.parse(JSON.stringify(tree))
 
@@ -1335,13 +1350,19 @@ export default function App() {
 
 // Compact phase-context badge shown in the header during non-idle phases.
 // Tells the user "what is this popup doing right now" without making them
-// scan the body. Model name is appended as a small mono badge so they
-// know which Claude tier is on the meter.
+// scan the body.
+//
+// UI/UX 檢討 (2026-07)：plan 階段不再重複顯示封數（摘要卡的「共 N 封」
+// 是這個數字唯一的家）、也不再掛 model 徽章 — 模型資訊屬於設定頁，
+// 每日批次審閱時是純遙測噪音。model 徽章只留在 classifying 階段
+// （那一刻「哪個模型在計費」才是相關資訊）。
 function PhaseContext({ phase, model }: { phase: Phase; model?: string }) {
-  const modelShort = model ? model.replace(/^claude-/, '').replace(/-\d{8}$/, '') : null
+  const modelShort =
+    model && phase.kind === 'classifying'
+      ? model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+      : null
   let label: string | null = null
   if (phase.kind === 'classifying') label = 'AI 分類中…'
-  else if (phase.kind === 'plan') label = `${phase.items.length} 封待處理`
   else if (phase.kind === 'executing') label = `處理中 ${phase.state.current} / ${phase.state.total}`
   else if (phase.kind === 'done')
     label =
@@ -2132,10 +2153,26 @@ function PlanScreen({
   const [filterVisible, setFilterVisible] = useState(false)
   const filterInputRef = useRef<HTMLInputElement | null>(null)
 
+  // 「待確認」過濾（UI/UX 檢討 2026-07）：80 封批次裡律師真正要親自看的
+  // 是 unresolved / 低信心那 5-20 封，其他都是她已信任的規則命中。摘要卡
+  // 的「待確認 N」chip 一鍵切到只看這批 — 這是整個畫面最重要的減噪工具。
+  const [attentionOnly, setAttentionOnly] = useState(false)
+  const needsAttention = useCallback(
+    (item: PlanItem) =>
+      item.source === 'unresolved' || (item.source !== 'rule' && item.confidence < 0.5),
+    [],
+  )
+  const attentionCount = useMemo(
+    () => items.filter(needsAttention).length,
+    [items, needsAttention],
+  )
+
   const filteredItems = useMemo(() => {
-    if (filterChips.length === 0) return items
+    let base = items
+    if (attentionOnly) base = base.filter(needsAttention)
+    if (filterChips.length === 0) return base
     const needles = filterChips.map((c) => c.toLowerCase())
-    return items.filter((item) => {
+    return base.filter((item) => {
       const haystack = [
         item.emailSubject ?? '',
         item.emailFrom ?? '',
@@ -2148,7 +2185,7 @@ function PlanScreen({
         .toLowerCase()
       return needles.every((n) => haystack.includes(n))
     })
-  }, [items, filterChips])
+  }, [items, filterChips, attentionOnly, needsAttention])
 
   function commitFilterDraft() {
     const t = filterDraft.trim()
@@ -2272,7 +2309,20 @@ function PlanScreen({
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [scrollIntoViewToken, setScrollIntoViewToken] = useState(0)
   const [toggleExpandToken, setToggleExpandToken] = useState(0)
-  const [shortcutsHintDismissed, setShortcutsHintDismissed] = useState(false)
+  // 持久化（UI/UX 檢討 2026-07）：舊版是 component-local state，每次開
+  // popup 提示都重生 — 每天用的人被迫反覆關同一條提示。localStorage 在
+  // extension popup 內跨 session 存活；? overlay 仍可隨時查快捷鍵。
+  const [shortcutsHintDismissed, setShortcutsHintDismissed] = useState(
+    () => localStorage.getItem('mo.shortcutsHintDismissed') === '1',
+  )
+  const dismissShortcutsHint = useCallback(() => {
+    setShortcutsHintDismissed(true)
+    try {
+      localStorage.setItem('mo.shortcutsHintDismissed', '1')
+    } catch {
+      // quota / private mode — session-only dismissal is still fine
+    }
+  }, [])
 
   // Auto-clear focus when items disappear (defensive — same scenario as
   // selection pruning above). F15: keep focus in-range for displayItems
@@ -2504,6 +2554,29 @@ function PlanScreen({
     setPropagateToast({ count: targetIds.size, key: Date.now() })
   }
 
+  // Bulk 「移到…」（UI/UX 檢討 2026-07）— 勾選後直接選資料夾套用，
+  // 取代舊的四步隱藏流程。userTouched 同批次刪除/保留的理由。
+  const [bulkMoveOpen, setBulkMoveOpen] = useState(false)
+  useEffect(() => {
+    // 勾選清空時收起 picker，避免殘留一個沒有對象的選擇器。
+    if (selectedIds.size === 0) setBulkMoveOpen(false)
+  }, [selectedIds])
+  function applyMoveTo(node: MailFolderNode) {
+    onBulkApply(selectedIds, (item) => ({
+      ...item,
+      action: 'move' as const,
+      targetFolderId: node.id,
+      targetFolderPath: node.path,
+      suggestedFolderName: undefined,
+      suggestedParentPath: undefined,
+      source: item.source === 'rule' ? 'ai' : item.source,
+      ruleId: item.source === 'rule' ? undefined : item.ruleId,
+      userTouched: true,
+    }))
+    setBulkMoveOpen(false)
+    setSelectedIds(new Set())
+  }
+
   // Bulk 全部刪除/全部保留 set userTouched (audit P2): these are explicit
   // user decisions — without the flag, a later same-subject auto-propagation
   // could silently flip a bulk-保留 row back to 刪除.
@@ -2552,8 +2625,8 @@ function PlanScreen({
         {banner && (
           <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs">
             <AlertTriangle className="size-3.5 mt-0.5 text-amber-700 shrink-0" />
-            <div className="flex-1">
-              <div className="font-medium text-amber-900">{banner.code}</div>
+            <div className="flex-1" title={banner.code}>
+              <div className="font-medium text-amber-900">{bannerTitle(banner.code)}</div>
               <div className="text-amber-800">{banner.message}</div>
             </div>
           </div>
@@ -2570,39 +2643,96 @@ function PlanScreen({
 
   return (
     <div className="space-y-3">
-      {aiPending && (
-        <div
-          className="rounded-md border border-foreground/30 bg-card px-2.5 py-2 space-y-1.5 text-xs"
-          title="popup 可關 — 背景會繼續、回來會自動接著看"
-        >
-          <div className="flex items-center gap-2">
-            <Loader2 className="size-3.5 animate-spin shrink-0" />
-            <span className="font-medium">
-              AI 分類中 {aiPending.completedEmails}/{aiPending.totalEmails}
-            </span>
-            <span className="text-muted-foreground ml-auto font-mono tabular-nums text-[10px]">
-              chunk {aiPending.completedChunks}/{aiPending.chunks}
-            </span>
+      {/* 前導區合併（UI/UX 檢討 2026-07）：舊版清單上方可同時疊 AI 進度卡
+          ＋amber banner＋toast＋摘要卡（含 token telemetry）四塊，600px
+          彈窗第一封信被推到 fold 之下。現在：AI 進度併入摘要卡一行、
+          banner 中文標題、toast 改浮層不佔版面、token/chunk 遙測移除
+          （成本統計收進 title tooltip）。 */}
+      <div className="rounded-md border border-border bg-card p-3 space-y-2">
+        <div className="flex items-baseline justify-between text-xs">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="font-medium">共 {items.length} 封</span>
+            {(filterChips.length > 0 || attentionOnly) && (
+              <span className="text-muted-foreground">
+                · 顯示 <span className="tabular-nums">{filteredItems.length}</span>
+              </span>
+            )}
+            <Badge variant="success" className="gap-1">移 {counts.move}</Badge>
+            <Badge variant="danger" className="gap-1">刪 {counts.delete}</Badge>
+            <Badge variant="warning" className="gap-1">新 {counts.new_folder}</Badge>
+            {counts.skip > 0 && <Badge variant="muted">留 {counts.skip}</Badge>}
+            {attentionCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setAttentionOnly((v) => !v)}
+                className={cn(
+                  'rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors',
+                  attentionOnly
+                    ? 'border-amber-500 bg-amber-100 text-amber-900'
+                    : 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100',
+                )}
+                title={
+                  attentionOnly
+                    ? '目前只顯示待確認 — 點擊恢復全部'
+                    : '只看 AI 沒把握、需要你決定的郵件'
+                }
+              >
+                待確認 {attentionCount}
+              </button>
+            )}
           </div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full bg-foreground transition-all duration-300"
-              style={{
-                width: `${
-                  aiPending.totalEmails > 0
-                    ? Math.round((aiPending.completedEmails / aiPending.totalEmails) * 100)
-                    : 0
-                }%`,
-              }}
-            />
-          </div>
+          <span
+            className="font-mono text-[10px] text-muted-foreground tabular-nums shrink-0"
+            title={
+              usage
+                ? `本批 token：輸入 ${usage.inputTokens} · 輸出 ${usage.outputTokens}` +
+                  (usage.cacheReadTokens > 0 ? ` · 快取命中 ${usage.cacheReadTokens}` : '')
+                : undefined
+            }
+          >
+            規則 {summary.ruleHits} · AI {summary.aiHandled}
+          </span>
+          <button
+            type="button"
+            onClick={() => setFilterVisible(true)}
+            className="text-muted-foreground hover:text-foreground shrink-0 ml-2"
+            aria-label="過濾清單"
+            title="過濾清單（快捷鍵 /）"
+          >
+            <Search className="size-3.5" />
+          </button>
         </div>
-      )}
+        {aiPending && (
+          <div
+            className="space-y-1"
+            title="popup 可關 — 背景會繼續、回來會自動接著看"
+          >
+            <div className="flex items-center gap-2 text-[11px]">
+              <Loader2 className="size-3 animate-spin shrink-0" />
+              <span className="text-muted-foreground">
+                AI 分類中 {aiPending.completedEmails}/{aiPending.totalEmails} — 已完成的可先審閱
+              </span>
+            </div>
+            <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full bg-foreground transition-all duration-300"
+                style={{
+                  width: `${
+                    aiPending.totalEmails > 0
+                      ? Math.round((aiPending.completedEmails / aiPending.totalEmails) * 100)
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
       {banner && (
         <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs">
           <AlertTriangle className="size-3.5 mt-0.5 text-amber-700 shrink-0" />
-          <div className="flex-1">
-            <div className="font-medium text-amber-900">{banner.code}</div>
+          <div className="flex-1" title={banner.code}>
+            <div className="font-medium text-amber-900">{bannerTitle(banner.code)}</div>
             <div className="text-amber-800">{banner.message}</div>
           </div>
           <button type="button" onClick={onDismissBanner} className="text-amber-700 hover:text-amber-900">
@@ -2613,7 +2743,7 @@ function PlanScreen({
       {propagateToast && (
         <div
           key={propagateToast.key}
-          className="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-900 animate-in fade-in slide-in-from-top-1 duration-200"
+          className="fixed bottom-20 inset-x-4 z-40 flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-900 shadow-md animate-in fade-in slide-in-from-bottom-1 duration-200"
         >
           <Sparkles className="size-3.5 text-emerald-700 shrink-0" />
           <span className="flex-1">
@@ -2629,33 +2759,6 @@ function PlanScreen({
           </button>
         </div>
       )}
-      <div className="rounded-md border border-border bg-card p-3 space-y-2">
-        <div className="flex items-baseline justify-between text-xs">
-          <div className="flex flex-wrap items-baseline gap-2">
-            <span className="font-medium">共 {items.length} 封</span>
-            {filterChips.length > 0 && (
-              <span className="text-muted-foreground">
-                · 過濾後顯示 <span className="tabular-nums">{filteredItems.length}</span>
-              </span>
-            )}
-            <Badge variant="success" className="gap-1">移 {counts.move}</Badge>
-            <Badge variant="danger" className="gap-1">刪 {counts.delete}</Badge>
-            <Badge variant="warning" className="gap-1">新 {counts.new_folder}</Badge>
-            {counts.skip > 0 && <Badge variant="muted">留 {counts.skip}</Badge>}
-          </div>
-          <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
-            規則 {summary.ruleHits} · AI {summary.aiHandled}
-          </span>
-        </div>
-        {usage && (
-          <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-mono">
-            <Sparkles className="size-3" />
-            in {usage.inputTokens} · out {usage.outputTokens}
-            {usage.cacheReadTokens > 0 && ` · cache-hit ${usage.cacheReadTokens}`}
-            {usage.cacheCreationTokens > 0 && ` · cache-write ${usage.cacheCreationTokens}`}
-          </div>
-        )}
-      </div>
 
       {(filterVisible || filterChips.length > 0) && (
         <div
@@ -2732,35 +2835,64 @@ function PlanScreen({
       )}
 
       {selectedIds.size > 0 && (
-        <div className="rounded-md border-2 border-foreground bg-card p-2.5 text-xs flex items-center justify-between gap-2 flex-wrap">
-          <span className="font-medium">已選 {selectedIds.size} 項</span>
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <Button size="sm" variant="destructive" onClick={applyDelete}>
-              全部刪除
-            </Button>
-            <Button size="sm" variant="outline" onClick={applySkip}>
-              全部保留
-            </Button>
-            <button
-              type="button"
-              onClick={() => setSelectedIds(new Set(filteredItems.map((i) => i.emailId)))}
-              className="text-[10px] text-muted-foreground hover:underline px-1"
-            >
-              {filterChips.length > 0
-                ? `全選顯示中 (${filteredItems.length})`
-                : `全選 (${items.length})`}
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedIds(new Set())}
-              className="text-[10px] text-muted-foreground hover:underline px-1"
-            >
-              清除
-            </button>
+        <div className="rounded-md border-2 border-foreground bg-card p-2.5 text-xs space-y-2">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span className="font-medium">已選 {selectedIds.size} 項</span>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {/* 「移到…」直接上批次列（UI/UX 檢討 2026-07）：批次移動是
+                  勾選後最常見的期待，舊版要走「展開任一張卡→卡內選目標→
+                  按全部套用」四步隱藏流程、還得靠一段常駐教學文字補救。
+                  展開卡內的「全部套用到勾選」保留作進階格式刷。 */}
+              <Button
+                size="sm"
+                variant={bulkMoveOpen ? 'default' : 'outline'}
+                onClick={() => setBulkMoveOpen((v) => !v)}
+              >
+                移到…
+              </Button>
+              {/* 全部刪除降為 outline-destructive：實心紅留給真正的警示。
+                  舊版它與底部轉紅的執行鈕形成兩顆意義不同的紅色主鈕。 */}
+              <Button
+                size="sm"
+                variant="outline"
+                className="border-red-300 text-red-700 hover:bg-red-50"
+                onClick={applyDelete}
+              >
+                全部刪除
+              </Button>
+              <Button size="sm" variant="outline" onClick={applySkip}>
+                全部保留
+              </Button>
+              <button
+                type="button"
+                onClick={() => setSelectedIds(new Set(filteredItems.map((i) => i.emailId)))}
+                className="text-[10px] text-muted-foreground hover:underline px-1"
+              >
+                {filterChips.length > 0
+                  ? `全選顯示中 (${filteredItems.length})`
+                  : `全選 (${items.length})`}
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedIds(new Set())}
+                className="text-[10px] text-muted-foreground hover:underline px-1"
+              >
+                清除
+              </button>
+            </div>
           </div>
-          <p className="basis-full text-[10px] text-muted-foreground">
-            想統一移到同一資料夾？展開任一張卡、在卡內選好目標、按「全部套用到勾選」即可。
-          </p>
+          {bulkMoveOpen && (
+            <div className="space-y-1">
+              <label className="text-[10px] text-muted-foreground">
+                目標資料夾（套用到勾選的 {selectedIds.size} 項）
+              </label>
+              <FolderPicker
+                tree={augmentedTree}
+                excludePrefixes={excludePrefixes}
+                onSelect={applyMoveTo}
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -2880,13 +3012,11 @@ function PlanScreen({
         </ul>
       )}
 
+      {/* 底欄減層（UI/UX 檢討 2026-07）：舊版最多疊三層（刪除警示條＋
+          鍵盤提示＋按鈕列）。刪除警示併入按鈕列小字＋執行鈕 label；執行鈕
+          固定 default（不再因含刪除而轉紅 — 舊版和批次列的紅色刪除鈕形成
+          兩顆意義不同的紅鈕，主動作反而失去辨識度）。 */}
       <div className="sticky bottom-0 -mx-4 px-4 py-3 border-t border-border bg-background/95 backdrop-blur space-y-2">
-        {counts.delete > 0 && (
-          <div className="flex items-center gap-1.5 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] text-amber-900">
-            <AlertTriangle className="size-3.5 text-amber-700 shrink-0" />
-            含 <span className="font-bold tabular-nums">{counts.delete}</span> 件永久刪除(可從 Outlook「已刪除的郵件」回復)
-          </div>
-        )}
         {!shortcutsHintDismissed && selectedIds.size === 0 && !aiPending && (
           <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
             <span>
@@ -2901,20 +3031,25 @@ function PlanScreen({
             <button
               type="button"
               className="text-muted-foreground hover:text-foreground"
-              onClick={() => setShortcutsHintDismissed(true)}
-              aria-label="關閉鍵盤提示"
+              onClick={dismissShortcutsHint}
+              aria-label="關閉鍵盤提示（不再顯示）"
+              title="關閉後不再顯示；按 ? 可隨時查快捷鍵"
             >
               ×
             </button>
           </div>
         )}
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <Button variant="ghost" onClick={onBack}>取消</Button>
-          <Button
-            onClick={onConfirmExecute}
-            disabled={movableValid === 0 || !!aiPending}
-            variant={counts.delete > 0 ? 'destructive' : 'default'}
-          >
+          {counts.delete > 0 && (
+            <span
+              className="text-[10px] text-amber-800 text-right flex-1"
+              title="刪除的郵件可從 Outlook「已刪除的郵件」資料夾回復"
+            >
+              含 {counts.delete} 件刪除・可回復
+            </span>
+          )}
+          <Button onClick={onConfirmExecute} disabled={movableValid === 0 || !!aiPending}>
             <Play /> {aiPending ? '等 AI 完成…' : `執行 ${movableValid} 個`}
           </Button>
         </div>
