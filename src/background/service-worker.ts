@@ -1939,6 +1939,9 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       if (typeof raw.onboardingDismissed === 'boolean') {
         clean.onboardingDismissed = raw.onboardingDismissed
       }
+      if (typeof raw.harvestEnabled === 'boolean') {
+        clean.harvestEnabled = raw.harvestEnabled
+      }
       const next = await setSettings(clean)
       return {
         ok: true,

@@ -161,6 +161,10 @@ function sanitizeSettings(raw: Record<string, unknown>): Settings {
       typeof raw.aiIncludeFewShotExamples === 'boolean'
         ? raw.aiIncludeFewShotExamples
         : DEFAULT_SETTINGS.aiIncludeFewShotExamples,
+    harvestEnabled:
+      typeof raw.harvestEnabled === 'boolean'
+        ? raw.harvestEnabled
+        : DEFAULT_SETTINGS.harvestEnabled,
     syncEnabled:
       typeof raw.syncEnabled === 'boolean'
         ? raw.syncEnabled
@@ -195,6 +199,7 @@ const ALLOWED_SETTINGS_KEYS: ReadonlySet<keyof Settings> = new Set([
   'primaryRootPath',
   'internalSubjectCategories',
   'aiIncludeFewShotExamples',
+  'harvestEnabled',
   'syncEnabled',
   'syncMachineId',
   'lastSyncAt',

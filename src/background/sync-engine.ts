@@ -83,6 +83,11 @@ const PER_DEVICE_SETTINGS_FIELDS: ReadonlySet<keyof Settings> = new Set([
   'lastSyncAt',
   'syncEnabled',
   'onboardingDismissed',
+  // Harvesting reads THIS machine's Outlook manual-filing history — a
+  // privacy-sensitive opt-in that each device must grant independently. Its
+  // watermark (lastHarvestAt) is already chrome.storage.local, so keep the
+  // toggle local too; a cloud pull must never silently enable it elsewhere.
+  'harvestEnabled',
 ])
 
 type PerDeviceFieldKey =
@@ -91,6 +96,7 @@ type PerDeviceFieldKey =
   | 'lastSyncAt'
   | 'syncEnabled'
   | 'onboardingDismissed'
+  | 'harvestEnabled'
 
 /** Project a Settings record down to only the fields safe to sync. */
 function stripPerDeviceSettings(s: Settings): Omit<Settings, PerDeviceFieldKey> {

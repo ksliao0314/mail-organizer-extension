@@ -114,6 +114,24 @@ describe('getSettings sanitize', () => {
     const after = await getSettings()
     expect(after.batchSize).toBe(100)
   })
+
+  it('harvestEnabled defaults to false when unset', async () => {
+    await chrome.storage.local.set({ settings: { claudeApiKey: 'x' } })
+    const cleaned = await getSettings()
+    expect(cleaned.harvestEnabled).toBe(false)
+  })
+
+  it('harvestEnabled round-trips through setSettings (was silently stripped)', async () => {
+    // Regression: harvestEnabled was in the Settings type + DEFAULT_SETTINGS
+    // but absent from ALLOWED_SETTINGS_KEYS and sanitizeSettings, so the
+    // Options toggle wrote true and getSettings dropped it back to false.
+    await setSettings({ harvestEnabled: true })
+    const after = await getSettings()
+    expect(after.harvestEnabled).toBe(true)
+    // And it must survive a re-sanitize on the next read.
+    const again = await getSettings()
+    expect(again.harvestEnabled).toBe(true)
+  })
 })
 
 describe('skipHistory', () => {
