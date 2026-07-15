@@ -195,10 +195,11 @@ describe('buildEmailBlock', () => {
     expect(block).toContain('world')
   })
 
-  it('truncates long previews to 200 chars', () => {
-    const longText = 'A'.repeat(500)
+  it('truncates long bodies to 800 chars (B3-C4 raised from 200)', () => {
+    const longText = 'A'.repeat(900)
     const block = buildEmailBlock([email({ Id: 'e', BodyPreview: longText })])
-    expect(block).not.toContain('A'.repeat(201))
+    expect(block).not.toContain('A'.repeat(801))
+    expect(block).toContain('A'.repeat(800))
   })
 
   // B2-B: case-number detection line
@@ -230,6 +231,53 @@ describe('buildEmailBlock', () => {
     const [rec0, rec1] = block.split('\n\n')
     expect(rec0).not.toContain('線索:')
     expect(rec1).toContain('線索:此對話近期曾歸於「客戶A/訴訟」')
+  })
+
+  // B3-C4: full-body (bodyText) feeding the prompt + detection
+  it('prefers bodyText over BodyPreview and detects a case number past the 250-char cutoff', () => {
+    // Case number sits at char ~400 of the body — beyond the old 250-char
+    // BodyPreview window. This is the core recall gain of batch-3.
+    const bodyText = 'A'.repeat(400) + ' 112訴204 ' + 'B'.repeat(300)
+    const block = buildEmailBlock([
+      email({ Id: 'e', Subject: '開庭通知', BodyPreview: '(前段沒有案號)', bodyText }),
+    ])
+    expect(block).toMatch(/識別碼:.*112訴204/)
+  })
+
+  it('truncates the body to 800 chars in the prompt', () => {
+    const bodyText = 'A'.repeat(810) + 'PASTMARK'
+    const block = buildEmailBlock([email({ Id: 'e', Subject: 's', bodyText })])
+    expect(block).not.toContain('PASTMARK')
+  })
+
+  it('falls back to BodyPreview when bodyText is absent', () => {
+    const block = buildEmailBlock([
+      email({ Id: 'e', Subject: '開庭', BodyPreview: '本件 112訴204 敬請' }),
+    ])
+    expect(block).toMatch(/識別碼:.*112訴204/)
+  })
+})
+
+// ---- actionToPlanItem body case identifiers (B3-C4) ------------------------
+
+describe('actionToPlanItem body case identifiers', () => {
+  it('records body case numbers from bodyText, separate from subject', () => {
+    const item = actionToPlanItem(
+      email({ Id: 'e', Subject: '開庭通知', bodyText: '詳如 112訴204 所載' }),
+      { emailIndex: 0, action: 'move', targetFolderPath: '內部資料/工時審閱', confidence: 0.9, reason: 'r' },
+      tree(),
+    )
+    expect(item.bodyCaseNumbers).toEqual(['112訴204'])
+  })
+
+  it('omits the field entirely when the body has no case identifier', () => {
+    const item = actionToPlanItem(
+      email({ Id: 'e', Subject: '午餐', bodyText: '今天吃什麼' }),
+      { emailIndex: 0, action: 'skip', confidence: 0.3, reason: 'r' },
+      tree(),
+    )
+    expect(item.bodyCaseNumbers).toBeUndefined()
+    expect(item.bodyCaseCodes).toBeUndefined()
   })
 })
 

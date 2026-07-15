@@ -458,6 +458,14 @@ function recipientAddrs(list?: Email['ToRecipients']): string {
 // subject blowing up the request budget.
 const MAX_SUBJECT_LEN = 200
 
+// How much email body to feed Claude per email (batch-3). Bodies are fetched
+// on demand (UniqueBody, AI-bucket reps only) into m.bodyText; when absent we
+// fall back to the 250-char BodyPreview. 800 was chosen so a case number in
+// the 案由/署名 block — routinely past the 250-char preview cutoff — still
+// reaches the model. It's a single knob: raise/lower here after measuring real
+// AI-bucket sizes (Chinese ≈ 1.5 tokens/char, so 800 ≈ ~1200 tok/email input).
+const BODY_PROMPT_CHARS = 800
+
 /**
  * Extract structured case identifiers (Taiwan court case numbers + Latin case
  * codes) from an email's subject and body preview (B2-B). Subject matches
@@ -505,7 +513,13 @@ export function buildEmailBlock(
         subjectRaw.length > MAX_SUBJECT_LEN
           ? subjectRaw.slice(0, MAX_SUBJECT_LEN) + '…'
           : subjectRaw
-      const preview = (m.BodyPreview ?? '').slice(0, 200).replace(/\s+/g, ' ').trim()
+      // Prefer the on-demand full body (batch-3); fall back to the always-
+      // present 250-char preview. This is the single truncation point that
+      // feeds both the prompt and detectCaseSignals.
+      const preview = (m.bodyText ?? m.BodyPreview ?? '')
+        .slice(0, BODY_PROMPT_CHARS)
+        .replace(/\s+/g, ' ')
+        .trim()
       // B2-B: surface detected case identifiers as their own line so the AI
       // treats them as a strong routing signal even when the subject is noisy.
       const cases = detectCaseSignals(subjectRaw, preview)
@@ -700,6 +714,15 @@ export function actionToPlanItem(
   // Default [] keeps existing callers/tests source-compatible.
   excludePrefixes: string[] = [],
 ): PlanItem {
+  // Body case identifiers (batch-3), computed here at classify time from the
+  // full body (bodyText when fetched, else the preview) — kept SEPARATE from
+  // subject identifiers so the learning side can apply its stricter body gate
+  // (caseSignalsForLearning). Only attached when non-empty to keep PlanItems
+  // lean. The subject-first gate itself lives in caseSignalsForLearning; here
+  // we just record what the body carried.
+  const bodyForCase = email.bodyText ?? email.BodyPreview ?? ''
+  const bodyCaseNumbers = extractCourtCaseNumbers(bodyForCase)
+  const bodyCaseCodes = extractCaseCodes(bodyForCase)
   const base = {
     emailId: email.Id,
     emailSubject: email.Subject ?? '',
@@ -708,6 +731,8 @@ export function actionToPlanItem(
     conversationId: email.ConversationId,
     confidence: clampConfidence(action.confidence),
     reason: (action.reason ?? '').trim().slice(0, 200),
+    ...(bodyCaseNumbers.length ? { bodyCaseNumbers } : {}),
+    ...(bodyCaseCodes.length ? { bodyCaseCodes } : {}),
   }
 
   if (action.action === 'move' && action.targetFolderPath) {
