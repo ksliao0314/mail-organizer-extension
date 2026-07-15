@@ -32,6 +32,7 @@ import {
   type RemoteWipeNotice,
   type SyncMeta,
 } from '@/background/sync-engine'
+import { SYNC_SCHEMA_VERSION } from '@/shared/constants'
 import type { Rule, RuleSource, RuleTombstone } from '@/shared/types'
 
 function rule(over: Partial<Rule> = {}): Rule {
@@ -94,7 +95,7 @@ describe('Normal push preserves cloud wipeMarker', () => {
     // Simulate: another machine pushed with a wipeMarker earlier.
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: '2026-05-26T00:00:00Z',
         ruleCount: 0,
@@ -129,7 +130,7 @@ describe('Normal push preserves cloud wipeMarker', () => {
   it('wipe push REPLACES an older marker with a fresh one', async () => {
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: '2026-05-26T00:00:00Z',
         ruleCount: 0,
@@ -175,7 +176,7 @@ describe('pullNow — applies remote wipeMarker', () => {
     const wipeAt = new Date().toISOString()
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: wipeAt,
         ruleCount: 0,
@@ -220,7 +221,7 @@ describe('pullNow — applies remote wipeMarker', () => {
     const wipeAt = new Date().toISOString()
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: wipeAt,
         ruleCount: 0,
@@ -248,7 +249,7 @@ describe('pullNow — applies remote wipeMarker', () => {
     const wipeAt = new Date().toISOString()
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: wipeAt,
         ruleCount: 0,
@@ -273,7 +274,7 @@ describe('pullNow — applies remote wipeMarker', () => {
     const wipeAt = new Date().toISOString()
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: wipeAt,
         ruleCount: 0,
@@ -301,7 +302,7 @@ describe('Echo guard — own wipeMarker does not self-wipe', () => {
     // cloud has fresh-looking marker
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'this-machine',
         updatedAt: wipeAt,
         ruleCount: 0,
@@ -330,7 +331,7 @@ describe('Staleness guard — marker.at <= lastSyncAt does not re-trip', () => {
     await setSettings({ lastSyncAt: '2026-06-01T00:00:00Z' })
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other-machine',
         updatedAt: '2026-05-26T00:00:00Z',
         ruleCount: 0,

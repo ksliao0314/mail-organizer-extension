@@ -11,6 +11,7 @@
 // chrome.storage.sync calls.
 
 import { CHUNK_BYTE_TARGET, FOLDER_ACTIVITY_SYNC_CAP, TOMBSTONE_SYNC_CAP } from './constants'
+import type { CompactRuleRow, FolderDictEntry } from './sync-codec'
 import type { FolderActivity, Rule, RuleSource, RuleTombstone } from './types'
 
 /** Sync envelope. Stored under one `chrome.storage.sync` key per chunk. */
@@ -67,6 +68,33 @@ export function shouldSyncRule(rule: Rule): boolean {
   return true
 }
 
+const SOURCE_AUTHORITY: Record<RuleSource, number> = {
+  user_manual: 3, // hand-made — highest intent
+  ai_overridden: 2, // user corrected the AI — proven attention
+  ai_confirmed: 1, // auto-learned
+  auto_scan: 0, // never synced anyway
+}
+
+/**
+ * Best-first ordering for the sync budget guard. When the library doesn't
+ * fit the 100 KB quota, the lowest-value rules are the ones to drop from
+ * the cloud (they stay in local storage — this only affects propagation).
+ *
+ * Priority, in order: enabled beats auto-disabled (a sleeping rule won't
+ * fire on the other machine either); then source authority (hand-made >
+ * corrected > auto); then track record (matchCount); then recency of use.
+ */
+export function compareRuleSyncPriority(a: Rule, b: Rule): number {
+  if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
+  const auth = SOURCE_AUTHORITY[b.source] - SOURCE_AUTHORITY[a.source]
+  if (auth !== 0) return auth
+  const mc = (b.matchCount || 0) - (a.matchCount || 0)
+  if (mc !== 0) return mc
+  const aRecency = a.lastUsedAt ?? a.createdAt ?? ''
+  const bRecency = b.lastUsedAt ?? b.createdAt ?? ''
+  return bRecency.localeCompare(aRecency)
+}
+
 /**
  * Split rules into chunks targeting ~6KB each. Rules are sorted by id
  * before chunking so chunk membership is deterministic across runs —
@@ -100,6 +128,22 @@ export function chunkFolderActivity(
   // same set of entries could land in different chunks each push and burn
   // the per-hour write quota.
   return chunkArray(recent, (e) => e.folderId)
+}
+
+/**
+ * Chunk compact rule rows (schemaVersion 3). Keyed by rule id for stable
+ * chunk membership. Unlike chunkRules, NO source filtering / ordering
+ * happens here — the caller (sync engine) has already selected + ordered
+ * the rows (via encodeRulesForSync on shouldSyncRule-filtered, budget-capped
+ * rules). This just splits them into ~6 KB byte-accurate chunks.
+ */
+export function chunkCompactRows(rows: CompactRuleRow[]): SyncChunk<CompactRuleRow>[] {
+  return chunkArray(rows, (r) => r.i)
+}
+
+/** Chunk the folder dictionary (schemaVersion 3). Keyed by folder index. */
+export function chunkFolderDict(folders: FolderDictEntry[]): SyncChunk<FolderDictEntry>[] {
+  return chunkArray(folders, (f) => String(f.x).padStart(6, '0'))
 }
 
 export function chunkTombstones(tombstones: RuleTombstone[]): SyncChunk<RuleTombstone>[] {

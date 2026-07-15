@@ -35,9 +35,11 @@ import {
 } from '@/shared/storage'
 import { applyConfidenceCap, listRules, mutateRules, normalizeSignal } from '@/shared/rules'
 import {
+  chunkCompactRows,
   chunkFolderActivity,
-  chunkRules,
+  chunkFolderDict,
   chunkTombstones,
+  compareRuleSyncPriority,
   jsonByteSize,
   shouldSyncRule,
   unchunkArray,
@@ -45,8 +47,15 @@ import {
   type SyncChunk,
 } from '@/shared/sync-chunks'
 import {
+  decodeRulesFromSync,
+  encodeRulesForSync,
+  type CompactRuleRow,
+  type FolderDictEntry,
+} from '@/shared/sync-codec'
+import {
   MAX_BACKUPS,
   MAX_FOLDER_ACTIVITY_CHUNKS,
+  MAX_FOLDER_DICT_CHUNKS,
   MAX_RULE_CHUNKS,
   MAX_TOMBSTONE_CHUNKS,
   PULL_DEBOUNCE_MS,
@@ -55,6 +64,7 @@ import {
   QUIESCE_TIMEOUT_MS,
   SYNC_RECENT_PUSHES_CAP,
   SYNC_SCHEMA_VERSION,
+  SYNC_TOTAL_BUDGET_BYTES,
 } from '@/shared/constants'
 import { logError } from '@/shared/error-log'
 import type { FolderActivity, Rule, RuleTombstone, Settings } from '@/shared/types'
@@ -115,9 +125,27 @@ function stripPerDeviceSettings(s: Settings): Omit<Settings, PerDeviceFieldKey> 
 
 const SYNC_META_KEY = 'syncMeta'
 const SYNC_SETTINGS_KEY = 'syncSettings'
+// v1/v2 legacy: full Rule objects, one array per chunk. v3 stops writing
+// these (they become orphans, cleaned on the first v3 push) but pull still
+// reads them so a freshly-upgraded machine can consume a pre-upgrade cloud.
 const SYNC_RULES_CHUNK_PREFIX = 'syncRules_'
+// v3: compact rule rows + a deduplicated folder dictionary. See sync-codec.ts.
+const SYNC_RULES_V3_CHUNK_PREFIX = 'syncRulesC_'
+const SYNC_FOLDERS_CHUNK_PREFIX = 'syncFolders_'
 const SYNC_TOMBSTONES_CHUNK_PREFIX = 'syncTombstones_'
 const SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX = 'syncFolderActivity_'
+
+/**
+ * Bytes reserved for syncMeta when sizing the rule budget. The meta object
+ * carries recentPushes (cap 20 × ~60 B) + wipeMarker + counts; 2 KB is a
+ * comfortable over-estimate so the rule payload never crowds it out.
+ */
+const META_BYTE_RESERVE = 2 * 1024
+
+/** Bytes one chrome.storage.sync item costs: UTF-8 key + JSON-serialised value. */
+function writeBytes(key: string, value: unknown): number {
+  return utf8ByteLength(key) + jsonByteSize(value)
+}
 
 // MAX_RULE_CHUNKS / MAX_TOMBSTONE_CHUNKS / MAX_FOLDER_ACTIVITY_CHUNKS:
 // see src/shared/constants.ts. Chunk-count caps prevent the key namespace
@@ -192,9 +220,23 @@ export type SyncMeta = {
   /** Total rule + tombstone counts — quick health check before reading chunks. */
   ruleCount: number
   tombstoneCount: number
-  /** Number of chunks each category was split into (for fan-out reads). */
+  /**
+   * Number of LEGACY (v1/v2) full-rule chunks. v3 writes 0 here and stores
+   * rules in the compact layout below; a v2 reader sees 0 and reads no rules
+   * from a v3 cloud (keeps its local set — no corruption). Kept required for
+   * back-compat with the many readers that index syncRules_0..N by it.
+   */
   ruleChunkCount: number
   tombstoneChunkCount: number
+  /**
+   * schemaVersion 3 compact layout: deduplicated folder dictionary +
+   * short-key rule rows (see sync-codec.ts). Optional so v1/v2 snapshots
+   * (which have neither) decode cleanly. When ruleV3ChunkCount is present
+   * and > 0, the pull path reconstructs rules from syncRulesC_* + syncFolders_*
+   * instead of the legacy syncRules_* chunks.
+   */
+  ruleV3ChunkCount?: number
+  folderChunkCount?: number
   /**
    * folderActivity sync was added in schemaVersion 2. Optional on the type
    * because v1 cloud snapshots predate it — readers default to 0 when
@@ -512,6 +554,8 @@ export async function clearCloudState(): Promise<void> {
       k === SYNC_META_KEY ||
       k === SYNC_SETTINGS_KEY ||
       k.startsWith(SYNC_RULES_CHUNK_PREFIX) ||
+      k.startsWith(SYNC_RULES_V3_CHUNK_PREFIX) ||
+      k.startsWith(SYNC_FOLDERS_CHUNK_PREFIX) ||
       k.startsWith(SYNC_TOMBSTONES_CHUNK_PREFIX) ||
       k.startsWith(SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX),
   )
@@ -683,6 +727,8 @@ async function getOurBytesInUse(): Promise<number> {
       key !== SYNC_META_KEY &&
       key !== SYNC_SETTINGS_KEY &&
       !key.startsWith(SYNC_RULES_CHUNK_PREFIX) &&
+      !key.startsWith(SYNC_RULES_V3_CHUNK_PREFIX) &&
+      !key.startsWith(SYNC_FOLDERS_CHUNK_PREFIX) &&
       !key.startsWith(SYNC_TOMBSTONES_CHUNK_PREFIX) &&
       !key.startsWith(SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX)
     ) {
@@ -732,13 +778,11 @@ async function doPush(
     ])
     await appendBackup('pre-push')
 
-    const allRuleChunks = chunkRules(rules)
-    const ruleChunks = allRuleChunks.slice(0, MAX_RULE_CHUNKS)
-    const truncatedRuleChunks = allRuleChunks.length - ruleChunks.length
-    const truncatedRuleCount = allRuleChunks
-      .slice(MAX_RULE_CHUNKS)
-      .reduce((sum, c) => sum + c.items.length, 0)
+    // Settings stripped of all per-device fields (apiKey, machineId,
+    // lastSyncAt, syncEnabled) — see PER_DEVICE_SETTINGS_FIELDS for why.
+    const settingsToSync = stripPerDeviceSettings(settings)
 
+    // --- Tombstones + folderActivity chunks (needed to size the rule budget) --
     const allTombChunks = chunkTombstones(tombstones)
     const tombChunks = allTombChunks.slice(0, MAX_TOMBSTONE_CHUNKS)
     const truncatedTombCount = allTombChunks
@@ -754,22 +798,70 @@ async function doPush(
       .slice(MAX_FOLDER_ACTIVITY_CHUNKS)
       .reduce((sum, c) => sum + c.items.length, 0)
 
-    if (
-      truncatedRuleChunks > 0 ||
-      truncatedTombCount > 0 ||
-      truncatedActivityCount > 0
-    ) {
-      console.warn(
-        `[mail-organizer] sync push: truncated ${truncatedRuleCount} rules` +
-          ` + ${truncatedTombCount} tombstones` +
-          ` + ${truncatedActivityCount} folderActivity entries (chunk cap reached).` +
-          ` Clean up auto-disabled / sleeping rules to reduce sync set.`,
-      )
+    // --- Rule budget guard (schemaVersion 3) ---------------------------------
+    // The 100 KB sync quota is a HARD ceiling; a single over-budget push fails
+    // the whole batch (`kQuotaBytes`). So: reserve bytes for everything that
+    // isn't rules (settings + tombstones + folderActivity + a meta allowance),
+    // then fit the compact rule payload into whatever is left of the total
+    // budget. If it doesn't fit, drop the lowest-priority rules from the CLOUD
+    // (they stay in local storage — this only limits cross-machine propagation)
+    // and surface the count. Compact encoding (folder dedup + short keys) means
+    // this rarely triggers below ~350 rules.
+    let nonRuleBytes = writeBytes(SYNC_SETTINGS_KEY, settingsToSync) + META_BYTE_RESERVE
+    for (const c of tombChunks)
+      nonRuleBytes += writeBytes(`${SYNC_TOMBSTONES_CHUNK_PREFIX}${c.index}`, c)
+    for (const c of activityChunks)
+      nonRuleBytes += writeBytes(`${SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX}${c.index}`, c)
+    const ruleBudget = Math.max(0, SYNC_TOTAL_BUDGET_BYTES - nonRuleBytes)
+
+    // Best-first so the LAST entries (lowest priority) are the ones dropped.
+    const ranked = rules.filter(shouldSyncRule).sort(compareRuleSyncPriority)
+    let kept = ranked
+    let encoded = encodeRulesForSync(kept)
+    let encodedBytes = jsonByteSize(encoded.folders) + jsonByteSize(encoded.rows)
+    while (kept.length > 0 && encodedBytes > ruleBudget) {
+      kept = kept.slice(0, -1)
+      encoded = encodeRulesForSync(kept)
+      encodedBytes = jsonByteSize(encoded.folders) + jsonByteSize(encoded.rows)
+    }
+    const budgetDroppedCount = ranked.length - kept.length
+
+    // Cap the folder dictionary. If it overflows MAX_FOLDER_DICT_CHUNKS we MUST
+    // also drop every row that references a dropped folder — otherwise those
+    // rows would pull on another machine with an empty target (dangling,
+    // silently orphaned, uncounted). Filter rows to surviving folders BEFORE
+    // chunking and fold the loss into truncatedRuleCount so it's surfaced.
+    const allFolderChunks = chunkFolderDict(encoded.folders)
+    const folderChunks: SyncChunk<FolderDictEntry>[] = allFolderChunks.slice(
+      0,
+      MAX_FOLDER_DICT_CHUNKS,
+    )
+    let rowsForSync = encoded.rows
+    let folderCapDroppedRows = 0
+    if (allFolderChunks.length > folderChunks.length) {
+      const survivingFolders = new Set(folderChunks.flatMap((c) => c.items.map((f) => f.x)))
+      rowsForSync = encoded.rows.filter((r) => survivingFolders.has(r.f))
+      folderCapDroppedRows = encoded.rows.length - rowsForSync.length
     }
 
-    // Settings stripped of all per-device fields (apiKey, machineId,
-    // lastSyncAt, syncEnabled) — see PER_DEVICE_SETTINGS_FIELDS for why.
-    const settingsToSync = stripPerDeviceSettings(settings)
+    const allRowChunks = chunkCompactRows(rowsForSync)
+    const rowChunks: SyncChunk<CompactRuleRow>[] = allRowChunks.slice(0, MAX_RULE_CHUNKS)
+    const chunkCapDroppedRows = allRowChunks
+      .slice(MAX_RULE_CHUNKS)
+      .reduce((sum, c) => sum + c.items.length, 0)
+    // Rows dropped for any reason (byte budget, row-chunk cap, folder-dict cap)
+    // all count — the push must never silently drop a rule cross-machine.
+    const truncatedRuleCount = budgetDroppedCount + chunkCapDroppedRows + folderCapDroppedRows
+
+    if (truncatedRuleCount > 0 || truncatedTombCount > 0 || truncatedActivityCount > 0) {
+      console.warn(
+        `[mail-organizer] sync push: ${truncatedRuleCount} rules not synced to cloud` +
+          ` (${budgetDroppedCount} over byte budget + ${chunkCapDroppedRows} over row-chunk cap` +
+          ` + ${folderCapDroppedRows} over folder-dict cap)` +
+          ` + ${truncatedTombCount} tombstones + ${truncatedActivityCount} folderActivity entries.` +
+          ` They remain in local storage; clean up auto-disabled / sleeping rules to sync more.`,
+      )
+    }
 
     const updatedAt = new Date().toISOString()
     // #6: extend the recentPushes log with this push's entry. Keep the
@@ -814,13 +906,18 @@ async function doPush(
         ? cloudMeta.wipeMarker
         : undefined
 
+    const syncedRuleCount = rowChunks.reduce((sum, c) => sum + c.items.length, 0)
     const meta: SyncMeta = {
       schemaVersion: SYNC_SCHEMA_VERSION,
       sourceMachineId: machineId,
       updatedAt,
-      ruleCount: ruleChunks.reduce((sum, c) => sum + c.items.length, 0),
+      ruleCount: syncedRuleCount,
       tombstoneCount: tombChunks.reduce((sum, c) => sum + c.items.length, 0),
-      ruleChunkCount: ruleChunks.length,
+      // v3 writes NO legacy full-rule chunks; a v2 reader sees 0 and reads
+      // none (keeps its local set). Rules live in the compact layout below.
+      ruleChunkCount: 0,
+      ruleV3ChunkCount: rowChunks.length,
+      folderChunkCount: folderChunks.length,
       tombstoneChunkCount: tombChunks.length,
       folderActivityCount: activityChunks.reduce(
         (sum, c) => sum + c.items.length,
@@ -836,11 +933,22 @@ async function doPush(
     // a shrinking library would leave stale chunks behind that get
     // included on the next pull.
     const allKeys = Object.keys(await chrome.storage.sync.get(null))
-    const orphanRuleKeys = allKeys.filter(
-      (k) =>
-        k.startsWith(SYNC_RULES_CHUNK_PREFIX) &&
-        chunkIndex(k, SYNC_RULES_CHUNK_PREFIX) >= ruleChunks.length,
+    // Legacy v1/v2 full-rule chunks: v3 writes none, so EVERY existing
+    // syncRules_* key is now an orphan to remove (index >= 0 = all).
+    const orphanLegacyRuleKeys = allKeys.filter((k) =>
+      k.startsWith(SYNC_RULES_CHUNK_PREFIX),
     )
+    const orphanRowKeys = allKeys.filter(
+      (k) =>
+        k.startsWith(SYNC_RULES_V3_CHUNK_PREFIX) &&
+        chunkIndex(k, SYNC_RULES_V3_CHUNK_PREFIX) >= rowChunks.length,
+    )
+    const orphanFolderKeys = allKeys.filter(
+      (k) =>
+        k.startsWith(SYNC_FOLDERS_CHUNK_PREFIX) &&
+        chunkIndex(k, SYNC_FOLDERS_CHUNK_PREFIX) >= folderChunks.length,
+    )
+    const orphanRuleKeys = [...orphanLegacyRuleKeys, ...orphanRowKeys, ...orphanFolderKeys]
     const orphanTombKeys = allKeys.filter(
       (k) =>
         k.startsWith(SYNC_TOMBSTONES_CHUNK_PREFIX) &&
@@ -855,7 +963,8 @@ async function doPush(
       [SYNC_META_KEY]: meta,
       [SYNC_SETTINGS_KEY]: settingsToSync,
     }
-    for (const c of ruleChunks) writes[`${SYNC_RULES_CHUNK_PREFIX}${c.index}`] = c
+    for (const c of rowChunks) writes[`${SYNC_RULES_V3_CHUNK_PREFIX}${c.index}`] = c
+    for (const c of folderChunks) writes[`${SYNC_FOLDERS_CHUNK_PREFIX}${c.index}`] = c
     for (const c of tombChunks) writes[`${SYNC_TOMBSTONES_CHUNK_PREFIX}${c.index}`] = c
     for (const c of activityChunks)
       writes[`${SYNC_FOLDER_ACTIVITY_CHUNK_PREFIX}${c.index}`] = c
@@ -1112,15 +1221,18 @@ async function doPull(
     )
   }
 
-  // Read all chunks. Plus the settings overlay.
-  const ruleKeys: string[] = []
-  for (let i = 0; i < meta.ruleChunkCount; i++) ruleKeys.push(`${SYNC_RULES_CHUNK_PREFIX}${i}`)
+  // Read all chunks. Plus the settings overlay. The schemaVersion guard
+  // above guarantees cloud is EXACTLY v3 here, so rules live in the compact
+  // layout (syncRulesC_* rows + syncFolders_* dictionary) — decode them.
+  const rowKeys: string[] = []
+  for (let i = 0; i < (meta.ruleV3ChunkCount ?? 0); i++)
+    rowKeys.push(`${SYNC_RULES_V3_CHUNK_PREFIX}${i}`)
+  const folderKeys: string[] = []
+  for (let i = 0; i < (meta.folderChunkCount ?? 0); i++)
+    folderKeys.push(`${SYNC_FOLDERS_CHUNK_PREFIX}${i}`)
   const tombKeys: string[] = []
   for (let i = 0; i < meta.tombstoneChunkCount; i++)
     tombKeys.push(`${SYNC_TOMBSTONES_CHUNK_PREFIX}${i}`)
-  // folderActivity chunks: v2 schema. v1 cloud has 0 of these (the field
-  // is optional on SyncMeta), so the for-loop is a no-op and we read no
-  // activity from cloud — local stays untouched.
   const activityKeys: string[] = []
   const activityChunkCount = meta.folderActivityChunkCount ?? 0
   for (let i = 0; i < activityChunkCount; i++)
@@ -1128,14 +1240,18 @@ async function doPull(
 
   const stored = await chrome.storage.sync.get([
     SYNC_SETTINGS_KEY,
-    ...ruleKeys,
+    ...rowKeys,
+    ...folderKeys,
     ...tombKeys,
     ...activityKeys,
   ])
 
-  const ruleChunks = ruleKeys
-    .map((k) => stored[k] as SyncChunk<Rule> | undefined)
-    .filter((c): c is SyncChunk<Rule> => !!c)
+  const rowChunks = rowKeys
+    .map((k) => stored[k] as SyncChunk<CompactRuleRow> | undefined)
+    .filter((c): c is SyncChunk<CompactRuleRow> => !!c)
+  const folderChunks = folderKeys
+    .map((k) => stored[k] as SyncChunk<FolderDictEntry> | undefined)
+    .filter((c): c is SyncChunk<FolderDictEntry> => !!c)
   const tombChunks = tombKeys
     .map((k) => stored[k] as SyncChunk<RuleTombstone> | undefined)
     .filter((c): c is SyncChunk<RuleTombstone> => !!c)
@@ -1143,7 +1259,10 @@ async function doPull(
     .map((k) => stored[k] as SyncChunk<FolderActivity> | undefined)
     .filter((c): c is SyncChunk<FolderActivity> => !!c)
 
-  const cloudRules = unchunkArray(ruleChunks)
+  const cloudRules = decodeRulesFromSync({
+    folders: unchunkArray(folderChunks),
+    rows: unchunkArray(rowChunks),
+  })
   const cloudTombstones = unchunkArray(tombChunks)
   const cloudFolderActivity = unchunkArray(activityChunksFromCloud)
 

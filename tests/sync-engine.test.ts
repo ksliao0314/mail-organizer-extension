@@ -23,6 +23,10 @@ import {
   SYNC_LAST_ERROR_KEY,
   type SyncErrorEntry,
 } from '@/background/sync-engine'
+import { chunkCompactRows, chunkFolderDict, unchunkArray } from '@/shared/sync-chunks'
+import { decodeRulesFromSync, encodeRulesForSync } from '@/shared/sync-codec'
+import type { CompactRuleRow, FolderDictEntry } from '@/shared/sync-codec'
+import { SYNC_SCHEMA_VERSION } from '@/shared/constants'
 import type { Rule, RuleSource, RuleTombstone } from '@/shared/types'
 
 function rule(over: Partial<Rule> = {}): Rule {
@@ -41,21 +45,22 @@ async function simulateOtherMachinePush(opts: {
   rules: Rule[]
   machineId?: string
 }): Promise<void> {
-  // Direct write to chrome.storage.sync as if another device pushed.
+  // Direct write to chrome.storage.sync as if another device pushed, in the
+  // v3 compact wire format (folder dict + short-key rows) that doPush emits.
   const machineId = opts.machineId ?? 'other-machine'
-  const chunkSize = 25
-  const ruleChunks: Array<{ index: number; items: Rule[] }> = []
-  for (let i = 0; i < opts.rules.length; i += chunkSize) {
-    ruleChunks.push({ index: ruleChunks.length, items: opts.rules.slice(i, i + chunkSize) })
-  }
+  const encoded = encodeRulesForSync(opts.rules)
+  const rowChunks = chunkCompactRows(encoded.rows)
+  const folderChunks = chunkFolderDict(encoded.folders)
   const writes: Record<string, unknown> = {
     syncMeta: {
-      schemaVersion: 2,
+      schemaVersion: SYNC_SCHEMA_VERSION,
       sourceMachineId: machineId,
       updatedAt: new Date().toISOString(),
       ruleCount: opts.rules.length,
       tombstoneCount: 0,
-      ruleChunkCount: ruleChunks.length,
+      ruleChunkCount: 0,
+      ruleV3ChunkCount: rowChunks.length,
+      folderChunkCount: folderChunks.length,
       tombstoneChunkCount: 0,
     },
     syncSettings: {
@@ -68,7 +73,8 @@ async function simulateOtherMachinePush(opts: {
       syncEnabled: false,
     },
   }
-  for (const c of ruleChunks) writes[`syncRules_${c.index}`] = c
+  for (const c of rowChunks) writes[`syncRulesC_${c.index}`] = c
+  for (const c of folderChunks) writes[`syncFolders_${c.index}`] = c
   await chrome.storage.sync.set(writes)
 }
 
@@ -231,13 +237,21 @@ describe('Bug #C: restoreBackup keeps current machineId / lastSyncAt / syncEnabl
 // ---- Bug #D: chunk truncation surfaces in push result --------------------
 
 describe('Bug #D: truncated rules + tombstones surfaced in push result', () => {
-  it('returns truncatedRuleCount when rules exceed chunk cap', async () => {
-    // Generate enough rules to exceed MAX_RULE_CHUNKS (20) at ~6KB/chunk.
-    // Each rule ~300 bytes; ~25 rules per chunk; need >500 rules for >20
-    // chunks. Make 600 to be safe.
+  it('returns truncatedRuleCount when the library exceeds the byte budget', async () => {
+    // v3 fits rules into SYNC_TOTAL_BUDGET_BYTES (~88 KB), dropping the
+    // lowest-priority ones over budget. Each rule here has a DISTINCT ~125-byte
+    // folder id (no dedup benefit) + a long signal → ~400 bytes each; 500 of
+    // them (~200 KB) blows well past the budget, so some must be dropped.
     const many: Rule[] = []
-    for (let i = 0; i < 600; i++) {
-      many.push(rule({ id: `id-${i.toString().padStart(4, '0')}`, signal: `r${i}.com` }))
+    for (let i = 0; i < 500; i++) {
+      many.push(
+        rule({
+          id: `id-${i.toString().padStart(4, '0')}`,
+          signal: `一一四年度上字第${i}號損害賠償等事件通知書主旨`,
+          targetFolderId: 'AAMkADAwMDAwMDAwLWJiYmItY2NjYy1kZGRk' + 'z'.repeat(90) + i,
+          targetFolderPath: `01進行中案件/2024年度/客戶第${i}號/往來書狀`,
+        }),
+      )
     }
     await addRules(many)
     const r = await pushNow('test')
@@ -261,13 +275,16 @@ describe('clearCloudState (disable + wipe)', () => {
     await pushNow('test')
     await clearCloudState()
     const cloud = await chrome.storage.sync.get(null)
-    // No sync keys remain.
+    // No sync keys remain (including the v3 compact layout keys).
     for (const k of Object.keys(cloud)) {
       expect(
         k === 'syncMeta' ||
           k === 'syncSettings' ||
           k.startsWith('syncRules_') ||
-          k.startsWith('syncTombstones_'),
+          k.startsWith('syncRulesC_') ||
+          k.startsWith('syncFolders_') ||
+          k.startsWith('syncTombstones_') ||
+          k.startsWith('syncFolderActivity_'),
       ).toBe(false)
     }
     // Local rules still there.
@@ -315,7 +332,7 @@ describe('tombstones round-trip via sync', () => {
     }
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other',
         updatedAt: new Date().toISOString(),
         ruleCount: 0,
@@ -370,7 +387,7 @@ describe('Bug #E: remote-pull preserves local-only rules', () => {
     }
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other',
         updatedAt: new Date().toISOString(),
         ruleCount: 0,
@@ -643,7 +660,7 @@ describe('folderActivity sync (v2 schema)', () => {
       folderActivityCount?: number
       folderActivityChunkCount?: number
     }
-    expect(meta.schemaVersion).toBe(2)
+    expect(meta.schemaVersion).toBe(SYNC_SCHEMA_VERSION)
     expect(meta.folderActivityCount).toBe(1)
     expect(meta.folderActivityChunkCount).toBeGreaterThanOrEqual(1)
     expect(cloud['syncFolderActivity_0']).toBeDefined()
@@ -677,7 +694,7 @@ describe('folderActivity sync (v2 schema)', () => {
     // Cloud has entry for folder B (from another machine).
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other',
         updatedAt: faNewer,
         ruleCount: 0,
@@ -729,7 +746,7 @@ describe('folderActivity sync (v2 schema)', () => {
     )
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2,
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other',
         updatedAt: faNewer,
         ruleCount: 0,
@@ -781,21 +798,28 @@ describe('folderActivity sync (v2 schema)', () => {
     expect(all.find((e) => e.folderId === 'cloud-only')).toBeDefined()
   })
 
-  it('SYNC_SCHEMA_VERSION upgrade: v1 cloud (no folderActivity fields) pulls without crash', async () => {
-    // Simulate a v1 cloud state (no folderActivity chunks or count fields).
+  it('cloud without folderActivity fields pulls without crash', async () => {
+    // A v3 cloud that carries rules but no folderActivity chunks/counts — the
+    // optional meta fields default to 0 on read (no activity merged).
+    const encoded = encodeRulesForSync([rule({ signal: 'sole.com' })])
+    const rowChunks = chunkCompactRows(encoded.rows)
+    const folderChunks = chunkFolderDict(encoded.folders)
     await chrome.storage.sync.set({
       syncMeta: {
-        schemaVersion: 2, // newer client wrote, but no activity yet
+        schemaVersion: SYNC_SCHEMA_VERSION,
         sourceMachineId: 'other',
         updatedAt: new Date().toISOString(),
         ruleCount: 1,
         tombstoneCount: 0,
-        ruleChunkCount: 1,
+        ruleChunkCount: 0,
+        ruleV3ChunkCount: rowChunks.length,
+        folderChunkCount: folderChunks.length,
         tombstoneChunkCount: 0,
         // folderActivityCount / folderActivityChunkCount omitted
       },
       syncSettings: { claudeModel: 'x', batchSize: 50 },
-      syncRules_0: { index: 0, items: [rule({ signal: 'sole.com' })] },
+      syncRulesC_0: rowChunks[0],
+      syncFolders_0: folderChunks[0],
     })
     const r = await pullNow('test')
     expect(r.pulled).toBe(true)
@@ -804,6 +828,74 @@ describe('folderActivity sync (v2 schema)', () => {
     expect(local.length).toBe(0)
   })
 })
+
+// ---- v3 compact wire format (schemaVersion 3) -----------------------------
+
+describe('v3 compact sync format', () => {
+  it('push writes the compact layout (no legacy chunks, deduped folder dict)', async () => {
+    // 10 rules across 3 distinct folders — the dictionary should hold 3.
+    const rules: Rule[] = []
+    for (let i = 0; i < 10; i++) {
+      rules.push(
+        rule({
+          id: `id-${i}`,
+          signal: `主旨關鍵字${i}`,
+          targetFolderId: `FID_${i % 3}` + 'x'.repeat(100),
+          targetFolderPath: `01案件/客戶${i % 3}`,
+        }),
+      )
+    }
+    await addRules(rules)
+    await pushNow('test')
+    const cloud = await chrome.storage.sync.get(null)
+    const meta = cloud['syncMeta'] as {
+      schemaVersion: number
+      ruleChunkCount: number
+      ruleV3ChunkCount?: number
+      folderChunkCount?: number
+    }
+    expect(meta.schemaVersion).toBe(SYNC_SCHEMA_VERSION)
+    expect(meta.ruleChunkCount).toBe(0) // no legacy full-rule chunks
+    expect(meta.ruleV3ChunkCount).toBeGreaterThan(0)
+    expect(meta.folderChunkCount).toBeGreaterThan(0)
+    // No legacy syncRules_* keys were written.
+    expect(Object.keys(cloud).some((k) => k.startsWith('syncRules_'))).toBe(false)
+    expect(Object.keys(cloud).some((k) => k.startsWith('syncRulesC_'))).toBe(true)
+
+    // Decode the stored chunks back — folder dict deduped 10 refs → 3 entries.
+    const rowKeys = Object.keys(cloud).filter((k) => k.startsWith('syncRulesC_'))
+    const folderKeys = Object.keys(cloud).filter((k) => k.startsWith('syncFolders_'))
+    const folders = unchunkArray(folderKeys.map((k) => cloud[k] as SyncChunkLike<FolderDictEntry>))
+    const rows = unchunkArray(rowKeys.map((k) => cloud[k] as SyncChunkLike<CompactRuleRow>))
+    expect(folders).toHaveLength(3)
+    const decoded = decodeRulesFromSync({ folders, rows })
+    expect(decoded).toHaveLength(10)
+    // Every rule's target survives the folder-dictionary round-trip.
+    for (const r of rules) {
+      const d = decoded.find((x) => x.id === r.id)!
+      expect(d.targetFolderId).toBe(r.targetFolderId)
+      expect(d.targetFolderPath).toBe(r.targetFolderPath)
+      expect(d.signal).toBe(r.signal)
+    }
+  })
+
+  it('a fresh machine pulls v3-encoded cloud rules back (decode-on-pull)', async () => {
+    // Another machine pushed two rules in the v3 compact format; this
+    // machine (empty local) pulls and reconstructs them.
+    await simulateOtherMachinePush({
+      rules: [
+        rule({ id: 'a', signal: 'alpha.com', source: 'user_manual' }),
+        rule({ id: 'b', signal: 'beta.com', source: 'ai_confirmed' }),
+      ],
+      machineId: 'other-machine',
+    })
+    await pullNow('test', { mode: 'union' })
+    const pulled = await listRules()
+    expect(pulled.map((r) => r.signal).sort()).toEqual(['alpha.com', 'beta.com'])
+  })
+})
+
+type SyncChunkLike<T> = { index: number; items: T[] }
 
 // ---- folderActivity refresh timestamp -------------------------------------
 
@@ -957,8 +1049,8 @@ describe('H1: doPush quota-wedge recovery', () => {
     const r = await pushNow('test')
     expect(r.pushed).toBe(true)
     const cloud = await chrome.storage.sync.get(null)
-    expect(cloud['syncRules_0']).toBeDefined() // new payload landed
-    expect(cloud['syncRules_1']).toBeUndefined() // orphans freed
+    expect(cloud['syncRulesC_0']).toBeDefined() // new v3 payload landed
+    expect(cloud['syncRules_1']).toBeUndefined() // legacy orphans freed
     expect(cloud['syncRules_2']).toBeUndefined()
   })
 

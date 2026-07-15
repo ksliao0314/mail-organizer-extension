@@ -43,6 +43,24 @@ export const CHUNK_BYTE_TARGET = 6 * 1024
 export const MAX_RULE_CHUNKS = 20
 export const MAX_TOMBSTONE_CHUNKS = 8
 export const MAX_FOLDER_ACTIVITY_CHUNKS = 4
+/**
+ * Folder-dictionary chunks (schemaVersion 3). The ~88 KB byte budget can hold
+ * at most ~15 chunks of folders anyway (it shrinks the folder set by dropping
+ * rules before this cap bites), so 16 makes the byte budget the sole limiter
+ * in practice and leaves this cap as a pure defensive backstop. ~40 distinct
+ * folders fit in ~2 chunks; a firm with a folder-per-case has ample headroom.
+ */
+export const MAX_FOLDER_DICT_CHUNKS = 16
+
+/**
+ * Total-byte budget for OUR sync payload, well under the 100 KB hard quota.
+ * doPush measures the non-rule writes (settings + meta + tombstones +
+ * folderActivity) and gives compact rule rows + folder dict the remainder up
+ * to this budget, dropping the lowest-priority rules if they don't fit. The
+ * ~12 KB gap to 100 KB absorbs Chrome's per-item bookkeeping and leaves room
+ * so a push never fails the whole batch on `kQuotaBytes`.
+ */
+export const SYNC_TOTAL_BUDGET_BYTES = 88 * 1024
 
 /** Tombstone sync cap — older deletions are unlikely to be re-learned. */
 export const TOMBSTONE_SYNC_CAP = 500
@@ -51,7 +69,7 @@ export const TOMBSTONE_SYNC_CAP = 500
 export const FOLDER_ACTIVITY_SYNC_CAP = 20
 
 /** Schema version of the cloud envelope. Bump on breaking change. */
-export const SYNC_SCHEMA_VERSION = 2
+export const SYNC_SCHEMA_VERSION = 3
 
 /** Local backup-snapshot rotation. */
 export const MAX_BACKUPS = 5

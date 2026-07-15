@@ -3,6 +3,7 @@ import {
   chunkRules,
   chunkTombstones,
   CHUNK_BYTE_TARGET,
+  compareRuleSyncPriority,
   jsonByteSize,
   shouldSyncRule,
   TOMBSTONE_SYNC_CAP,
@@ -53,6 +54,39 @@ describe('shouldSyncRule', () => {
         }),
       ),
     ).toBe(true)
+  })
+})
+
+describe('compareRuleSyncPriority (budget-guard drop order)', () => {
+  it('enabled rules rank above auto-disabled ones', () => {
+    const on = rule({ enabled: true, source: 'ai_confirmed' })
+    const off = rule({ enabled: false, source: 'user_manual', matchCount: 999 })
+    // Even a high-value disabled rule loses to any enabled rule.
+    expect(compareRuleSyncPriority(on, off)).toBeLessThan(0)
+  })
+
+  it('among enabled rules, source authority wins (user_manual > ai_confirmed)', () => {
+    const manual = rule({ enabled: true, source: 'user_manual', matchCount: 0 })
+    const ai = rule({ enabled: true, source: 'ai_confirmed', matchCount: 500 })
+    expect(compareRuleSyncPriority(manual, ai)).toBeLessThan(0)
+  })
+
+  it('same source → higher matchCount wins', () => {
+    const proven = rule({ source: 'ai_confirmed', matchCount: 50 })
+    const fresh = rule({ source: 'ai_confirmed', matchCount: 1 })
+    expect(compareRuleSyncPriority(proven, fresh)).toBeLessThan(0)
+  })
+
+  it('sorting a mixed set puts the drop-me rules last', () => {
+    const rules = [
+      rule({ id: 'disabled', enabled: false, source: 'user_manual', matchCount: 100 }),
+      rule({ id: 'ai-cold', source: 'ai_confirmed', matchCount: 0 }),
+      rule({ id: 'manual-hot', source: 'user_manual', matchCount: 20 }),
+      rule({ id: 'ai-hot', source: 'ai_confirmed', matchCount: 80 }),
+    ]
+    const order = [...rules].sort(compareRuleSyncPriority).map((r) => r.id)
+    expect(order[0]).toBe('manual-hot') // highest priority kept
+    expect(order[order.length - 1]).toBe('disabled') // dropped first
   })
 })
 
