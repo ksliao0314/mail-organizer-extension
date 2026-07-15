@@ -220,31 +220,43 @@ function domainRule(signal: string, targetFolderPath: string): Rule {
 }
 
 describe('internal-body case matching (batch-3)', () => {
+  // Matching requires the FULLY-FETCHED bodyText, never the 250-char preview
+  // (review fix): a truncated view can't verify case uniqueness, so preflight
+  // (preview-only) never body-matches.
   it('routes on a body case number when the subject has none', () => {
     const r = subjectRule('112訴304', 'case/304')
-    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '開庭通知', BodyPreview: '本件 112訴304 敬請出席' }))
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '開庭通知', bodyText: '本件 112訴304 敬請出席' }))
     expect(m?.rule.targetFolderPath).toBe('case/304')
     expect(m?.reason).toContain('內文含案號')
   })
 
   it('routes on a body case CODE against a case_code rule', () => {
     const r = caseCodeRule('25A0067A', 'case/A')
-    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '案件 25A0067A 相關文件' }))
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', bodyText: '案件 25A0067A 相關文件' }))
     expect(m?.rule.targetFolderPath).toBe('case/A')
     expect(m?.reason).toContain('內文含案件代號')
+  })
+
+  it('does NOT match on a preview-only email (no bodyText) — preflight safety', () => {
+    // The exact P2 misroute guard: only BodyPreview present (as at preflight),
+    // no bodyText → body pass must not fire, even though the preview names a
+    // case that has a rule. The email flows to the AI (full-body) instead.
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '本件 112訴304' }))
+    expect(m).toBeNull()
   })
 
   it('IGNORES the body when the subject carries its own case number', () => {
     // Subject case 112訴204 has no rule; body case 112訴304 has a rule.
     // Subject-first gate → body is not consulted → no match (falls to AI).
     const r = subjectRule('112訴304', 'case/304')
-    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '112年度訴字第204號 通知', BodyPreview: '參照 112訴304' }))
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '112年度訴字第204號 通知', bodyText: '參照 112訴304' }))
     expect(m).toBeNull()
   })
 
   it('does NOT route when the body is ambiguous (>1 distinct case)', () => {
     const r = subjectRule('112訴304', 'case/304')
-    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '本件 112訴304，另案 113訴500' }))
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', bodyText: '本件 112訴304，另案 113訴500' }))
     expect(m).toBeNull()
   })
 
@@ -257,7 +269,7 @@ describe('internal-body case matching (batch-3)', () => {
         Id: 'e',
         Subject: '通知',
         From: { EmailAddress: { Address: 'clerk@court.example.tw' } },
-        BodyPreview: '本件 112訴304',
+        bodyText: '本件 112訴304',
       }),
     )
     expect(m?.rule.targetFolderPath).toBe('domain/court')

@@ -1726,12 +1726,22 @@ export function gateCaseSignals(
   }
 }
 
-/** Matching-side view. Body input degrades gracefully: `bodyText` (800 chars,
- *  AI bucket) when present, else the 250-char `BodyPreview` already on hand. */
+// Body case extraction operates on the SAME window on both sides so a learned
+// rule can actually fire and ambiguity is judged consistently (batch-3 review
+// fix). Matching reads ONLY the fully-fetched `bodyText` — NEVER the 250-char
+// BodyPreview. Rationale: on a truncated preview the ambiguity check is blind
+// to a second case number sitting past char 250, so an email that merely CITES
+// another party's case in its first lines (真正主案在深處) could be silently
+// routed to that cited case's folder without AI review. Requiring the full
+// body means: at preflight (no bodyText) the body pass simply does not fire —
+// body-case mail flows to the AI, which reads the full body and routes it
+// correctly; the learned rule then fires on future SUBJECT occurrences.
+const BODY_CASE_WINDOW = 800
+
 export function caseSignalsForMatch(
-  email: Pick<Email, 'Subject' | 'bodyText' | 'BodyPreview'>,
+  email: Pick<Email, 'Subject' | 'bodyText'>,
 ): EligibleCaseSignals {
-  const body = email.bodyText ?? email.BodyPreview ?? ''
+  const body = (email.bodyText ?? '').slice(0, BODY_CASE_WINDOW)
   return gateCaseSignals(
     extractCourtCaseNumbers(email.Subject ?? ''),
     extractCaseCodes(email.Subject ?? ''),
@@ -1741,18 +1751,18 @@ export function caseSignalsForMatch(
 }
 
 /** Learning-side view. Body identifiers are pre-computed at classify time into
- *  `bodyCaseNumbers`/`bodyCaseCodes` (from the full 800-char bodyText); fall
- *  back to re-extracting from `bodyPreview` for plan items that lack them. */
+ *  `bodyCaseNumbers`/`bodyCaseCodes` from the SAME full body window the matching
+ *  side reads — NO 250-char bodyPreview fallback, which would let learning mint
+ *  a rule the matching side can never fire (→ stale-swept). Absent fields ⇒ no
+ *  body case (the email was never body-fetched). */
 export function caseSignalsForLearning(
-  item: Pick<PlanItem, 'emailSubject' | 'bodyCaseNumbers' | 'bodyCaseCodes' | 'bodyPreview'>,
+  item: Pick<PlanItem, 'emailSubject' | 'bodyCaseNumbers' | 'bodyCaseCodes'>,
 ): EligibleCaseSignals {
-  const bodyCourt = item.bodyCaseNumbers ?? extractCourtCaseNumbers(item.bodyPreview ?? '')
-  const bodyCodes = item.bodyCaseCodes ?? extractCaseCodes(item.bodyPreview ?? '')
   return gateCaseSignals(
     extractCourtCaseNumbers(item.emailSubject ?? ''),
     extractCaseCodes(item.emailSubject ?? ''),
-    bodyCourt,
-    bodyCodes,
+    item.bodyCaseNumbers ?? [],
+    item.bodyCaseCodes ?? [],
   )
 }
 

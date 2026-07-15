@@ -57,10 +57,10 @@ describe('caseSignalsForMatch', () => {
     expect(withText.courtCases).toEqual(['112訴204'])
   })
 
-  it('falls back to BodyPreview when bodyText absent', () => {
+  it('does NOT read BodyPreview (matching requires the full bodyText)', () => {
+    // Preview-only (as at preflight) → body ignored → no body-case routing.
     const r = caseSignalsForMatch(email({ Subject: '開庭通知', BodyPreview: '本件 112訴204' }))
-    expect(r.source).toBe('body')
-    expect(r.courtCases).toEqual(['112訴204'])
+    expect(r.source).toBe('none')
   })
 
   it('subject case number wins even if the body cites another case', () => {
@@ -85,10 +85,11 @@ describe('caseSignalsForLearning', () => {
     expect(r.courtCases).toEqual(['112訴204'])
   })
 
-  it('re-extracts from bodyPreview when pre-computed fields are absent', () => {
+  it('does NOT re-extract from bodyPreview — absent pre-computed fields ⇒ no body case', () => {
+    // Symmetry with matching: learning only trusts identifiers pre-computed
+    // from the full body (bodyCaseNumbers), never the 250-char preview.
     const r = caseSignalsForLearning(planItem({ emailSubject: '開庭', bodyPreview: '本件 112訴204 敬請' }))
-    expect(r.source).toBe('body')
-    expect(r.courtCases).toEqual(['112訴204'])
+    expect(r.source).toBe('none')
   })
 
   it('refuses ambiguity: 2 distinct pre-computed body numbers → bodyAmbiguous', () => {
