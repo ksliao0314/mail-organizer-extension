@@ -20,6 +20,28 @@ export type SyncChunk<T> = {
   items: T[]
 }
 
+const _utf8Encoder = new TextEncoder()
+
+/**
+ * UTF-8 byte length of a string — the unit chrome.storage.sync actually
+ * enforces its 8 KB-per-item / 100 KB-total quota in.
+ *
+ * The old code used `JSON.stringify(x).length`, i.e. the UTF-16 code-unit
+ * count. For ASCII that equals the byte count, but a CJK character is 1
+ * code unit and 3 bytes. A rule library full of Chinese folder paths and
+ * subject keywords therefore under-counted by up to 3×, so a chunk the
+ * chunker believed was 6 KB could be 14 KB in storage → the
+ * `kQuotaBytesPerItem quota exceeded` crash. Always measure in real bytes.
+ */
+export function utf8ByteLength(s: string): number {
+  return _utf8Encoder.encode(s).length
+}
+
+/** UTF-8 byte size of a value once JSON-serialised (how sync bills it). */
+export function jsonByteSize(value: unknown): number {
+  return utf8ByteLength(JSON.stringify(value))
+}
+
 // CHUNK_BYTE_TARGET re-exported for backward compat with existing
 // imports; new code should import from '@/shared/constants'.
 export { CHUNK_BYTE_TARGET } from './constants'
@@ -98,16 +120,17 @@ function chunkArray<T>(items: T[], keyFn: (item: T) => string): SyncChunk<T>[] {
   const sorted = [...items].sort((a, b) => keyFn(a).localeCompare(keyFn(b)))
   const chunks: SyncChunk<T>[] = []
   let current: T[] = []
-  let currentBytes = JSON.stringify({ index: 0, items: [] }).length // envelope overhead
+  // Envelope overhead, measured in real UTF-8 bytes (the unit sync bills in).
+  let currentBytes = jsonByteSize({ index: 0, items: [] })
 
   for (const item of sorted) {
     // +1 for the comma in the eventual array serialisation. Slight
     // over-estimate but safe.
-    const itemSize = JSON.stringify(item).length + 1
+    const itemSize = jsonByteSize(item) + 1
     if (current.length > 0 && currentBytes + itemSize > CHUNK_BYTE_TARGET) {
       chunks.push({ index: chunks.length, items: current })
       current = []
-      currentBytes = JSON.stringify({ index: chunks.length, items: [] }).length
+      currentBytes = jsonByteSize({ index: chunks.length, items: [] })
     }
     current.push(item)
     currentBytes += itemSize

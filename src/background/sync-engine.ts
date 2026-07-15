@@ -38,8 +38,10 @@ import {
   chunkFolderActivity,
   chunkRules,
   chunkTombstones,
+  jsonByteSize,
   shouldSyncRule,
   unchunkArray,
+  utf8ByteLength,
   type SyncChunk,
 } from '@/shared/sync-chunks'
 import {
@@ -661,9 +663,19 @@ async function readSyncMeta(): Promise<SyncMeta | undefined> {
 }
 
 async function getOurBytesInUse(): Promise<number> {
-  // chrome.storage.sync.getBytesInUse(null) returns bytes used by ALL
-  // keys, including any from other extensions or earlier versions.
-  // For our purposes, we list and filter to known prefixes.
+  // chrome.storage.sync is isolated PER EXTENSION — getBytesInUse(null)
+  // returns only our own keys (never other extensions'), measured in the
+  // real UTF-8 bytes Chrome bills the quota in. That is the authoritative
+  // number and what the usage meter must show, so the user sees true
+  // headroom instead of a UTF-16 char-count under-estimate.
+  try {
+    const authoritative = await chrome.storage.sync.getBytesInUse(null)
+    if (typeof authoritative === 'number' && authoritative >= 0) return authoritative
+  } catch {
+    // getBytesInUse unavailable (e.g. test mock) — fall through to manual sum.
+  }
+  // Byte-accurate manual fallback. Mirrors Chrome's accounting: key bytes +
+  // JSON-value bytes, both in UTF-8 (NOT String.length, which under-counts CJK).
   const all = await chrome.storage.sync.get(null)
   let bytes = 0
   for (const [key, value] of Object.entries(all)) {
@@ -676,7 +688,7 @@ async function getOurBytesInUse(): Promise<number> {
     ) {
       continue
     }
-    bytes += key.length + JSON.stringify(value).length
+    bytes += utf8ByteLength(key) + jsonByteSize(value)
   }
   return bytes
 }

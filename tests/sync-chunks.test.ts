@@ -3,9 +3,11 @@ import {
   chunkRules,
   chunkTombstones,
   CHUNK_BYTE_TARGET,
+  jsonByteSize,
   shouldSyncRule,
   TOMBSTONE_SYNC_CAP,
   unchunkArray,
+  utf8ByteLength,
 } from '@/shared/sync-chunks'
 import type { Rule, RuleSource, RuleTombstone } from '@/shared/types'
 
@@ -81,6 +83,35 @@ describe('chunkRules', () => {
       // Allow some over-estimate slack but not blow out.
       expect(JSON.stringify(c).length).toBeLessThan(CHUNK_BYTE_TARGET + 1024)
     }
+  })
+
+  it('keeps every CJK-heavy chunk under the 8KB per-item byte limit (kQuotaBytesPerItem regression)', () => {
+    // The bug: the chunker sized chunks with String.length (UTF-16 code
+    // units), but chrome.storage.sync bills per-item quota in UTF-8 bytes.
+    // A Chinese char is 1 code unit but 3 bytes, so Chinese-heavy rules
+    // packed ~3× too many per chunk → a "6KB" chunk was really ~14KB →
+    // `Resource::kQuotaBytesPerItem quota exceeded`. Realistic firm data:
+    // deep Chinese folder paths + long Chinese subject-keyword signals.
+    const PER_ITEM_LIMIT = 8_192
+    const rules = Array.from({ length: 60 }, (_, i) =>
+      rule({
+        id: `id-${i.toString().padStart(3, '0')}`,
+        type: 'subject_keyword',
+        signal: `台灣高等法院民事判決一一四年度上字第${i}號損害賠償等事件通知`,
+        targetFolderPath: `01進行中案件/２０２４年度/王小明與陳大文股權轉讓糾紛/往來文件與書狀/第${i}類`,
+      }),
+    )
+    const chunks = chunkRules(rules)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) {
+      // Real UTF-8 bytes of the stored value, plus the key ("syncRules_NN").
+      const stored = jsonByteSize(c) + utf8ByteLength(`syncRules_${c.index}`)
+      expect(stored).toBeLessThan(PER_ITEM_LIMIT)
+    }
+    // Sanity: this data really is CJK-heavy — char count would have lied.
+    const worst = chunks.reduce((m, c) => Math.max(m, jsonByteSize(c)), 0)
+    const worstChars = chunks.reduce((m, c) => Math.max(m, JSON.stringify(c).length), 0)
+    expect(worst).toBeGreaterThan(worstChars * 1.3)
   })
 
   it('skips auto_scan + orphaned rules', () => {

@@ -33,6 +33,25 @@ function makeArea(area: 'local' | 'session' | 'sync') {
     clear: vi.fn(async () => {
       stores[area] = {}
     }),
+    // Mirror Chrome's real accounting: each item costs its key's UTF-8
+    // bytes + its JSON-serialised value's UTF-8 bytes. Crucially NOT
+    // String.length (which under-counts CJK 3×) — tests rely on this to
+    // catch byte-vs-char regressions in the sync chunker / usage meter.
+    getBytesInUse: vi.fn(async (keys?: string | string[] | null) => {
+      const enc = new TextEncoder()
+      const wanted =
+        keys == null
+          ? Object.keys(stores[area])
+          : typeof keys === 'string'
+            ? [keys]
+            : keys
+      let bytes = 0
+      for (const k of wanted) {
+        if (!(k in stores[area])) continue
+        bytes += enc.encode(k).length + enc.encode(JSON.stringify(stores[area][k])).length
+      }
+      return bytes
+    }),
     QUOTA_BYTES: 102_400,
     QUOTA_BYTES_PER_ITEM: 8_192,
   }
