@@ -145,6 +145,7 @@ describe('generateAiOverrideRules', () => {
     const r = await generateAiOverrideRules([item], [result(item.emailId, 'moved')])
     expect(r.added).toBe(0)
     expect(r.disabled).toBe(0)
+    expect(r.details).toEqual([])
   })
 
   it('creates an ai_overridden rule when user picks a different target', async () => {
@@ -162,6 +163,14 @@ describe('generateAiOverrideRules', () => {
     })
     const r = await generateAiOverrideRules([item], [result(item.emailId, 'moved')])
     expect(r.added).toBe(1)
+    // details feed the DoneScreen learned-rules list (覆核 P1-3)
+    expect(r.details).toHaveLength(1)
+    expect(r.details[0]).toEqual({
+      type: 'case_code',
+      signal: '25A0067A',
+      targetFolderPath: '03/Right',
+      source: 'ai_overridden',
+    })
     const rules = await listRules()
     expect(rules).toHaveLength(1)
     expect(rules[0]!.type).toBe('case_code')

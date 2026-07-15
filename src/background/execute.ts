@@ -61,6 +61,7 @@ import {
   type PlanItem,
   type Rule,
   type RuleEvent,
+  type RuleLearnedDetail,
   type RuleSnapshot,
   type UndoSnapshot,
   UNDO_WINDOW_MS,
@@ -575,16 +576,19 @@ export async function startExecute(
     // Rule ids minted by THIS batch's AI-confirmed learning — recorded in
     // the undo snapshot so 撤回 can delete them (H2 learning reversal).
     let mintedRuleIds: string[] = []
+    const learnedDetails: RuleLearnedDetail[] = []
     try {
       const gen = await generateAiConfirmedRules(plan, state.results)
       aiConfirmedAdded = gen.added
       mintedRuleIds = gen.addedIds
+      learnedDetails.push(...gen.details)
     } catch (e) {
       console.warn('[mail-organizer] generateAiConfirmedRules failed (non-fatal)', e)
     }
     try {
       const r = await generateAiOverrideRules(plan, state.results)
       aiOverriddenAdded = r.added
+      learnedDetails.push(...r.details)
       if (r.disabled > 0) {
         console.info(
           `[mail-organizer] ai_overridden disabled ${r.disabled} stale rule(s) pointing at the AI's old wrong target`,
@@ -594,6 +598,7 @@ export async function startExecute(
       console.warn('[mail-organizer] generateAiOverrideRules failed (non-fatal)', e)
     }
     state.rulesAdded = aiConfirmedAdded + aiOverriddenAdded
+    state.rulesAddedDetail = learnedDetails
 
     // Conflict prevention moved into chooseLearningSignal (2026-05-27
     // redesign). When the user routes a same-domain email to a different
@@ -1349,7 +1354,7 @@ function isStructuralCourtCaseRule(r: Rule): boolean {
 async function generateAiConfirmedRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
-): Promise<{ added: number; addedIds: string[] }> {
+): Promise<{ added: number; addedIds: string[]; details: RuleLearnedDetail[] }> {
   // Snapshot of currently-enabled rules — only used for dedup checks.
   // The atomic addRulesFilteringTombstones call below ensures we don't
   // clobber concurrent writers and respects user tombstones.
@@ -1535,8 +1540,24 @@ async function generateAiConfirmedRules(
   const { added } = await addRulesFilteringTombstones(newRules)
   // Ids are threaded into the undo snapshot (H2) so 撤回 can delete the
   // rules this batch just minted — otherwise the reverted misfiling is
-  // deterministically re-proposed next batch.
-  return { added: added.length, addedIds: added.map((r) => r.id) }
+  // deterministically re-proposed next batch. `details` feed the DoneScreen
+  // learned-rules list (覆核 P1-3).
+  return {
+    added: added.length,
+    addedIds: added.map((r) => r.id),
+    details: added.map((r) => ruleLearnedDetail(r)),
+  }
+}
+
+// Project a freshly-minted Rule down to the display-only fields the DoneScreen
+// needs. Keeps ExecuteState small (no confidence / stats / ids the UI ignores).
+function ruleLearnedDetail(r: Rule): RuleLearnedDetail {
+  return {
+    type: r.type,
+    signal: r.signal,
+    targetFolderPath: r.targetFolderPath,
+    source: r.source,
+  }
 }
 
 /**
@@ -1557,7 +1578,7 @@ async function generateAiConfirmedRules(
 export async function generateAiOverrideRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
-): Promise<{ added: number; disabled: number }> {
+): Promise<{ added: number; disabled: number; details: RuleLearnedDetail[] }> {
   type Override = {
     type: LearningSignal['type']
     signal: string
@@ -1605,13 +1626,17 @@ export async function generateAiOverrideRules(
         (sig.type === 'domain' || sig.type === 'sender') && sig.demoteOnly === true,
     })
   }
-  if (overrides.length === 0) return { added: 0, disabled: 0 }
+  if (overrides.length === 0) return { added: 0, disabled: 0, details: [] as RuleLearnedDetail[] }
 
   // Track the mutations so we can record audit events AFTER the mutex
   // releases. Doing it inside mutateRules would mean nested storage writes
   // before the lock yielded — annoying but not broken; we keep it outside
   // for cleaner ordering.
   const auditEvents: RuleEvent[] = []
+  // Rules minted this pass, collected for the DoneScreen learned-rules list
+  // (覆核 P1-3). Mirrors auditEvents' outer-scope + push-inside pattern; the
+  // mutateRules closure runs once under the lock so no double-collection.
+  const createdRules: Rule[] = []
   const snapshotRule = (r: Rule): RuleSnapshot => ({
     type: r.type,
     signal: r.signal,
@@ -1729,6 +1754,7 @@ export async function generateAiOverrideRules(
         source: 'ai_overridden',
       })
       next.push(created)
+      createdRules.push(created)
       auditEvents.push({
         kind: 'create',
         ruleId: created.id,
@@ -1746,7 +1772,7 @@ export async function generateAiOverrideRules(
       console.warn('[mail-organizer] recordRuleEvents (ai-override) failed', e),
     )
   }
-  return outcome
+  return { ...outcome, details: createdRules.map(ruleLearnedDetail) }
 }
 
 // ---- Undo ------------------------------------------------------------------

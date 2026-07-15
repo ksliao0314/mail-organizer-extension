@@ -490,6 +490,16 @@ export type ExecuteSummary = {
   errors: number
 }
 
+// One rule the learning loop minted during an execute batch. Surfaced to the
+// DoneScreen so the reviewer can see EXACTLY which corrections became durable
+// rules (覆核 P1-3) — closing the "will my override stick?" transparency gap.
+export type RuleLearnedDetail = {
+  type: RuleType
+  signal: string
+  targetFolderPath: string
+  source: RuleSource
+}
+
 export type ExecuteState = {
   inProgress: boolean
   cancelRequested: boolean
@@ -503,6 +513,12 @@ export type ExecuteState = {
   results: ExecuteItemResult[]
   summary: ExecuteSummary
   rulesAdded: number
+  /**
+   * Details of the rules minted this batch (same count as rulesAdded).
+   * Optional for backward-compat with persisted states from older versions
+   * that lack it. Consumed by the DoneScreen learned-rules list.
+   */
+  rulesAddedDetail?: RuleLearnedDetail[]
 }
 
 // Defaults are intentionally empty / generic for new installs. Existing

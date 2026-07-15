@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Circle,
+  FolderTree,
   HelpCircle,
   Loader2,
   Mail,
@@ -2095,6 +2096,21 @@ function ClassifyingScreen({ startedAt, batchSize }: { startedAt: number; batchS
 
 // ---- Plan ----------------------------------------------------------------
 
+// Group key for the "依資料夾分組" sort (覆核 P1-2). Same-destination rows
+// share a key so they cluster together; the reviewer can then eyeball "all N
+// mails going to 客戶A/訴訟" as a block instead of hunting them scattered
+// across an 80-row list. Non-move actions get their own synthetic buckets.
+function targetGroupKey(item: PlanItem): string {
+  if (item.action === 'move') return item.targetFolderPath ?? '（未指定目標）'
+  if (item.action === 'new_folder') {
+    return item.suggestedParentPath && item.suggestedFolderName
+      ? `${joinFolderPath(item.suggestedParentPath, item.suggestedFolderName)}（新建）`
+      : '（新建・未完成）'
+  }
+  if (item.action === 'delete') return '（刪除）'
+  return '（保留）'
+}
+
 function PlanScreen({
   items,
   tree,
@@ -2256,9 +2272,46 @@ function PlanScreen({
     new Set(),
   )
 
+  // 依資料夾分組排序 (覆核 P1-2). When on, reorder so same-target rows sit
+  // together. Secondary key = conversationId (falls back to emailId) so a
+  // conversation cluster's members stay contiguous within their folder bucket
+  // — the collapse-link placement logic below relies on that contiguity.
+  // Array.sort is stable (ES2019+), so ties preserve the original order.
+  const [sortMode, setSortMode] = useState<'default' | 'byTarget'>('default')
+  const orderedItems = useMemo(() => {
+    if (sortMode !== 'byTarget') return filteredItems
+    // Strict code-point compare (NOT localeCompare): the group-header dedup
+    // and the conversation-cluster contiguity checks downstream test group
+    // keys with strict `!==`. localeCompare returns 0 for canonically-equal
+    // but code-point-distinct strings (e.g. NFC vs NFD "café"), which would
+    // make this an inconsistent (invalid) ordering vs the strict dedup —
+    // interleaving two such groups, duplicating headers and splitting
+    // clusters. Code-point compare keeps sort + dedup on the same equality.
+    const cmp = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0)
+    return [...filteredItems].sort((a, b) => {
+      const kc = cmp(targetGroupKey(a), targetGroupKey(b))
+      if (kc !== 0) return kc
+      return cmp(a.conversationId ?? a.emailId, b.conversationId ?? b.emailId)
+    })
+  }, [filteredItems, sortMode])
+
+  // Per-target-group tallies (from filteredItems so hidden siblings count too)
+  // — the group header shows the true "N mails → this folder" and 全選此組
+  // selects ALL of them, not just the rows currently rendered.
+  const targetGroups = useMemo(() => {
+    const ids = new Map<string, string[]>()
+    for (const item of filteredItems) {
+      const k = targetGroupKey(item)
+      const arr = ids.get(k) ?? []
+      arr.push(item.emailId)
+      ids.set(k, arr)
+    }
+    return ids
+  }, [filteredItems])
+
   const conversationGroups = useMemo(() => {
     const byConv = new Map<string, PlanItem[]>()
-    for (const item of filteredItems) {
+    for (const item of orderedItems) {
       const cid = item.conversationId
       if (!cid) continue
       const arr = byConv.get(cid) ?? []
@@ -2284,11 +2337,11 @@ function PlanScreen({
       collapsible.set(cid, { rep: first, siblings: members.slice(1) })
     }
     return collapsible
-  }, [filteredItems])
+  }, [orderedItems])
 
   // The items actually rendered: skip siblings of COLLAPSED groups.
   const displayItems = useMemo(() => {
-    return filteredItems.filter((item) => {
+    return orderedItems.filter((item) => {
       const cid = item.conversationId
       if (!cid) return true
       const group = conversationGroups.get(cid)
@@ -2298,7 +2351,7 @@ function PlanScreen({
       // Sibling — render only if group is expanded.
       return expandedConversations.has(cid)
     })
-  }, [filteredItems, conversationGroups, expandedConversations])
+  }, [orderedItems, conversationGroups, expandedConversations])
 
   function toggleConversation(cid: string) {
     setExpandedConversations((prev) => {
@@ -2364,12 +2417,14 @@ function PlanScreen({
     }
   }, [displayItems.length, focusedIndex])
 
-  // Reset focus when the filter narrows differently. Without this, j/k
-  // could land on an item the user can no longer see while their visible
-  // list scrolls past unexpected entries.
+  // Reset focus when the filter narrows differently, OR the sort mode flips
+  // (both reorder displayItems, so a held focusedIndex would point at a
+  // different row than the user expects). Without this, j/k could land on an
+  // item the user can no longer see while their visible list scrolls past
+  // unexpected entries.
   useEffect(() => {
     setFocusedIndex(null)
-  }, [filterChips])
+  }, [filterChips, sortMode])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -2711,6 +2766,26 @@ function PlanScreen({
                 待確認 {attentionCount}
               </button>
             )}
+            {items.length > 2 && (
+              <button
+                type="button"
+                onClick={() => setSortMode((m) => (m === 'byTarget' ? 'default' : 'byTarget'))}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors',
+                  sortMode === 'byTarget'
+                    ? 'border-foreground bg-foreground text-background'
+                    : 'border-border text-muted-foreground hover:bg-accent',
+                )}
+                title={
+                  sortMode === 'byTarget'
+                    ? '目前依目標資料夾分組 — 點擊恢復原順序'
+                    : '把要進同一個資料夾的信聚在一起，方便逐夾核對'
+                }
+              >
+                <FolderTree className="size-3" />
+                依資料夾
+              </button>
+            )}
           </div>
           <span
             className="font-mono text-[10px] text-muted-foreground tabular-nums shrink-0"
@@ -2953,13 +3028,53 @@ function PlanScreen({
             const isRepOfGroup = group && group.rep.emailId === it.emailId
             const isCollapsed =
               isRepOfGroup && !expandedConversations.has(cid!)
+            // 依資料夾分組 (P1-2)：sortMode='byTarget' 時，group key 與前一
+            // 列不同就先插一條群組分隔列（路徑 + 該資料夾總筆數 + 全選此
+            // 組）。群組計數取自 targetGroups（涵蓋被折疊的同對話 siblings），
+            // 全選也把隱藏 siblings 一起勾。
+            const gkey = sortMode === 'byTarget' ? targetGroupKey(it) : null
+            const showGroupHeader =
+              gkey !== null &&
+              (idx === 0 || targetGroupKey(displayItems[idx - 1]!) !== gkey)
+            const groupSize = gkey !== null ? (targetGroups.get(gkey)?.length ?? 0) : 0
             // F15 (2026-06-03): focus ring keys off the displayItems
             // index (the rendered position), matching keyboard nav which
             // now also indexes displayItems. Previously this used the
             // filteredItems index, so a cursor on a hidden sibling
             // matched no rendered row and the ring vanished.
             return (
-              <li key={it.emailId} className="contents">
+              <Fragment key={it.emailId}>
+                {showGroupHeader && (
+                  <li className="pt-2 first:pt-0">
+                    <div className="flex items-center gap-2 rounded bg-muted/50 px-2 py-1">
+                      <FolderTree className="size-3 text-muted-foreground shrink-0" />
+                      <span
+                        className="font-mono text-[11px] font-medium truncate"
+                        title={gkey!}
+                      >
+                        {gkey}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground tabular-nums shrink-0">
+                        {groupSize} 封
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedIds((prev) => {
+                            const next = new Set(prev)
+                            for (const id of targetGroups.get(gkey!) ?? []) next.add(id)
+                            return next
+                          })
+                        }
+                        className="ml-auto shrink-0 text-[10px] text-muted-foreground hover:text-foreground hover:underline"
+                        title="勾選所有要進這個資料夾的信"
+                      >
+                        全選此組
+                      </button>
+                    </div>
+                  </li>
+                )}
+                <li className="contents">
                 <PlanRow
                   item={it}
                   tree={augmentedTree}
@@ -2997,26 +3112,6 @@ function PlanScreen({
                     + 還有 {group!.siblings.length} 封同對話 — 展開檢視
                   </button>
                 )}
-                {/* Expanded marker after the LAST sibling — show
-                    collapse link. Detect "last sibling" = next
-                    displayItem has different conversationId. */}
-                {isRepOfGroup &&
-                  !isCollapsed &&
-                  (() => {
-                    // Find this group's siblings AFTER rep in displayItems
-                    const nextItem = displayItems[idx + 1]
-                    const isLastSiblingHere =
-                      !nextItem ||
-                      nextItem.conversationId !== cid ||
-                      // Edge case: rep was alone (filtered siblings)
-                      group!.siblings.length === 0
-                    // If group has siblings but next item is NOT this
-                    // group's sibling — that means siblings come later;
-                    // collapse-link should sit at the end. We pin it
-                    // to the rep row when only rep is rendered (siblings
-                    // expanded means they ARE in displayItems though).
-                    return isLastSiblingHere ? null : null
-                  })()}
                 {/* After the LAST sibling of an expanded group, show
                     collapse button. Sibling rows themselves carry no
                     extra UI. */}
@@ -3037,7 +3132,8 @@ function PlanScreen({
                     </button>
                   )
                 })()}
-              </li>
+                </li>
+              </Fragment>
             )
           })}
         </ul>
@@ -3204,6 +3300,15 @@ type UndoResultPayload = {
   errors: Array<{ subject: string; message: string }>
 }
 
+// Compact rule-type labels for the DoneScreen learned-rules list (覆核 P1-3).
+const LEARNED_TYPE_LABEL: Record<string, string> = {
+  domain: '網域',
+  sender: '寄件人',
+  case_code: '案號',
+  subject_keyword: '主旨',
+  compound: '組合',
+}
+
 function DoneScreen({
   state,
   batchSize,
@@ -3334,9 +3439,45 @@ function DoneScreen({
             移動 {state.summary.moved} · 刪除 {state.summary.deleted} · 新建 {state.summary.foldersCreated} · 保留 {state.summary.skipped}
           </div>
           {state.rulesAdded > 0 && (
-            <div className="flex items-center gap-1 text-emerald-800">
-              <Sparkles className="size-3" />
-              <span>AI 自動產生 {state.rulesAdded} 條規則</span>
+            <div className="text-emerald-800">
+              <div className="flex items-center gap-1">
+                <Sparkles className="size-3 shrink-0" />
+                <span>學會 {state.rulesAdded} 條新規則 — 下次同類郵件自動歸檔</span>
+              </div>
+              {state.rulesAddedDetail && state.rulesAddedDetail.length > 0 && (
+                <details className="mt-1 ml-4">
+                  <summary className="cursor-pointer select-none text-[11px] text-emerald-700 hover:underline">
+                    看是哪幾條規則 →
+                  </summary>
+                  <ul className="mt-1 space-y-0.5">
+                    {state.rulesAddedDetail.map((d, i) => (
+                      <li
+                        key={i}
+                        className="text-[10px] text-emerald-900/85 truncate"
+                        title={`${d.signal} → ${d.targetFolderPath}`}
+                      >
+                        <span className="text-emerald-700">
+                          {d.source === 'ai_overridden' ? '你改的' : 'AI'}·
+                          {LEARNED_TYPE_LABEL[d.type] ?? d.type}
+                        </span>{' '}
+                        <span className="font-mono">{d.signal}</span> →{' '}
+                        <span className="font-mono">{d.targetFolderPath}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void chrome.tabs.create({
+                        url: `${chrome.runtime.getURL('src/options/index.html')}#rules-library/all`,
+                      })
+                    }}
+                    className="mt-1 text-[10px] text-emerald-700 hover:underline"
+                  >
+                    在規則庫檢視 / 編輯 →
+                  </button>
+                </details>
+              )}
             </div>
           )}
         </div>

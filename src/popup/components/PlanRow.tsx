@@ -71,6 +71,50 @@ export function renderSourceBadge(source: PlanItem['source']): ReactNode {
   )
 }
 
+// Did the user override what the AI originally suggested? Mirrors the
+// background `wasUserOverride` (execute.ts) — action differs OR the final
+// target differs from the AI's original target. Kept here (not imported from
+// execute.ts) so the popup bundle doesn't pull in service-worker-only deps.
+// Exported for unit tests + reuse in the collapsed row and the trace block.
+export function aiOverrideInfo(item: PlanItem): {
+  overrode: boolean
+  aiOriginalTarget?: string
+  finalTarget?: string
+} {
+  const aiOriginalTarget =
+    item.aiOriginalAction === 'move'
+      ? item.aiOriginalTargetFolderPath
+      : item.aiOriginalAction === 'new_folder' &&
+          item.aiOriginalSuggestedParentPath &&
+          item.aiOriginalSuggestedFolderName
+        ? joinFolderPath(item.aiOriginalSuggestedParentPath, item.aiOriginalSuggestedFolderName)
+        : undefined
+  const finalTarget =
+    item.action === 'move'
+      ? item.targetFolderPath
+      : item.action === 'new_folder' && item.suggestedParentPath && item.suggestedFolderName
+        ? joinFolderPath(item.suggestedParentPath, item.suggestedFolderName)
+        : undefined
+  const overrode =
+    item.aiOriginalAction !== undefined &&
+    (item.aiOriginalAction !== item.action || aiOriginalTarget !== finalTarget)
+  return { overrode, aiOriginalTarget, finalTarget }
+}
+
+/**
+ * A user override that lands on a concrete move / new_folder destination is
+ * the case the learning loop turns into a durable rule (execute.ts
+ * generateAiOverrideRules). Surfacing it on the collapsed row answers the
+ * reviewer's "will my correction stick?" at the moment they make it. Coarse
+ * by design: a few overrides (domain-only signal, or one that conflicts with
+ * an existing rule) are skipped downstream — the wording says 將 (will try),
+ * and the DoneScreen lists what actually got learned.
+ */
+export function willLearnFromOverride(item: PlanItem): boolean {
+  const { overrode, finalTarget } = aiOverrideInfo(item)
+  return overrode && finalTarget !== undefined
+}
+
 export type PlanRowProps = {
   item: PlanItem
   tree: MailFolderNode[]
@@ -253,12 +297,28 @@ export function PlanRow({
   // user can dig into the exact value when they care.
   const lowConfidence = item.source !== 'rule' && item.confidence < 0.5
 
-  // ONE attention badge in the collapsed view (UI/UX 檢討 2026-07)：
-  // 「待決」(unresolved) 與「低信心」對律師是同一個語意 —「這封需要你
-  // 親自決定」。兩顆分開的 amber 徽章稀釋彼此；合併成一顆「待確認」，
-  // 原因放 hover title。其餘 rule/AI tone 由色條與展開後的判斷依據承擔。
+  // ONE tag in the collapsed view (UI/UX 檢討 2026-07 / 覆核 P1 2026-07)：
+  // 收合列右側最多一顆標記，優先序 = 將學習 > 待確認 > 來源。理由：
+  //   1. 將學習：律師剛覆寫 AI 的列（已做出決定）→ 執行後會嘗試學成規則。
+  //      willLearn 蘊含 overrode（現值 ≠ AI 原判）＝律師已決定，故不該再標
+  //      「待確認」(語意是「你還沒決定」)。放最前面修正了「低信心 AI 被
+  //      覆寫後仍顯示待確認、將學習永不出現」的問題 (覆核複審 2026-07)。
+  //   2. 待確認 (unresolved / 低信心且未覆寫)：律師必須親自決定。
+  //   3. 來源標記 (P1)：其餘列標出「非規則命中」——rule 命中是可信任的
+  //      靜默背景（不標），AI / thread 才上淡色標，讓律師掃 80 列時一眼
+  //      分出哪些是 AI 猜的、需要查證。
+  // 一列一顆，彩色 chip = 要動作，淡圖示 = 提示，層級分明不形成色牆。
   const needsAttention = item.source === 'unresolved' || lowConfidence
-  const collapsedAttentionBadge = needsAttention ? (
+  const willLearn = willLearnFromOverride(item)
+  const collapsedTag: ReactNode = willLearn ? (
+    <Badge
+      variant="outline"
+      className="text-[9px] border-emerald-300 bg-emerald-50 text-emerald-800"
+      title="你覆寫了 AI 的建議 — 執行後會嘗試把這次更正記成自動規則。是否真的學成要看訊號類型（案號、寄件人等）與有無衝突；執行完可在完成畫面的「學會的規則」清單核對實際結果。"
+    >
+      將學習
+    </Badge>
+  ) : needsAttention ? (
     <Badge
       variant="outline"
       className="text-[9px] border-amber-300 bg-amber-50 text-amber-800"
@@ -270,6 +330,21 @@ export function PlanRow({
     >
       待確認
     </Badge>
+  ) : item.source === 'ai' ? (
+    <span
+      className="inline-flex items-center text-muted-foreground/60"
+      title="AI 判斷 — 非規則命中，建議展開查證判斷依據"
+      aria-label="AI 判斷"
+    >
+      <Sparkles className="size-3" />
+    </span>
+  ) : item.source === 'thread' ? (
+    <span
+      className="text-[9px] font-medium text-violet-600/80"
+      title="沿用同對話 / 同主旨歷史信件的歸檔 — 非規則命中"
+    >
+      延續
+    </span>
   ) : null
 
   const fromCompact = (() => {
@@ -350,9 +425,7 @@ export function PlanRow({
                   >
                     {display ?? '—'}
                   </span>
-                  {collapsedAttentionBadge && (
-                    <span className="shrink-0">{collapsedAttentionBadge}</span>
-                  )}
+                  {collapsedTag && <span className="shrink-0">{collapsedTag}</span>}
                 </div>
                 {targetIssue && (
                   <div className="flex items-center gap-1 text-[10px] text-red-700 leading-tight">
@@ -384,9 +457,7 @@ export function PlanRow({
                   <span className={cn('truncate', targetIssue ? 'text-red-700' : 'text-muted-foreground')}>
                     {display ?? '—'}
                   </span>
-                  {collapsedAttentionBadge && (
-                    <span className="ml-auto shrink-0">{collapsedAttentionBadge}</span>
-                  )}
+                  {collapsedTag && <span className="ml-auto shrink-0">{collapsedTag}</span>}
                 </div>
                 {targetIssue && (
                   <div className="flex items-center gap-1 text-[10px] text-red-700 leading-tight">
@@ -569,19 +640,7 @@ export function RuleTraceBlock({
   const mr = item.matchedRule
 
   // Compute AI-override hint: when user changed away from what AI suggested.
-  const aiOriginalTarget = item.aiOriginalAction === 'move'
-    ? item.aiOriginalTargetFolderPath
-    : item.aiOriginalAction === 'new_folder' && item.aiOriginalSuggestedParentPath && item.aiOriginalSuggestedFolderName
-      ? joinFolderPath(item.aiOriginalSuggestedParentPath, item.aiOriginalSuggestedFolderName)
-      : undefined
-  const finalTarget = item.action === 'move'
-    ? item.targetFolderPath
-    : item.action === 'new_folder' && item.suggestedParentPath && item.suggestedFolderName
-      ? joinFolderPath(item.suggestedParentPath, item.suggestedFolderName)
-      : undefined
-  const userOverrodeAi =
-    item.aiOriginalAction !== undefined &&
-    (item.aiOriginalAction !== item.action || aiOriginalTarget !== finalTarget)
+  const { overrode: userOverrodeAi, aiOriginalTarget } = aiOverrideInfo(item)
 
   return (
     <div className="rounded border border-border/60 bg-muted/30 px-2.5 py-2 space-y-1.5 text-[10px]">
