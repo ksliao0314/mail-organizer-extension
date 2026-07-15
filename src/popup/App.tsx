@@ -24,6 +24,7 @@ import { PlanRow } from './components/PlanRow'
 import { FolderPicker } from './components/FolderPicker'
 import { cn } from '@/lib/utils'
 import { flattenFolderTree, joinFolderPath } from '@/shared/outlook-api'
+import { estimateUsageCostUsd, formatUsdApprox } from '@/shared/classifier'
 import { OnboardingWizard } from './components/OnboardingWizard'
 import { initParentBridge, postToParent } from '@/shared/parent-bridge'
 import { normalizeSubject } from '@/shared/normalize'
@@ -1329,6 +1330,7 @@ export default function App() {
             tree={phase.folderTree}
             excludePrefixes={status?.excludePrefixes ?? ['05已完成案件']}
             usage={phase.usage}
+            model={status?.model}
             summary={phase.summary}
             banner={phase.banner}
             aiPending={phase.aiPending}
@@ -2116,6 +2118,7 @@ function PlanScreen({
   tree,
   excludePrefixes,
   usage,
+  model,
   summary,
   banner,
   aiPending,
@@ -2130,6 +2133,7 @@ function PlanScreen({
   tree: MailFolderNode[]
   excludePrefixes: string[]
   usage: ClassifyUsage | null
+  model?: string
   summary: { ruleHits: number; aiHandled: number }
   banner?: { code: string; message: string }
   aiPending?: {
@@ -2792,11 +2796,18 @@ function PlanScreen({
             title={
               usage
                 ? `本批 token：輸入 ${usage.inputTokens} · 輸出 ${usage.outputTokens}` +
-                  (usage.cacheReadTokens > 0 ? ` · 快取命中 ${usage.cacheReadTokens}` : '')
+                  (usage.cacheReadTokens > 0 ? ` · 快取命中 ${usage.cacheReadTokens}` : '') +
+                  `\n費用為估算（依模型 list price 概算，非帳單）`
                 : undefined
             }
           >
             規則 {summary.ruleHits} · AI {summary.aiHandled}
+            {usage && (
+              <span className="text-muted-foreground/70">
+                {' · 約 '}
+                {formatUsdApprox(estimateUsageCostUsd(usage, model ?? ''))}
+              </span>
+            )}
           </span>
           <button
             type="button"

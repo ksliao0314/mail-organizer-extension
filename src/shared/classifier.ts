@@ -120,6 +120,61 @@ export type ClassifierUsage = {
   cacheReadTokens: number
 }
 
+// ---- Cost estimation (覆核透明度 2026-07) ----------------------------------
+//
+// Approximate Anthropic list prices in USD per MILLION tokens for the models
+// this extension offers (Options MODEL_OPTIONS). These are ESTIMATES for the
+// lawyer's cost awareness — NOT billing. Anthropic pricing changes over time;
+// treat the figure as order-of-magnitude ("this batch cost about 3 cents"),
+// which is all a reviewer needs to decide whether a re-run is worth it.
+type ModelPrice = { input: number; output: number }
+const MODEL_PRICE_PER_MTOK: Record<'opus' | 'sonnet' | 'haiku', ModelPrice> = {
+  opus: { input: 15, output: 75 },
+  sonnet: { input: 3, output: 15 },
+  haiku: { input: 1, output: 5 },
+}
+
+function priceForModel(model: string): ModelPrice {
+  const m = (model || '').toLowerCase()
+  if (m.includes('opus')) return MODEL_PRICE_PER_MTOK.opus
+  if (m.includes('haiku')) return MODEL_PRICE_PER_MTOK.haiku
+  // Sonnet is the default tier and the safe middle estimate for anything
+  // unrecognised (a future model id we don't have a row for yet).
+  return MODEL_PRICE_PER_MTOK.sonnet
+}
+
+/**
+ * Estimate the USD cost of one classify batch from its token usage + model.
+ * Cache-write tokens are billed above base input (this client uses the 1h
+ * extended TTL ≈ 2× base); cache-read tokens are ~0.1× base. Structural param
+ * so both ClassifierUsage and the popup's own usage shape satisfy it.
+ */
+export function estimateUsageCostUsd(
+  usage: {
+    inputTokens: number
+    outputTokens: number
+    cacheCreationTokens: number
+    cacheReadTokens: number
+  },
+  model: string,
+): number {
+  const p = priceForModel(model)
+  const inputSide =
+    usage.inputTokens * p.input +
+    usage.cacheCreationTokens * p.input * 2 + // 1h cache write ≈ 2× base input
+    usage.cacheReadTokens * p.input * 0.1 // cache read ≈ 0.1× base input
+  const outputSide = usage.outputTokens * p.output
+  return (inputSide + outputSide) / 1_000_000
+}
+
+/** Human-friendly USD label for the cost estimate. Sub-cent batches read as
+ *  "< US$0.01" rather than "US$0.00" so the reviewer knows it's tiny-but-nonzero. */
+export function formatUsdApprox(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return 'US$0.00'
+  if (usd < 0.01) return '< US$0.01'
+  return `US$${usd.toFixed(2)}`
+}
+
 export type ClassifierResult = {
   plan: PlanItem[]
   rawResponse: string

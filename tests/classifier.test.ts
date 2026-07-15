@@ -6,6 +6,8 @@ import {
   buildEmailBlock,
   buildFolderBlock,
   classifyBatch,
+  estimateUsageCostUsd,
+  formatUsdApprox,
   parseAiActions,
   salvageTruncatedArray,
 } from '@/shared/classifier'
@@ -304,6 +306,59 @@ describe('buildActiveFoldersBlock', () => {
     const many = Array.from({ length: 30 }, (_, i) => `F/${i}`)
     const block = buildActiveFoldersBlock(many, [])
     expect(block.split('\n').filter((l) => l.startsWith('- '))).toHaveLength(15)
+  })
+})
+
+// ---- cost estimation (覆核透明度) ------------------------------------------
+
+const zeroUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
+
+describe('estimateUsageCostUsd', () => {
+  it('prices base input/output at the model rate (sonnet: $3 / $15 per MTok)', () => {
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, inputTokens: 1_000_000 }, 'claude-sonnet-4-6'),
+    ).toBeCloseTo(3, 6)
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, outputTokens: 1_000_000 }, 'claude-sonnet-4-6'),
+    ).toBeCloseTo(15, 6)
+  })
+
+  it('selects the model family by name (opus > sonnet > haiku for input)', () => {
+    const oneM = { ...zeroUsage, inputTokens: 1_000_000 }
+    expect(estimateUsageCostUsd(oneM, 'claude-opus-4-7')).toBeCloseTo(15, 6)
+    expect(estimateUsageCostUsd(oneM, 'claude-sonnet-4-6')).toBeCloseTo(3, 6)
+    expect(estimateUsageCostUsd(oneM, 'claude-haiku-4-5-20251001')).toBeCloseTo(1, 6)
+  })
+
+  it('falls back to sonnet rate for an unknown model id', () => {
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, inputTokens: 1_000_000 }, 'claude-future-9'),
+    ).toBeCloseTo(3, 6)
+  })
+
+  it('discounts cache reads (~0.1×) and surcharges cache writes (~2×) vs base input', () => {
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, cacheReadTokens: 1_000_000 }, 'claude-sonnet-4-6'),
+    ).toBeCloseTo(0.3, 6)
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, cacheCreationTokens: 1_000_000 }, 'claude-sonnet-4-6'),
+    ).toBeCloseTo(6, 6)
+  })
+
+  it('is zero for zero usage', () => {
+    expect(estimateUsageCostUsd(zeroUsage, 'claude-sonnet-4-6')).toBe(0)
+  })
+})
+
+describe('formatUsdApprox', () => {
+  it('formats normal amounts to 2dp', () => {
+    expect(formatUsdApprox(3)).toBe('US$3.00')
+    expect(formatUsdApprox(0.034)).toBe('US$0.03')
+  })
+  it('shows sub-cent as < US$0.01, zero as US$0.00', () => {
+    expect(formatUsdApprox(0.004)).toBe('< US$0.01')
+    expect(formatUsdApprox(0)).toBe('US$0.00')
+    expect(formatUsdApprox(-1)).toBe('US$0.00')
   })
 })
 
