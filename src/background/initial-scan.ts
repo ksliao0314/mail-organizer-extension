@@ -73,6 +73,14 @@ function isAbortError(e: unknown): boolean {
 // in-flight listFolderMessages immediately on user cancel.
 let currentController: AbortController | null = null
 
+// Synchronous start guard (audit P2): `isScanRunning()` is an async
+// check-then-act — two overlapping startInitialScan calls (double-click,
+// or FAB iframe + options tab) could BOTH pass it before either persisted
+// `inProgress: true`. This flag flips before the first await hands control
+// back, so the second caller fails fast. SW idle-kill resets it, which is
+// fine — the persisted inProgress + recoverStaleScanState covers restarts.
+let scanStartInFlight = false
+
 export type ScanItemStatus = 'queued' | 'processing' | 'done' | 'no_domains' | 'empty' | 'error'
 
 export type ScanItemResult = {
@@ -172,7 +180,8 @@ export async function startInitialScan(opts: {
     if (!d) return false
     return internalDomainSet.has(d.toLowerCase())
   }
-  if (await isScanRunning()) throw new Error('已有掃描中的批次')
+  if (scanStartInFlight || (await isScanRunning())) throw new Error('已有掃描中的批次')
+  scanStartInFlight = true
 
   const flat = flattenFolderTree(tree)
   const targets = flat.filter((n) => {
@@ -183,6 +192,7 @@ export async function startInitialScan(opts: {
   })
 
   if (targets.length === 0) {
+    scanStartInFlight = false // clear the sync guard — nothing started
     throw new Error(`找不到根資料夾「${rootPath}」或其子資料夾`)
   }
 
@@ -196,29 +206,11 @@ export async function startInitialScan(opts: {
     results: targets.map((n) => ({ folderPath: n.path, status: 'queued' as const })),
     summary: { foldersScanned: 0, rulesAdded: 0, foldersWithNoExternalDomains: 0, errors: 0 },
   }
-  await saveScanState(state)
-
-  // Snapshot existing rules for dedup. Build a fast key set for O(1) lookups.
-  // Tracks domain / case_code / compound / subject_keyword so a follow-up
-  // scan doesn't produce duplicates for any of these auto-derived kinds.
-  const existing = await listRules()
-  const knownKeys = new Set<string>()
-  for (const r of existing) {
-    if (r.type === 'domain') {
-      const dom = r.signal.toLowerCase().replace(/^@/, '')
-      knownKeys.add(`domain::${dom}::${r.targetFolderId}`)
-    } else if (r.type === 'case_code') {
-      knownKeys.add(`case_code::${r.signal.toUpperCase().trim()}::${r.targetFolderId}`)
-    } else if (r.type === 'compound') {
-      // Use the raw (canonical) signal string — encodeCompound produces a
-      // stable JSON serialization so it's safe to compare directly.
-      knownKeys.add(`compound::${r.signal}::${r.targetFolderId}`)
-    } else if (r.type === 'subject_keyword') {
-      knownKeys.add(`subject_keyword::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
-    } else if (r.type === 'sender') {
-      knownKeys.add(`sender::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
-    }
-  }
+  // NOTE: saveScanState + the existing-rules snapshot now run INSIDE the
+  // main try block below (audit P3): they can throw (storage failure /
+  // rules-lock contention), and before the move a throw here happened
+  // AFTER inProgress:true was persisted but OUTSIDE the catch that resets
+  // it — stranding the UI in a permanent 掃描中 state.
 
   // Same pattern for plain-domain rules: collect per-folder, then decide in
   // a cross-folder pass. Two gates apply (see post-loop section):
@@ -287,13 +279,50 @@ export async function startInitialScan(opts: {
   }
 
   const controller = new AbortController()
-  currentController = controller
-  await holdKeepAlive()
+  // Only release keep-alive in `finally` if we actually acquired it —
+  // an unconditional release after an early throw would decrement a
+  // refcount we never took and could clear a CONCURRENT holder's alarm
+  // (e.g. an execute batch running alongside).
+  let held = false
+  // #15 (audit P2): why the loop exited matters — see the cross-folder
+  // passes below.
+  let cancelled = false
 
   try {
+    await saveScanState(state)
+
+    // Snapshot existing rules for dedup. Build a fast key set for O(1)
+    // lookups. Tracks domain / case_code / compound / subject_keyword so a
+    // follow-up scan doesn't produce duplicates for these auto-derived kinds.
+    const existing = await listRules()
+    const knownKeys = new Set<string>()
+    for (const r of existing) {
+      if (r.type === 'domain') {
+        const dom = r.signal.toLowerCase().replace(/^@/, '')
+        knownKeys.add(`domain::${dom}::${r.targetFolderId}`)
+      } else if (r.type === 'case_code') {
+        knownKeys.add(`case_code::${r.signal.toUpperCase().trim()}::${r.targetFolderId}`)
+      } else if (r.type === 'compound') {
+        // Use the raw (canonical) signal string — encodeCompound produces a
+        // stable JSON serialization so it's safe to compare directly.
+        knownKeys.add(`compound::${r.signal}::${r.targetFolderId}`)
+      } else if (r.type === 'subject_keyword') {
+        knownKeys.add(`subject_keyword::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
+      } else if (r.type === 'sender') {
+        knownKeys.add(`sender::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
+      }
+    }
+
+    currentController = controller
+    await holdKeepAlive()
+    held = true
+
     for (let i = 0; i < targets.length; i++) {
       const live = await getScanState()
-      if (live?.cancelRequested) break
+      if (live?.cancelRequested) {
+        cancelled = true
+        break
+      }
 
       const node = targets[i]!
       state.current = i
@@ -484,7 +513,10 @@ export async function startInitialScan(opts: {
         state.summary.foldersScanned++
         state.summary.rulesAdded += added
       } catch (e) {
-        if (isAbortError(e)) break
+        if (isAbortError(e)) {
+          cancelled = true
+          break
+        }
         state.results[i] = {
           folderPath: node.path,
           status: 'error',
@@ -574,7 +606,15 @@ export async function startInitialScan(opts: {
     // Domains passing the gate → build the plain-domain rule and flip
     // the matching reportedDomains entry's `added` flag so the scan UI
     // shows the truth instead of "detected but silently dropped".
-    try {
+    //
+    // #15 (audit P2): skip BOTH cross-folder passes when the scan was
+    // cancelled. Their predicate — "signal anchors exactly ONE folder,
+    // ≤1 hits everywhere else" — is only sound over the FULL folder set;
+    // on a partial set a domain that also anchors an unscanned folder
+    // looks unique and would mint a rule the complete scan would have
+    // rejected. Per-folder rules (case_code / compound) in the buffer
+    // still flush — those never depended on cross-folder context.
+    if (!cancelled) try {
       // Aggregate the union of all domains seen across folders, then
       // probe via the shared helper.
       const allDomains = new Set<string>()
@@ -628,8 +668,9 @@ export async function startInitialScan(opts: {
     // Already filtered at collection time to generic providers only — a
     // non-generic sender will be routable via its plain-domain rule.
     // Uniqueness predicate is identical to Pass A's; the only difference
-    // is the signal type (full email vs domain).
-    try {
+    // is the signal type (full email vs domain). Same cancelled guard as
+    // Pass A — partial folder data can't prove cross-folder uniqueness.
+    if (!cancelled) try {
       const allSenders = new Set<string>()
       for (const fd of folderSenderData) {
         for (const s of fd.senderCounts.keys()) allSenders.add(s)
@@ -716,6 +757,7 @@ export async function startInitialScan(opts: {
       }
     }
     currentController = null
-    await releaseKeepAlive()
+    if (held) await releaseKeepAlive()
+    scanStartInFlight = false
   }
 }

@@ -1076,22 +1076,50 @@ function createFab() {
   let bodyMO: MutationObserver | null = null
   let lastAnchor: HTMLElement | null = null
 
+  // Audit P3: the raw MO callback ran findCopilotAnchor — four full-document
+  // querySelectorAll passes + forced layout on candidates — on EVERY mutation
+  // batch, and on tenants WITHOUT Copilot (disabled / not licensed) it never
+  // found an anchor, so the scan ran for the tab's whole lifetime. Two
+  // mitigations: (1) trailing 500ms debounce so mutation bursts collapse to
+  // one scan; (2) a 60s give-up deadline — if no anchor appeared by then,
+  // this tenant almost certainly has no Copilot button; disconnect and keep
+  // the CSS fallback position (window.resize still recomputes it, and any
+  // caller of startBodyMO after a teardown restarts the window).
+  let bodyMODebounce: number | null = null
+  let bodyMODeadline: number | null = null
   const stopBodyMO = () => {
     if (bodyMO) {
       bodyMO.disconnect()
       bodyMO = null
     }
+    if (bodyMODebounce !== null) {
+      window.clearTimeout(bodyMODebounce)
+      bodyMODebounce = null
+    }
+    if (bodyMODeadline !== null) {
+      window.clearTimeout(bodyMODeadline)
+      bodyMODeadline = null
+    }
   }
   const startBodyMO = () => {
     if (bodyMO) return
     bodyMO = new MutationObserver(() => {
-      const anchor = findCopilotAnchor()
-      if (anchor) {
-        stopBodyMO()
-        positionFab()
-      }
+      if (bodyMODebounce !== null) window.clearTimeout(bodyMODebounce)
+      bodyMODebounce = window.setTimeout(() => {
+        bodyMODebounce = null
+        if (!bodyMO) return // stopped while the debounce was pending
+        const anchor = findCopilotAnchor()
+        if (anchor) {
+          stopBodyMO()
+          positionFab()
+        }
+      }, 500)
     })
     bodyMO.observe(document.body, { childList: true, subtree: true })
+    bodyMODeadline = window.setTimeout(() => {
+      bodyMODeadline = null
+      stopBodyMO()
+    }, 60_000)
   }
 
   const positionFabAndObserve = () => {

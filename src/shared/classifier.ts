@@ -273,12 +273,18 @@ const MAX_SUBJECT_LEN = 200
 export function buildEmailBlock(emails: Email[]): string {
   return emails
     .map((m, i) => {
-      const fromName = m.From?.EmailAddress?.Name ?? ''
-      const fromAddr = m.From?.EmailAddress?.Address ?? '(unknown)'
+      // Whitespace-collapse Subject and the From display name, same as
+      // BodyPreview below (audit P3): the record format is line-oriented
+      // ("[i] 主旨:… / 寄件:…"), and RFC 2047 encoded-word headers can
+      // decode to contain literal CR/LF — a crafted inbound email could
+      // otherwise terminate its own record and append forged lines
+      // (including a fake "[k] 主旨:…" shadowing another real email).
+      const fromName = (m.From?.EmailAddress?.Name ?? '').replace(/\s+/g, ' ').trim()
+      const fromAddr = (m.From?.EmailAddress?.Address ?? '(unknown)').replace(/\s+/g, ' ').trim()
       const to = recipientAddrs(m.ToRecipients)
       const cc = recipientAddrs(m.CcRecipients)
       const date = (m.ReceivedDateTime ?? '').slice(0, 10)
-      const subjectRaw = m.Subject ?? ''
+      const subjectRaw = (m.Subject ?? '').replace(/\s+/g, ' ').trim()
       const subject =
         subjectRaw.length > MAX_SUBJECT_LEN
           ? subjectRaw.slice(0, MAX_SUBJECT_LEN) + '…'
@@ -463,6 +469,12 @@ export function actionToPlanItem(
   email: Email,
   action: AiAction,
   folderTree: MailFolderNode[],
+  // Enforced here, not just in the prompt (audit P2): the folder block
+  // hides excluded folders from the AI, but the model can still NAME an
+  // excluded path (from the email's content, or hallucination) — and the
+  // full tree resolves it to a real targetFolderId that would execute.
+  // Default [] keeps existing callers/tests source-compatible.
+  excludePrefixes: string[] = [],
 ): PlanItem {
   const base = {
     emailId: email.Id,
@@ -475,6 +487,21 @@ export function actionToPlanItem(
   }
 
   if (action.action === 'move' && action.targetFolderPath) {
+    // Excluded path → unresolved (no targetFolderId), same shape as the
+    // path-not-found case: the row shows in the plan for the user to
+    // re-target manually instead of silently moving into a folder they
+    // explicitly excluded.
+    if (pathExcluded(action.targetFolderPath, excludePrefixes)) {
+      return {
+        ...base,
+        action: 'move',
+        targetFolderPath: action.targetFolderPath,
+        source: 'unresolved',
+        aiOriginalAction: 'move',
+        aiOriginalTargetFolderPath: action.targetFolderPath,
+        reason: base.reason + '（AI 指定的路徑在排除清單）',
+      }
+    }
     const node = flattenFolderTree(folderTree).find((n) => n.path === action.targetFolderPath)
     return {
       ...base,
@@ -505,9 +532,12 @@ export function actionToPlanItem(
     // this check, execute hits a 404 at folder-create time. Marking
     // unresolved here lets the user pick the right parent in the plan UI.
     const parentPath = action.suggestedParentPath
+    // A parent inside the exclude list is as unusable as a nonexistent one
+    // — creating a child there would put mail into an excluded subtree.
     const parentValid =
       !parentPath ||
-      flattenFolderTree(folderTree).some((n) => n.path === parentPath)
+      (!pathExcluded(parentPath, excludePrefixes) &&
+        flattenFolderTree(folderTree).some((n) => n.path === parentPath))
     if (!parentValid) {
       return {
         ...base,
@@ -559,9 +589,15 @@ export async function classifyBatch(
   // settings.aiIncludeFewShotExamples flag — defaults to ON because
   // examples improve accuracy meaningfully, but lawyers / others with
   // sensitive folder names can disable in Options.
+  // Also drop exemplars targeting EXCLUDED folders (audit P2): the folder
+  // block hides excluded paths from the AI, but an exemplar line
+  // "寄件人網域 @x → 排除的資料夾" actively steered the model into naming
+  // exactly those paths.
   const exemplars =
     input.rules && settings.aiIncludeFewShotExamples
-      ? selectExemplars(input.rules)
+      ? selectExemplars(input.rules).filter(
+          (r) => !pathExcluded(r.targetFolderPath, input.excludePrefixes),
+        )
       : []
   const examplesBlock = buildExamplesBlock(exemplars)
 
@@ -691,21 +727,19 @@ export async function classifyBatch(
   }
   const actions = [...dedupedByIndex.values()]
 
-  const plan: PlanItem[] = actions.map((action) => {
+  // Drop actions whose emailIndex maps to no real email (out-of-range or
+  // NaN) instead of fabricating a ghost PlanItem with emailId '' (audit
+  // P3): ghosts inflated plan.length past the chunk's email count (progress
+  // showed >100%), and two ghosts collide on the same empty-string React
+  // key downstream. The backstop below already guarantees every REAL email
+  // gets a plan entry, so dropping loses nothing.
+  const plan: PlanItem[] = actions.flatMap((action) => {
     const email = input.emails[action.emailIndex]
     if (!email) {
-      return {
-        emailId: '',
-        emailSubject: '',
-        emailFrom: '',
-        bodyPreview: '',
-        action: 'skip',
-        confidence: 0,
-        reason: `AI emailIndex ${action.emailIndex} 超出範圍`,
-        source: 'unresolved',
-      }
+      console.warn(`[mail-organizer] AI 回傳無效 emailIndex ${action.emailIndex}，已丟棄`)
+      return []
     }
-    return actionToPlanItem(email, action, input.folderTree)
+    return [actionToPlanItem(email, action, input.folderTree, input.excludePrefixes)]
   })
 
   // Backstop: if AI returned fewer items than emails, mark missing ones as skip

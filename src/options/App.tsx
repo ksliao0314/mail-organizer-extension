@@ -1,4 +1,4 @@
-import { Fragment, type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -245,6 +245,14 @@ export default function App() {
       const t = e.target as HTMLElement | null
       const tag = t?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      // If a layered overlay (rule-detail drawer, confirm dialog, actions
+      // menu) is open, Esc belongs to IT — bail and let its own handler
+      // close just that layer. Their stopImmediatePropagation can't save us
+      // here: this App-level listener registers at mount, BEFORE any
+      // overlay's listener, and document keydown listeners fire in
+      // registration order — so we'd close the whole options iframe first
+      // and the drawer's handler would fire into a dead UI.
+      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]')) return
       postToParent({ type: 'mail-organizer/close-options' })
     }
     document.addEventListener('keydown', onKey)
@@ -1043,6 +1051,24 @@ export default function App() {
                 onChange={(e) => setThresholdDraft(Number(e.target.value))}
                 onMouseUp={(e) => void commitThreshold(Number((e.target as HTMLInputElement).value))}
                 onTouchEnd={(e) => void commitThreshold(Number((e.target as HTMLInputElement).value))}
+                // Keyboard adjustments (Arrow/Home/End/Page keys) fire
+                // change but never mouseup/touchend — without these two
+                // fallbacks the display updated while the setting silently
+                // never saved.
+                onKeyUp={(e) => {
+                  const k = e.key
+                  if (
+                    k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown' ||
+                    k === 'Home' || k === 'End' || k === 'PageUp' || k === 'PageDown'
+                  ) {
+                    void commitThreshold(Number((e.target as HTMLInputElement).value))
+                  }
+                }}
+                onBlur={(e) => {
+                  if (thresholdDraft !== null) {
+                    void commitThreshold(Number(e.target.value))
+                  }
+                }}
                 className="flex-1 accent-foreground"
               />
               <span className="font-mono tabular-nums w-12 text-right text-sm">
@@ -1179,7 +1205,19 @@ export default function App() {
         {/* Cross-machine sync (Edge / Chrome account-level sync) — moved
             from the engine tab (2026-05-27 reorg). It's a data-replication
             concern, not a classification setting. */}
-        <CrossMachineSyncCard status={status} onChanged={refresh} />
+        {/* Sync ops (manual pull, first-enable union merge, rollback,
+            applied remote wipe) rewrite the LOCAL rule library — refresh
+            rules + metrics too, not just status, or the rule-library UI
+            keeps showing pre-pull data and a drawer edit saved afterwards
+            can overwrite freshly-pulled changes with stale copies. */}
+        <CrossMachineSyncCard
+          status={status}
+          onChanged={async () => {
+            await refresh()
+            await refreshRules()
+            await refreshMetrics()
+          }}
+        />
 
         <div className="pt-4">
           <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase border-b border-border pb-1.5">統計與紀錄</h2>
@@ -2157,6 +2195,12 @@ function RuleAllView({
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // IME guard: cancelling a Chinese/Japanese composition fires a
+      // keydown with key='Escape' and isComposing=true (legacy keyCode
+      // 229). That Esc means "drop the composition", NOT "close the
+      // drawer" — swallowing it here closed the drawer and discarded the
+      // user's whole in-progress edit.
+      if (e.isComposing || e.keyCode === 229) return
       if (e.key === 'Escape' && detailId) {
         // If a nested ConfirmDialog (role="alertdialog") is open on top of
         // the drawer, let *it* consume Esc (cancel the dialog) — don't tear
@@ -2238,14 +2282,22 @@ function RuleAllView({
       setSelected(new Set(filtered.map((r) => r.id)))
     }
   }
-  function toggleOne(id: string) {
+  // Stable identities (useCallback) so the memoized RuleRow can skip
+  // re-rendering unchanged rows on search keystrokes / filter changes.
+  const toggleOne = useCallback((id: string) => {
     setSelected((s) => {
       const next = new Set(s)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
+  const handleToggleRule = useCallback(
+    (r: Rule) => {
+      void onToggle(r, !r.enabled)
+    },
+    [onToggle],
+  )
 
   // Bulk action helper — survives partial failures (network blip on
   // rule 3 of 10 shouldn't lose the work on rules 1–2 or stop rules
@@ -2518,9 +2570,9 @@ function RuleAllView({
                   selected={selected.has(r.id)}
                   highlighted={detailId === r.id}
                   showTarget
-                  onSelect={() => toggleOne(r.id)}
-                  onOpenDetail={() => setDetailId(r.id)}
-                  onToggle={() => void onToggle(r, !r.enabled)}
+                  onSelect={toggleOne}
+                  onOpenDetail={setDetailId}
+                  onToggle={handleToggleRule}
                 />
               ))}
             </tbody>
@@ -2721,14 +2773,38 @@ function RuleLibraryActionsMenu({
   async function handleExport() {
     setOpen(false)
     const r = await send<{ json: string; filename: string }>({ type: 'exportRules' })
-    if (!r.ok || !r.data) return
-    const blob = new Blob([r.data.json], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = r.data.filename
-    a.click()
-    URL.revokeObjectURL(url)
+    if (!r.ok || !r.data) {
+      // Same feedback idiom as handleImportFile below.
+      alert(`匯出失敗:${(!r.ok && (r.message ?? r.code)) || '背景沒回傳資料'}`)
+      return
+    }
+    let url: string | null = null
+    try {
+      const blob = new Blob([r.data.json], { type: 'application/json' })
+      url = URL.createObjectURL(blob)
+      // Prefer chrome.downloads — a detached anchor.click() is blocked in
+      // some MV3 contexts (notably the FAB iframe) and silently does
+      // nothing; and revoking the blob URL synchronously could cut off the
+      // download before it started. Mirrors exportDiagnostic /
+      // exportSettings, which were hardened for exactly this.
+      if (chrome.downloads?.download) {
+        await chrome.downloads.download({ url, filename: r.data.filename, saveAs: false })
+      } else {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = r.data.filename
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+      }
+    } catch (e) {
+      alert(`匯出失敗:${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      if (url) {
+        const u = url
+        setTimeout(() => URL.revokeObjectURL(u), 10_000)
+      }
+    }
   }
 
   async function handleImportFile(e: ChangeEvent<HTMLInputElement>) {
@@ -3324,7 +3400,12 @@ const RULE_TYPE_PRIORITY: Record<RuleType, number> = {
  * the target-folder column) and grouped view (`showTarget`=false —
  * the target is in the group header).
  */
-function RuleRow({
+// Perf (audit): memoized with id/rule-based callbacks. The 全部規則 table
+// renders up to 200-800 rows; with inline per-row arrows every search
+// keystroke / filter change / checkbox toggle re-rendered EVERY row (each
+// running refinedTypeLabel's regex extraction twice). With stable callbacks
+// from the parents, memo lets unchanged rows skip re-render entirely.
+const RuleRow = memo(function RuleRow({
   rule,
   selected,
   highlighted,
@@ -3337,10 +3418,12 @@ function RuleRow({
   selected: boolean
   highlighted: boolean
   showTarget: boolean
-  onSelect: () => void
-  onOpenDetail: () => void
-  onToggle: () => void
+  onSelect: (id: string) => void
+  onOpenDetail: (id: string) => void
+  onToggle: (rule: Rule) => void
 }) {
+  const typeLabel = refinedTypeLabel(rule.type, rule.signal)
+  const openDetail = () => onOpenDetail(rule.id)
   const accuracyPct =
     rule.matchCount > 0
       ? Math.round(((rule.matchCount - (rule.overrideCount ?? 0)) / rule.matchCount) * 100)
@@ -3360,7 +3443,7 @@ function RuleRow({
   // aria-label so screen readers announce what the row is for.
   //
   // Why a row click is the activation gesture: every body cell already
-  // had onClick={onOpenDetail} via mouse. The keyboard equivalent is to
+  // had onClick={openDetail} via mouse. The keyboard equivalent is to
   // land focus on the row and press Enter. The toggle button + checkbox
   // intercept their own clicks via stopPropagation so they remain
   // independent targets.
@@ -3368,14 +3451,14 @@ function RuleRow({
     if (e.target !== e.currentTarget) return // event came from a child
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
-      onOpenDetail()
+      openDetail()
     }
   }
   return (
     <tr
       tabIndex={0}
       onKeyDown={handleRowKey}
-      aria-label={`${refinedTypeLabel(rule.type, rule.signal)} ${rule.signal} → ${rule.targetFolderPath}`}
+      aria-label={`${typeLabel} ${rule.signal} → ${rule.targetFolderPath}`}
       className={cn(
         'border-t border-border hover:bg-accent/30 transition-colors',
         'focus:outline-none focus:ring-2 focus:ring-foreground/20 focus:ring-inset',
@@ -3387,18 +3470,18 @@ function RuleRow({
         <input
           type="checkbox"
           checked={selected}
-          onChange={onSelect}
+          onChange={() => onSelect(rule.id)}
           className="accent-foreground"
           aria-label={`選取 ${rule.signal}`}
           onClick={(e) => e.stopPropagation()}
         />
       </td>
-      <td className="px-2 py-1.5 cursor-pointer" onClick={onOpenDetail}>
+      <td className="px-2 py-1.5 cursor-pointer" onClick={openDetail}>
         <Badge variant="outline" className="font-mono text-[9px]">
-          {refinedTypeLabel(rule.type, rule.signal)}
+          {typeLabel}
         </Badge>
       </td>
-      <td className="px-2 py-1.5 cursor-pointer max-w-0" onClick={onOpenDetail}>
+      <td className="px-2 py-1.5 cursor-pointer max-w-0" onClick={openDetail}>
         <div className="font-mono truncate" title={rule.signal}>
           {rule.type === 'compound' ? formatCompoundSignal(rule.signal) : rule.signal}
         </div>
@@ -3406,7 +3489,7 @@ function RuleRow({
       {showTarget && (
         <td
           className="px-2 py-1.5 cursor-pointer max-w-0 text-muted-foreground"
-          onClick={onOpenDetail}
+          onClick={openDetail}
         >
           <div className="truncate" title={rule.targetFolderPath}>
             {rule.targetFolderPath}
@@ -3415,7 +3498,7 @@ function RuleRow({
       )}
       <td
         className="px-2 py-1.5 text-right font-mono tabular-nums cursor-pointer"
-        onClick={onOpenDetail}
+        onClick={openDetail}
       >
         <span>{rule.matchCount}</span>
         {accuracyPct !== null && (
@@ -3426,11 +3509,11 @@ function RuleRow({
       </td>
       <td
         className="px-2 py-1.5 text-right font-mono tabular-nums cursor-pointer"
-        onClick={onOpenDetail}
+        onClick={openDetail}
       >
         {rule.confidence.toFixed(2)}
       </td>
-      <td className="px-2 py-1.5 cursor-pointer" onClick={onOpenDetail}>
+      <td className="px-2 py-1.5 cursor-pointer" onClick={openDetail}>
         <span className="text-[10px] text-muted-foreground">
           {SOURCE_LABEL[rule.source]}
         </span>
@@ -3440,7 +3523,7 @@ function RuleRow({
           type="button"
           onClick={(e) => {
             e.stopPropagation()
-            onToggle()
+            onToggle(rule)
           }}
           title={rule.enabled ? '停用' : '啟用'}
           aria-label={`${rule.enabled ? '停用' : '啟用'}規則 ${rule.signal}`}
@@ -3451,7 +3534,7 @@ function RuleRow({
       </td>
     </tr>
   )
-}
+})
 
 /**
  * Grouped table — rules clustered by target folder. Each folder
@@ -3495,6 +3578,14 @@ function RuleGroupedTable({
   onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
 }) {
   void allRules // currently unused; reserved for future "this folder also has N hidden rules" hint
+  // Stable wrapper so the memoized RuleRow's onToggle prop keeps identity
+  // across re-renders (see RuleRow's memo note).
+  const handleToggleRule = useCallback(
+    (r: Rule) => {
+      void onToggle(r, !r.enabled)
+    },
+    [onToggle],
+  )
   const groups = useMemo(() => {
     const map = new Map<string, Rule[]>()
     for (const r of rules) {
@@ -3657,9 +3748,9 @@ function RuleGroupedTable({
                       selected={selected.has(r.id)}
                       highlighted={detailId === r.id}
                       showTarget={false}
-                      onSelect={() => onSelect(r.id)}
-                      onOpenDetail={() => onOpenDetail(r.id)}
-                      onToggle={() => void onToggle(r, !r.enabled)}
+                      onSelect={onSelect}
+                      onOpenDetail={onOpenDetail}
+                      onToggle={handleToggleRule}
                     />
                   ))}
                 </tbody>
@@ -4905,7 +4996,7 @@ function CrossMachineSyncCard({
             ✗ 不同步:auto_scan 規則(各機器各自跑初始掃描)、API key、本機快取
           </span>
           <span className="block text-[10px] text-muted-foreground">
-            ⚠ Edge ↔ Chrome 之間不會自動同步、跨瀏覽器請用規則庫的「複製到剪貼簿」
+            ⚠ Edge ↔ Chrome 之間不會自動同步、跨瀏覽器請用規則庫「操作 → 匯出規則 / 匯入規則」的 JSON 檔
           </span>
         </CardDescription>
       </CardHeader>
@@ -5213,6 +5304,15 @@ function CrossMachineSyncCard({
                 <li>每次推 / 拉前都會自動本機備份、可從「同步歷史」回復</li>
               </ul>
             </div>
+            {/* Surface the failure INSIDE the modal — the card-level error
+                banner renders underneath this fixed z-50 overlay, so a
+                failed enable used to look like the button silently did
+                nothing. */}
+            {error && (
+              <p className="text-[11px] text-red-700" role="alert">
+                啟用失敗:{error}
+              </p>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <Button size="sm" variant="ghost" onClick={() => setShowEnableModal(false)} disabled={busy}>
                 取消
@@ -5640,6 +5740,7 @@ function RecentActivityFilterCard({
             prefixes={prefixes}
             leaves={leaves}
             onCommit={commit}
+            parentSaving={saving}
           />
         </details>
       </CardContent>
@@ -5656,10 +5757,16 @@ function AdvancedManualEditor({
   prefixes,
   leaves,
   onCommit,
+  parentSaving,
 }: {
   prefixes: string[]
   leaves: string[]
   onCommit: (nextPrefixes: string[], nextLeaves: string[]) => Promise<void>
+  /** Parent card's in-flight commit flag. commit() drops re-entrant calls
+   *  silently (the stale-read-race guard), so this button must also be
+   *  disabled while a pill commit is in flight — otherwise a click here
+   *  would no-op with a green-looking spinner flash and no error. */
+  parentSaving: boolean
 }) {
   const [prefixDraft, setPrefixDraft] = useState(prefixes.join('\n'))
   const [leafDraft, setLeafDraft] = useState(leaves.join('\n'))
@@ -5722,7 +5829,7 @@ function AdvancedManualEditor({
           />
         </div>
       </div>
-      <Button onClick={() => void save()} disabled={!dirty || saving} size="sm">
+      <Button onClick={() => void save()} disabled={!dirty || saving || parentSaving} size="sm">
         {saving ? '儲存中…' : '儲存手動編輯'}
       </Button>
     </div>
@@ -5744,11 +5851,19 @@ function StaleSweepActionRow() {
   async function run() {
     setRunning(true)
     setResult(null)
-    const r = await send<{ disabledCount: number }>({ type: 'runStaleSweep' })
+    const r = await send<{ disabledCount: number; staleDeletedCount?: number }>({
+      type: 'runStaleSweep',
+    })
     setRunning(false)
     if (r.ok && r.data) {
-      const n = r.data.disabledCount
-      setResult(n === 0 ? '沒有符合條件的規則需要停用' : `已自動停用 ${n} 條休眠規則`)
+      const disabled = r.data.disabledCount
+      const deleted = r.data.staleDeletedCount ?? 0
+      // Report BOTH outcomes — stale rules are hard-deleted (not disabled),
+      // so a sweep that only deleted used to read as "nothing to do".
+      const parts: string[] = []
+      if (deleted > 0) parts.push(`已刪除 ${deleted} 條休眠規則`)
+      if (disabled > 0) parts.push(`已自動停用 ${disabled} 條規則`)
+      setResult(parts.length > 0 ? parts.join('、') : '沒有符合條件的規則需要清理')
       window.setTimeout(() => setResult(null), 4000)
     } else if (!r.ok) {
       setResult(`失敗:${r.message ?? r.code}`)
@@ -5817,7 +5932,7 @@ function RuleHealthSection({
         </CardTitle>
         <CardDescription>
           長期未命中、命中多但路徑模糊、彼此衝突、目標資料夾不存在等情況。點分類展開檢視與處理。
-          每天背景自動把「休眠」規則(從未命中超過 90 天)停用、不影響手動規則。
+          每天背景自動把 100 天未命中的「休眠」規則刪除(不可復原、不留紀錄;同訊號日後可重新學回)、不影響手動規則。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2 text-xs">
@@ -5827,7 +5942,7 @@ function RuleHealthSection({
           count={health.counts.sleeping}
           active={openBucket === 'sleeping'}
           onClick={() => setOpenBucket((b) => (b === 'sleeping' ? null : 'sleeping'))}
-          description="從未命中 30 天 / 或上次命中 ≥ 90 天前。每日自動掃除把 ≥ 90 天從未命中的規則停用(可重新啟用)"
+          description="從未命中 30 天 / 或上次命中 ≥ 90 天前。每日自動掃除會把 ≥ 100 天未命中的規則刪除(不可復原、不留紀錄;同訊號日後可重新學回)"
         />
         <HealthBucketButton
           label="模糊熱門"

@@ -137,14 +137,20 @@ export function PlanRow({
   const rowRef = useRef<HTMLLIElement | null>(null)
   const { isWide } = useLayout()
 
-  // Imperatively trigger expand toggle when PlanScreen bumps the token. We
-  // gate on a ref so a stale token from a previous row doesn't double-fire
-  // when this row receives focus.
+  // Imperatively trigger expand toggle when PlanScreen bumps the token.
+  // The token prop only exists while this row is focused, so the FIRST
+  // value a row instance sees just means "focus arrived" — sync it
+  // silently. Only a CHANGE between two defined values is a real Enter
+  // press. (Audit P1: comparing against an undefined ref made focus gain
+  // itself count as Enter — j/k auto-expanded every row it landed on, and
+  // the first click on a newly-focused row was swallowed by the bubbled
+  // toggle.)
   const lastExpandToken = useRef<number | undefined>(undefined)
   useEffect(() => {
-    if (toggleExpandToken === undefined) return
-    if (toggleExpandToken === lastExpandToken.current) return
+    const prev = lastExpandToken.current
     lastExpandToken.current = toggleExpandToken
+    if (toggleExpandToken === undefined || prev === undefined) return
+    if (toggleExpandToken === prev) return
     setExpanded((v) => !v)
   }, [toggleExpandToken])
 

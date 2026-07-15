@@ -164,6 +164,22 @@ export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; 
     )
   }
 
+  // Flush the killed batch's completed work into lifetime metrics (audit
+  // P3): the normal bumpMetrics runs only after the item loop completes,
+  // so a mid-batch SW death silently dropped every already-moved/deleted
+  // count from the dashboard and weekly digest. Safe against double-count:
+  // the normal path persists inProgress=false BEFORE bumping, and this
+  // recovery only fires on inProgress===true — the two sites are mutually
+  // exclusive per batch.
+  await bumpMetrics({
+    moved: state.summary.moved,
+    deleted: state.summary.deleted,
+    foldersCreated: state.summary.foldersCreated,
+    errors: state.summary.errors + errorCount,
+  }).catch((e) =>
+    console.warn('[mail-organizer] recovery metrics flush failed (non-fatal)', e),
+  )
+
   await saveExecuteState({
     ...state,
     inProgress: false,
@@ -230,6 +246,13 @@ export async function startExecute(
   if (await isExecuteRunning()) {
     throw new Error('已有批次執行中')
   }
+
+  // Dismiss any still-unexpired undo snapshot from the PREVIOUS batch
+  // (audit P3): captureUndoSnapshot early-returns when the new batch has
+  // zero moves, so without this a quick zero-move follow-up batch left
+  // the old banner alive — and clicking 撤回 would revert the WRONG
+  // batch's moves. Mirrors retryFailed's existing dismissUndo rationale.
+  await dismissUndo().catch(() => {})
 
   const state = initialState(plan)
   await saveExecuteState(state)

@@ -48,26 +48,29 @@ export function installStaleSweepListener(): void {
  * Public entry for manual invocation (e.g. "run sweep now" button in
  * options page). Same operation as the alarm-triggered path.
  */
-export async function runSweep(): Promise<{ disabledCount: number }> {
+export async function runSweep(): Promise<{ disabledCount: number; staleDeletedCount: number }> {
   try {
     // Dedupe first — collapsing same-triplet duplicates before the stale
     // check lets stats (matchCount etc.) on the kept rule reflect the
     // full history of all dups merged into it. Hard delete, no audit.
     await dedupeRulesByKey()
-    const { disabled } = await autoDisableStaleRules()
+    const { disabled, byReason } = await autoDisableStaleRules()
     // Only log soft-disable events (legacy_token / high-error-rate).
     // Stale deletions are intentionally silent per the design: they
     // leave no audit trail, no tombstone, no console log — the rule
-    // library just gets cleaner.
+    // library just gets cleaner. The COUNT is still returned so the
+    // manual "run sweep now" button can tell the user what happened
+    // (audit: reporting only disabledCount made a stale-deleting sweep
+    // look like a no-op).
     if (disabled.length > 0) {
       console.info(
         `[mail-organizer] stale sweep: auto-disabled ${disabled.length} rule(s)`,
         disabled.map((r) => `${r.type}::${r.signal}`),
       )
     }
-    return { disabledCount: disabled.length }
+    return { disabledCount: disabled.length, staleDeletedCount: byReason.stale }
   } catch (e) {
     console.warn('[mail-organizer] stale sweep failed (non-fatal)', e)
-    return { disabledCount: 0 }
+    return { disabledCount: 0, staleDeletedCount: 0 }
   }
 }

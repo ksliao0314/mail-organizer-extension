@@ -67,7 +67,14 @@ export async function mutateRules<T>(
   return withRulesLock(async () => {
     const current = await getRules()
     const { next, result } = await fn(current)
-    await setRules(next)
+    // Identity check (audit, perf): every transform follows copy-on-write —
+    // it returns the SAME array ref only when truly nothing changed (all 18
+    // call sites verified 2026-06). Skipping the write on that path spares a
+    // full rule-library serialization per no-op sweep — runSweep fires on
+    // EVERY SW wake (module-load listener), so idle wakes used to pay 2 full
+    // writes each — and also suppresses the redundant sync push the rules
+    // onChanged listener would schedule.
+    if (next !== current) await setRules(next)
     return result
   })
 }
@@ -730,6 +737,13 @@ export async function autoDisableStaleRules(
         signal: r.signal,
         targetFolderPath: r.targetFolderPath,
       })
+    }
+    // Nothing disabled AND nothing stale-deleted → `next` holds exactly the
+    // same refs in the same order. Return the ORIGINAL array so mutateRules'
+    // identity check skips the full-library rewrite (this runs on every SW
+    // wake via the module-load sweep).
+    if (disabled.length === 0 && byReason.stale === 0) {
+      return { next: rules, result: undefined }
     }
     return { next, result: undefined }
   })

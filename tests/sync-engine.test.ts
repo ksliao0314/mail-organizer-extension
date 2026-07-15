@@ -649,6 +649,14 @@ describe('folderActivity sync (v2 schema)', () => {
     expect(cloud['syncFolderActivity_0']).toBeDefined()
   })
 
+  // Timestamps MUST be relative to now (time-bomb regression, 2026-06):
+  // writeFolderActivity prunes rows older than 30 days against the REAL
+  // clock — hard-coded absolute fixture dates made these tests fail the
+  // day the fixtures aged out, with zero code change.
+  const FA_HOUR = 60 * 60 * 1000
+  const faOlder = new Date(Date.now() - 30 * FA_HOUR).toISOString()
+  const faNewer = new Date(Date.now() - 2 * FA_HOUR).toISOString()
+
   it('pull merges cloud folderActivity into local (union by folderId)', async () => {
     // Local has entry for folder A.
     await recordFolderActivityFromBatch(
@@ -660,18 +668,18 @@ describe('folderActivity sync (v2 schema)', () => {
           latestMessage: {
             subject: 'local subject',
             from: 'a@x.com',
-            receivedAt: '2026-05-25T10:00:00Z',
+            receivedAt: faOlder,
           },
         },
       ],
-      '2026-05-25T10:00:00Z',
+      faOlder,
     )
     // Cloud has entry for folder B (from another machine).
     await chrome.storage.sync.set({
       syncMeta: {
         schemaVersion: 2,
         sourceMachineId: 'other',
-        updatedAt: '2026-05-26T09:00:00Z',
+        updatedAt: faNewer,
         ruleCount: 0,
         tombstoneCount: 0,
         ruleChunkCount: 0,
@@ -686,12 +694,12 @@ describe('folderActivity sync (v2 schema)', () => {
           {
             folderId: 'folder-b',
             folderPath: '案件/B',
-            lastActiveAt: '2026-05-26T09:00:00Z',
+            lastActiveAt: faNewer,
             recentCount: 5,
             latestMessage: {
               subject: 'cloud subject',
               from: 'b@x.com',
-              receivedAt: '2026-05-26T09:00:00Z',
+              receivedAt: faNewer,
             },
           },
         ],
@@ -713,17 +721,17 @@ describe('folderActivity sync (v2 schema)', () => {
           latestMessage: {
             subject: 'stale local',
             from: 'a@x.com',
-            receivedAt: '2026-05-20T10:00:00Z',
+            receivedAt: faOlder,
           },
         },
       ],
-      '2026-05-20T10:00:00Z',
+      faOlder,
     )
     await chrome.storage.sync.set({
       syncMeta: {
         schemaVersion: 2,
         sourceMachineId: 'other',
-        updatedAt: '2026-05-26T09:00:00Z',
+        updatedAt: faNewer,
         ruleCount: 0,
         tombstoneCount: 0,
         ruleChunkCount: 0,
@@ -738,12 +746,12 @@ describe('folderActivity sync (v2 schema)', () => {
           {
             folderId: 'folder-x',
             folderPath: '案件/X',
-            lastActiveAt: '2026-05-26T09:00:00Z',
+            lastActiveAt: faNewer,
             recentCount: 3,
             latestMessage: {
               subject: 'fresh from cloud',
               from: 'b@x.com',
-              receivedAt: '2026-05-26T09:00:00Z',
+              receivedAt: faNewer,
             },
           },
         ],
@@ -852,6 +860,15 @@ describe('Bug #N: quiesce drains in-flight push before resolving', () => {
 // ---- P-1: writeFolderActivity diff-before-write --------------------------
 
 describe('P-1: writeFolderActivity skips chrome.storage.local.set on no-op', () => {
+  // Relative timestamps (time-bomb regression, 2026-06): writeFolderActivity
+  // prunes rows older than 30 days against the real clock. With hard-coded
+  // dates, the first test "passed" for the wrong reason once the fixtures
+  // aged out (both writes pruned to [] → identical empty JSON), and the
+  // second failed outright (pruned-to-empty on both writes → no set call).
+  const P1_HOUR = 60 * 60 * 1000
+  const p1T0 = new Date(Date.now() - 3 * P1_HOUR).toISOString()
+  const p1T1 = new Date(Date.now() - 1 * P1_HOUR).toISOString()
+
   it('writing identical content twice does not invoke chrome.storage.local.set the second time', async () => {
     const setMock = chrome.storage.local.set as ReturnType<typeof vi.fn>
     setMock.mockClear()
@@ -862,16 +879,20 @@ describe('P-1: writeFolderActivity skips chrome.storage.local.set on no-op', () 
       latestMessage: {
         subject: 'identical',
         from: 'a@x.com',
-        receivedAt: '2026-05-26T10:00:00Z',
+        receivedAt: p1T0,
       },
     }
-    await recordFolderActivityFromBatch([entry], '2026-05-26T10:00:00Z')
+    await recordFolderActivityFromBatch([entry], p1T0)
     const firstCallCount = setMock.mock.calls.filter((c) =>
       Object.prototype.hasOwnProperty.call(c[0], 'folderActivity'),
     ).length
+    // A row actually landed (fixture within the retention window) —
+    // otherwise the idempotency assertion below would vacuously pass on
+    // two empty writes.
+    expect(firstCallCount).toBeGreaterThan(0)
     // Same content, same timestamp — second write should detect identical
     // and skip the actual set() call.
-    await recordFolderActivityFromBatch([entry], '2026-05-26T10:00:00Z')
+    await recordFolderActivityFromBatch([entry], p1T0)
     const secondCallCount = setMock.mock.calls.filter((c) =>
       Object.prototype.hasOwnProperty.call(c[0], 'folderActivity'),
     ).length
@@ -889,7 +910,7 @@ describe('P-1: writeFolderActivity skips chrome.storage.local.set on no-op', () 
           count: 1,
         },
       ],
-      '2026-05-26T10:00:00Z',
+      p1T0,
     )
     const before = setMock.mock.calls.length
     await recordFolderActivityFromBatch(
@@ -900,7 +921,7 @@ describe('P-1: writeFolderActivity skips chrome.storage.local.set on no-op', () 
           count: 1,
         },
       ],
-      '2026-05-26T11:00:00Z', // different timestamp — content actually differs
+      p1T1, // different timestamp — content actually differs
     )
     expect(setMock.mock.calls.length).toBeGreaterThan(before)
   })

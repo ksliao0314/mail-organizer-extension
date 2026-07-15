@@ -1795,6 +1795,27 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
 
       const tree = (await getFolderCache())?.tree ?? (await getOrFetchFolderTree(false))
 
+      // Fail fast with a SYNCHRONOUS error the UI can render. The scan
+      // itself is fire-and-forgotten below, so its own throw for this
+      // condition (root folder absent from the tree) was invisible — the
+      // UI got ok:true, refreshed to a null scan state, and silently
+      // showed the start button again with the reason buried in the SW
+      // console.
+      const hasTargets = flattenFolderTree(tree).some((n) => {
+        const inRoot = n.path === rootPath || n.path.startsWith(rootPath + '/')
+        if (!inRoot) return false
+        return !settings.excludeFolderPrefixes.some(
+          (p) => n.path === p || n.path.startsWith(p + '/'),
+        )
+      })
+      if (!hasTargets) {
+        return {
+          ok: false,
+          code: 'NO_TARGETS',
+          message: `找不到根資料夾「${rootPath}」或其子資料夾(可能已改名/被排除清單涵蓋)`,
+        }
+      }
+
       void startInitialScan({
         rootPath,
         tree,
@@ -2307,10 +2328,11 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
 
     case 'runStaleSweep': {
       // Manual trigger for the daily auto-disable sweep. Same operation
-      // as the chrome.alarms-driven path. Returns the count of rules
-      // auto-disabled this run.
-      const { disabledCount } = await runSweep()
-      return { ok: true, data: { disabledCount } }
+      // as the chrome.alarms-driven path. Returns both the soft-disabled
+      // count (legacy_token / high-error-rate) and the stale hard-delete
+      // count so the options button can report what actually happened.
+      const { disabledCount, staleDeletedCount } = await runSweep()
+      return { ok: true, data: { disabledCount, staleDeletedCount } }
     }
 
     // ---- Cross-machine sync (chrome.storage.sync) ----------------------

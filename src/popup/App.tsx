@@ -538,6 +538,14 @@ export default function App() {
     const execStartedAt = phase.state.startedAt
 
     void (async () => {
+      // Cancellation (audit P2): the ref is reset to null the moment phase
+      // leaves 'done' (see the effect's early-return above), so re-checking
+      // it after EVERY await makes leaving DoneScreen an effective cancel.
+      // Without this, a quick 繼續歸檔下一批 raced the still-in-flight prefetch
+      // chain into a SECOND classifyPreflight+classifyAi (double Anthropic
+      // spend, interleaved progress writes); 回主畫面 similarly let the chain
+      // resurrect AI progress that finishAndReset had just cleared.
+      const cancelled = () => prefetchStartedRef.current !== phaseKey
       // Audit: the just-executed batch leaves ITS OWN (older) AI classify
       // progress in session storage — nothing clears it between classify-done
       // and DoneScreen mount. The old guard bailed on ANY progress, so it
@@ -547,6 +555,7 @@ export default function App() {
       // genuine in-flight/done prefetch); otherwise clear the residue and
       // proceed. Mirrors continueToNextBatch's startedAt staleness guard.
       const existing = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
+      if (cancelled()) return
       if (
         existing.ok &&
         existing.data &&
@@ -559,6 +568,7 @@ export default function App() {
         // Stale residue from the batch we just executed — clear it so the
         // resume path can't promote it and so our prefetch starts clean.
         await send({ type: 'clearAiClassifyProgress' })
+        if (cancelled()) return
       }
       // Headless preflight + classifyAi. Same SW handlers the foreground
       // path uses; just don't touch popup phase so DoneScreen stays put.
@@ -567,6 +577,7 @@ export default function App() {
         batchSize,
         forceFresh: false,
       })
+      if (cancelled()) return
       if (!pf.ok || !pf.data) return
       if (pf.data.unmatchedPreview.length === 0) return // nothing for AI to do
       await send({ type: 'classifyAi', excludeIds: [] })
@@ -661,12 +672,38 @@ export default function App() {
         usage = saved!.plan!.usage
         summary = saved!.plan!.summary
         banner = saved!.plan!.banner ?? undefined
-        // If AI is still going + popupState may be missing freshly-arrived
-        // items, append them.
-        if (aiProg && !aiProg.done) {
+        // popupState may be missing AI items that arrived after its last
+        // debounced save — merge them in whether or not classify has since
+        // finished. (Audit P2: this was gated on !aiProg.done, so a classify
+        // that COMPLETED while the popup was closed had its post-close items
+        // silently dropped on reopen — despite the aiPending card promising
+        // "popup 可關、回來會自動接著看".)
+        if (aiProg) {
           const seen = new Set(items.map((i) => i.emailId))
           const fresh = aiProg.aiPlan.filter((ai) => !seen.has(ai.emailId))
           if (fresh.length > 0) items = [...items, ...fresh]
+          if (aiProg.done) {
+            // Adopt the final run's usage / summary / error banner — the
+            // stale snapshot predates completion. Same formulas as the
+            // in-popup poll's done-branch below.
+            usage = aiProg.usage ?? usage
+            summary = {
+              ruleHits: aiProg.rulePlan.length,
+              aiHandled:
+                aiProg.aiPlan.length -
+                (aiProg.skippedByUser ?? 0) -
+                aiProg.aiPlan.filter((x) => x.source === 'unresolved').length,
+            }
+            if (aiProg.aiError) {
+              banner = {
+                code: aiProg.aiError.code,
+                message:
+                  aiProg.aiError.code === 'TRUNCATED' || aiProg.aiError.code === 'CONFIDENCE_GATED'
+                    ? aiProg.aiError.message
+                    : `AI 分類失敗：${aiProg.aiError.message}。規則命中與已完成部分仍可執行。`,
+              }
+            }
+          }
         }
       } else if (aiProg) {
         items = [...aiProg.rulePlan, ...aiProg.aiPlan]
@@ -843,6 +880,20 @@ export default function App() {
               : p.banner,
           }
         }
+        // Nothing changed this tick (the common case — chunks complete every
+        // 10-30s but we poll at 500ms): return the SAME reference so React
+        // skips the re-render entirely. Without this, every tick minted a new
+        // phase object → full 100-row PlanRow re-render twice a second AND
+        // re-armed the 400ms-debounced savePopupState (debounce < poll
+        // interval → never coalesces → ~2 session writes/sec for the whole
+        // classify).
+        if (
+          freshAi.length === 0 &&
+          p.aiPending.completedEmails === prog.completedEmails &&
+          p.aiPending.completedChunks === prog.completedChunks
+        ) {
+          return p
+        }
         return {
           ...p,
           items,
@@ -1010,17 +1061,34 @@ export default function App() {
     })
   }
 
+  // Synchronous re-entry guard for 執行 (audit P2): a double-click used to
+  // fire startExecute twice — the second either hit the SW's ALREADY_RUNNING
+  // guard and stranded the popup on ErrorScreen, or (response slow) started
+  // duplicate work. The ref flips before the first await, so click #2 is a
+  // no-op regardless of message timing.
+  const executeSubmittingRef = useRef(false)
   async function confirmExecute() {
     if (phase.kind !== 'plan') return
+    if (executeSubmittingRef.current) return
+    executeSubmittingRef.current = true
     // Bg holds the tree in folderCache already; no need to ship ~200 KB back.
-    const r = await send<{ started: boolean; total: number }>({
-      type: 'startExecute',
-      plan: phase.items,
-    })
-    if (!r.ok) {
+    let r: Awaited<ReturnType<typeof send<{ started: boolean; total: number }>>>
+    try {
+      r = await send<{ started: boolean; total: number }>({
+        type: 'startExecute',
+        plan: phase.items,
+      })
+    } finally {
+      executeSubmittingRef.current = false
+    }
+    if (!r.ok && r.code !== 'ALREADY_RUNNING') {
       setPhase({ kind: 'error', code: r.code, message: r.message })
       return
     }
+    // ALREADY_RUNNING falls through: the batch we just tried to start IS
+    // already running (our own double-send or another popup surface) — show
+    // the executing view and let the getExecuteState poll adopt real state
+    // instead of stranding the user on an error screen.
     // Execute now owns the workflow — popup state becomes stale, drop it.
     void send({ type: 'clearPopupState' })
     // Seed an initial executing state immediately so UI doesn't flicker.
@@ -2016,7 +2084,32 @@ function PlanScreen({
   // Picker shows real folders + the pending destinations in this same plan, so
   // user can re-target later items to a folder that doesn't exist in Outlook
   // yet (execute will create + reorder).
-  const augmentedTree = useMemo(() => buildAugmentedTree(tree, items), [tree, items])
+  //
+  // Perf (audit): buildAugmentedTree deep-clones the whole folder tree
+  // (JSON round-trip, ~200KB) — but it only READS the new_folder destination
+  // triples. Keying it directly on `items` recomputed the clone on EVERY
+  // edit (action toggles, d/s shortcuts, move-target picks). Derive a cheap
+  // proxy key from just those triples so unrelated edits reuse the cached
+  // tree; only a change to an actual pending destination re-clones.
+  const pendingFoldersKey = useMemo(
+    () =>
+      items
+        .filter((i) => i.action === 'new_folder')
+        .map(
+          (i) =>
+            `${i.emailId}\u0000${i.suggestedFolderName ?? ''}\u0000${i.suggestedParentPath ?? ''}`,
+        )
+        .join('\u0001'),
+    [items],
+  )
+  const augmentedTree = useMemo(
+    () => buildAugmentedTree(tree, items),
+    // `pendingFoldersKey` is a complete proxy for the slice of `items` that
+    // buildAugmentedTree reads — when it's unchanged, the cached result is
+    // identical by construction.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tree, pendingFoldersKey],
+  )
 
   // Path index — flatten once per augmented-tree change, share across all
   // PlanRow instances. Avoids 50× redundant flattens on each onChange.
@@ -2846,6 +2939,16 @@ function ExecutingScreen({
   onCancel: () => void
 }) {
   const pct = state.total > 0 ? Math.round((state.current / state.total) * 100) : 0
+  // Arm the cancel button only after a short beat (audit P2): PlanScreen's
+  // 執行 and this screen's 取消 render in the same sticky-bar spot, so the
+  // second click of a double-click on 執行 landed HERE and cancelled the
+  // batch the first click just started. 600ms comfortably outlasts a
+  // double-click without delaying a real cancel decision.
+  const [cancelArmed, setCancelArmed] = useState(false)
+  useEffect(() => {
+    const t = window.setTimeout(() => setCancelArmed(true), 600)
+    return () => window.clearTimeout(t)
+  }, [])
   return (
     <div className="space-y-3">
       <div className="rounded-md border border-border bg-card p-3 space-y-2">
@@ -2892,7 +2995,7 @@ function ExecutingScreen({
 
       <div className="sticky bottom-0 -mx-4 px-4 py-3 border-t border-border bg-background/95 backdrop-blur flex items-center justify-between">
         <span className="text-xs text-muted-foreground">popup 可關 — 背景會繼續</span>
-        <Button variant="outline" onClick={onCancel} disabled={state.cancelRequested}>
+        <Button variant="outline" onClick={onCancel} disabled={state.cancelRequested || !cancelArmed}>
           <Pause /> {state.cancelRequested ? '取消中…' : '取消'}
         </Button>
       </div>

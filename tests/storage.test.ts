@@ -204,24 +204,33 @@ describe('subjectMemory conflictCount decay', () => {
 // the user pressed 重新整理 once, the very next classify batch erased
 // the subject preview.
 describe('folderActivity.latestMessage preservation', () => {
+  // Timestamps MUST be relative to now (time-bomb regression, 2026-06):
+  // writeFolderActivity prunes entries older than FOLDER_ACTIVITY_MAX_AGE_MS
+  // (30 days) against the REAL clock, so hard-coded absolute dates made
+  // these tests start failing the day the fixtures aged past the window —
+  // green on 2026-06-18, red on 2026-06-23, no code change in between.
+  const HOUR = 60 * 60 * 1000
+  const t0 = new Date(Date.now() - 12 * HOUR).toISOString() // scan time
+  const t1 = new Date(Date.now() - 1 * HOUR).toISOString() // batch time (newer)
+
   it('preserves prev.latestMessage when batch supplies none', async () => {
     // Step 1: scan populates latestMessage
     await mergeFolderActivityScan([
       {
         folderId: 'f1',
         folderPath: 'P/A',
-        latestMessageAt: '2026-05-22T00:00:00Z',
+        latestMessageAt: t0,
         latestMessage: {
           subject: 'foo',
           from: 'a@b.com',
-          receivedAt: '2026-05-22T00:00:00Z',
+          receivedAt: t0,
         },
       },
     ])
     // Step 2: batch without latestMessage (simulates pre-fix call site).
     await recordFolderActivityFromBatch(
       [{ folderId: 'f1', folderPath: 'P/A', count: 3 }],
-      '2026-05-22T12:00:00Z',
+      t1,
     )
     const activity = await getFolderActivity()
     const row = activity.find((r) => r.folderId === 'f1')
@@ -234,11 +243,11 @@ describe('folderActivity.latestMessage preservation', () => {
       {
         folderId: 'f2',
         folderPath: 'P/B',
-        latestMessageAt: '2026-05-22T00:00:00Z',
+        latestMessageAt: t0,
         latestMessage: {
           subject: 'old subject',
           from: 'old@example.com',
-          receivedAt: '2026-05-22T00:00:00Z',
+          receivedAt: t0,
         },
       },
     ])
@@ -251,11 +260,11 @@ describe('folderActivity.latestMessage preservation', () => {
           latestMessage: {
             subject: 'new subject',
             from: 'new@example.com',
-            receivedAt: '2026-05-22T12:00:00Z',
+            receivedAt: t1,
           },
         },
       ],
-      '2026-05-22T12:00:00Z',
+      t1,
     )
     const activity = await getFolderActivity()
     const row = activity.find((r) => r.folderId === 'f2')
