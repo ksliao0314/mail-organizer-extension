@@ -21,12 +21,11 @@ import {
   addRulesFilteringTombstones,
   bumpRuleHits,
   bumpRuleOverrides,
+  caseSignalsForLearning,
   courtCaseSignal,
   decodeCompound,
   deleteRule,
   encodeCompound,
-  extractCaseCodes,
-  extractCourtCaseNumbers,
   extractSubjectSignal,
   isGenericProviderDomain,
   listRules,
@@ -1117,10 +1116,13 @@ export function wasUserOverride(item: PlanItem): boolean {
  *   - 'full_subject': signal is the entire normalized subject — used
  *     by the conflict-upgrade path and the internal-domain fallback.
  */
+// `fromBody` (batch-3): the structural case identifier came from the email
+// BODY, not the subject. Body cases are noisier (quote other parties' cases),
+// so downstream drops their confidence and tightens the source gate.
 type LearningSignal =
-  | { type: 'compound'; signal: string; descr: string; featureKind: 'court_case' | 'full_subject'; demoteOnly?: false }
-  | { type: 'case_code'; signal: string; descr: string; demoteOnly?: false }
-  | { type: 'subject_keyword'; signal: string; descr: string; featureKind: 'court_case' | 'full_subject'; demoteOnly?: false }
+  | { type: 'compound'; signal: string; descr: string; featureKind: 'court_case' | 'full_subject'; demoteOnly?: false; fromBody?: boolean }
+  | { type: 'case_code'; signal: string; descr: string; demoteOnly?: false; fromBody?: boolean }
+  | { type: 'subject_keyword'; signal: string; descr: string; featureKind: 'court_case' | 'full_subject'; demoteOnly?: false; fromBody?: boolean }
   | { type: 'domain'; signal: string; descr: string; demoteOnly?: boolean }
   | { type: 'sender'; signal: string; descr: string; demoteOnly?: boolean }
 
@@ -1141,10 +1143,14 @@ function chooseLearningSignal(
   existingRules: Rule[],
 ): LearningSignal | null {
   const subject = item.emailSubject ?? ''
-  const courtCases = extractCourtCaseNumbers(subject)
-  const cc = courtCases[0]
-  const codes = extractCaseCodes(subject)
-  const codeAlpha = codes[0]
+  // Case identifiers via the shared gate (batch-3): subject-first, body only
+  // as a single-distinct fallback. `fromBody` flows into the confidence and
+  // source gate downstream. An ambiguous body (>1 distinct) yields no case
+  // signal at all → we fall through to the domain path (寧缺勿濫).
+  const caseGate = caseSignalsForLearning(item)
+  const fromBody = caseGate.source === 'body'
+  const cc = fromBody && caseGate.bodyAmbiguous ? undefined : caseGate.courtCases[0]
+  const codeAlpha = fromBody && caseGate.bodyAmbiguous ? undefined : caseGate.caseCodes[0]
   // Normalized full subject (reply/forward prefixes stripped, lower-
   // cased, whitespace collapsed). Returns '' for empty / single-char
   // subjects below MIN_SUBJECT_SIGNAL_LEN.
@@ -1163,7 +1169,13 @@ function chooseLearningSignal(
   // ---- Priority 1: compound with court case (structural ID fast-path)
   // Court case numbers are unique per case → no bloat risk. Build
   // compound + domain immediately for strongest routing. Confidence 0.9.
-  if (usableDomain && cc) {
+  // ONLY for SUBJECT cases (!fromBody): a compound's subject_keyword
+  // condition is matched against the SUBJECT (matchCompound), so a
+  // body-derived case number in a compound would never fire → the stale
+  // sweep would hard-delete it. Body court cases fall to P2, which mints a
+  // pure-case subject_keyword rule that C5's internal-body pass CAN match —
+  // this is the closed-loop symmetry guarantee.
+  if (usableDomain && cc && !fromBody) {
     const signal = encodeCompound([
       { type: 'domain', value: usableDomain },
       { type: 'subject_keyword', value: cc },
@@ -1176,21 +1188,27 @@ function chooseLearningSignal(
     }
   }
   // ---- Priority 2: court case alone (structural ID fast-path)
-  // Court case numbers are globally unique; safe to route on subject
-  // alone even without a domain anchor. Confidence 0.85.
+  // Court case numbers are globally unique; safe to route on the identifier
+  // alone even without a domain anchor. Confidence 0.85 (subject) / 0.75 (body).
   if (cc) {
     return {
       type: 'subject_keyword',
       signal: cc,
-      descr: `主旨含 ${cc}`,
+      descr: `${fromBody ? '內文' : '主旨'}含 ${cc}`,
       featureKind: 'court_case',
+      fromBody,
     }
   }
   // ---- Priority 3: Latin case code (structural ID fast-path)
   // Firm-internal case codes (25A0067A etc.) — also unique per case.
-  // Confidence 0.9.
+  // Confidence 0.9 (subject) / 0.8 (body).
   if (codeAlpha) {
-    return { type: 'case_code', signal: codeAlpha, descr: `案件代號 ${codeAlpha}` }
+    return {
+      type: 'case_code',
+      signal: codeAlpha,
+      descr: `${fromBody ? '內文' : ''}案件代號 ${codeAlpha}`,
+      fromBody,
+    }
   }
   // ---- Priority 4: usable domain (non-generic-provider)
   //
@@ -1351,7 +1369,7 @@ function isStructuralCourtCaseRule(r: Rule): boolean {
   return false
 }
 
-async function generateAiConfirmedRules(
+export async function generateAiConfirmedRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
 ): Promise<{ added: number; addedIds: string[]; details: RuleLearnedDetail[] }> {
@@ -1383,20 +1401,25 @@ async function generateAiConfirmedRules(
     const isStructural =
       sig.type === 'case_code' ||
       ('featureKind' in sig && sig.featureKind === 'court_case')
+    // A BODY-derived structural id (batch-3) is NOT trusted enough to earn the
+    // rule/thread bypass below — bodies quote other parties' cases. Only a
+    // SUBJECT structural id keeps the "first-sight learn from any route" power.
+    const structuralTrusted = isStructural && !('fromBody' in sig && sig.fromBody)
 
     // Source gate:
     //   - ai / unresolved: always eligible (AI was confident & accepted, or
     //     the user resolved it — human-validated intent).
-    //   - rule / thread: eligible ONLY for structural IDs. This lets a case
-    //     number routed by thread memory (or by a DIFFERENT rule, e.g. a
+    //   - rule / thread: eligible ONLY for SUBJECT structural IDs. This lets a
+    //     case number routed by thread memory (or by a DIFFERENT rule, e.g. a
     //     plain-domain rule) mint a durable, syncable, cross-sender case
     //     rule — closing the thread-memory learning dead-end. Non-structural
-    //     rule/thread hits stay excluded (they'd just re-mint what already
-    //     routed them, or overfit a broad subject).
+    //     and body-derived rule/thread hits stay excluded (they'd overfit a
+    //     broad subject, or trust a noisy body citation from an unvalidated
+    //     route).
     if (
       item.source !== 'ai' &&
       item.source !== 'unresolved' &&
-      !isStructural
+      !structuralTrusted
     ) {
       continue
     }
@@ -1507,9 +1530,12 @@ async function generateAiConfirmedRules(
             : sig.type === 'sender'
               ? 0.7
               : 0.55
-    const confidence = userResolved
-      ? Math.min(0.95, baseConfidence + 0.05)
-      : baseConfidence
+    // Body-derived case identifiers are noisier than subject ones — dock 0.1
+    // so a bad body-learned rule crosses bumpRuleHits' error-rate disable
+    // threshold sooner (batch-3). case_code 0.9→0.8, court-case 0.85→0.75.
+    const bodyPenalty = 'fromBody' in sig && sig.fromBody ? 0.1 : 0
+    const confidence =
+      (userResolved ? Math.min(0.95, baseConfidence + 0.05) : baseConfidence) - bodyPenalty
 
     newRules.push(
       newRule({
@@ -1591,6 +1617,9 @@ export async function generateAiOverrideRules(
     // so a new plain-domain / plain-sender rule would just re-create
     // the same conflict).
     demoteOnly: boolean
+    // batch-3: structural id came from the body, not the subject → mint at a
+    // lower confidence even on the (user-validated) override path.
+    fromBody: boolean
   }
   const overrides: Override[] = []
   // Existing rules needed for chooseLearningSignal's conflict-prevention
@@ -1624,6 +1653,7 @@ export async function generateAiOverrideRules(
       // For other types this property is absent → default false.
       demoteOnly:
         (sig.type === 'domain' || sig.type === 'sender') && sig.demoteOnly === true,
+      fromBody: 'fromBody' in sig && sig.fromBody === true,
     })
   }
   if (overrides.length === 0) return { added: 0, disabled: 0, details: [] as RuleLearnedDetail[] }
@@ -1750,7 +1780,11 @@ export async function generateAiOverrideRules(
         // rule creation is blocked above so we only get here for
         // compound / case_code / subject_keyword / sender — all of which
         // either uniquely identify a case or pinpoint a specific human.
-        confidence: 0.95,
+        // A body-derived case id (batch-3) is docked to 0.85 even here: the
+        // user validated the DESTINATION, but the body citation itself is
+        // noisier than a subject one, so let the error-rate gate cull it
+        // sooner if it misfires.
+        confidence: o.fromBody ? 0.85 : 0.95,
         source: 'ai_overridden',
       })
       next.push(created)
