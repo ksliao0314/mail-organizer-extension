@@ -1287,30 +1287,11 @@ export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcom
   }
   if (bestDomain) return bestDomain
   // Internal-body case pass (batch-3, priority ~3.5 — after domain, before
-  // plain subject_keyword). Fires ONLY when the subject carries no case number
-  // AND the body has exactly ONE distinct case identifier (caseSignalsForMatch
-  // gate). Bodies are noisy — they quote the opponent's OTHER case, cite prior
-  // cases — so we route on a body case number only when it's unambiguous, and
-  // only against STRUCTURAL case rules (case_code / court-case), never plain
-  // subject / domain rules. Placed after domain so a stable domain rule wins
-  // over a noisy body signal; anything ambiguous falls through to AI (safe).
-  // NOTE: at preflight time email.bodyText is not yet fetched, so this reads
-  // the 250-char BodyPreview — a first-250 hit routes here; a deeper one goes
-  // to AI, which can then learn a rule for next time (B3-C6).
-  const bodyCase = caseSignalsForMatch(email)
-  if (bodyCase.source === 'body' && !bodyCase.bodyAmbiguous) {
-    for (const r of index.caseCodeRules) {
-      if (bodyCase.caseCodes.some((c) => c.toUpperCase() === r.signal.toUpperCase())) {
-        return { rule: r, reason: `內文含案件代號「${r.signal}」` }
-      }
-    }
-    for (const r of index.courtCaseSubjectRules) {
-      const cc = courtCaseSignal(r.signal)
-      if (cc && bodyCase.courtCases.includes(cc)) {
-        return { rule: r, reason: `內文含案號「${cc}」` }
-      }
-    }
-  }
+  // plain subject_keyword). See matchBodyCaseWithIndex. Requires the fully-
+  // fetched bodyText, so it is inert at preflight (BodyPreview only) and fires
+  // in the AI path after getMessageBody (service-worker classifyAi).
+  const bodyOutcome = matchBodyCaseWithIndex(email, index)
+  if (bodyOutcome) return bodyOutcome
   // subject_keyword (priority 4) — linear, no index possible without
   // bringing in a substring data structure (trie / aho-corasick).
   // Bucket is sorted longest-signal-first by buildRuleIndex so
@@ -1328,6 +1309,39 @@ export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcom
         const reason = matchSender(r.signal, email)
         if (reason) return { rule: r, reason }
       }
+    }
+  }
+  return null
+}
+
+/**
+ * Internal-body case pass (batch-3). Route a previously-unmatched email on a
+ * case number found in its BODY — but ONLY:
+ *   - when the subject carries NO case number (caseSignalsForMatch subject-
+ *     first gate), and
+ *   - the body has exactly ONE distinct case identifier (!bodyAmbiguous —
+ *     bodies quote the opponent's OTHER case / prior cases), and
+ *   - it matches a STRUCTURAL case rule (case_code / court-case), never a
+ *     plain subject / domain / compound rule.
+ * caseSignalsForMatch reads ONLY the fully-fetched bodyText, so this is inert
+ * until a caller supplies it (the AI path, post getMessageBody) — never on the
+ * 250-char preflight preview where ambiguity can't be judged. Exported so the
+ * classifyAi loop can route body-case reps by rule (skipping the AI) after it
+ * fetches the full body, keeping matchEmailWithIndex the single source of the
+ * pass logic.
+ */
+export function matchBodyCaseWithIndex(email: Email, index: RuleIndex): MatchOutcome | null {
+  const bodyCase = caseSignalsForMatch(email)
+  if (bodyCase.source !== 'body' || bodyCase.bodyAmbiguous) return null
+  for (const r of index.caseCodeRules) {
+    if (bodyCase.caseCodes.some((c) => c.toUpperCase() === r.signal.toUpperCase())) {
+      return { rule: r, reason: `內文含案件代號「${r.signal}」` }
+    }
+  }
+  for (const r of index.courtCaseSubjectRules) {
+    const cc = courtCaseSignal(r.signal)
+    if (cc && bodyCase.courtCases.includes(cc)) {
+      return { rule: r, reason: `內文含案號「${cc}」` }
     }
   }
   return null

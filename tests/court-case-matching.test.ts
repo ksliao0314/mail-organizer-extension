@@ -5,6 +5,7 @@ import {
   courtCaseSignal,
   encodeCompound,
   extractCourtCaseNumbers,
+  matchBodyCaseWithIndex,
   matchEmailWithIndex,
   newRule,
   ruleBeatsThread,
@@ -273,5 +274,46 @@ describe('internal-body case matching (batch-3)', () => {
       }),
     )
     expect(m?.rule.targetFolderPath).toBe('domain/court')
+  })
+})
+
+// ---- matchBodyCaseWithIndex (C5 activation helper) --------------------------
+
+describe('matchBodyCaseWithIndex (full-body re-match used by classifyAi)', () => {
+  it('matches an unambiguous body court case against a court-case rule', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '開庭通知', bodyText: '本件 112訴304 敬請' }),
+      buildRuleIndex([r]),
+    )
+    expect(m?.rule.targetFolderPath).toBe('case/304')
+    expect(m?.reason).toContain('內文含案號')
+  })
+
+  it('returns null when the subject carries a case number (subject-first)', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '112年度訴字第204號', bodyText: '參照 112訴304' }),
+      buildRuleIndex([r]),
+    )
+    expect(m).toBeNull()
+  })
+
+  it('returns null on an ambiguous body (>1 distinct case)', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '通知', bodyText: '本件 112訴304，另案 113訴500' }),
+      buildRuleIndex([r]),
+    )
+    expect(m).toBeNull()
+  })
+
+  it('returns null when only BodyPreview is present (no fetched bodyText)', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '本件 112訴304' }),
+      buildRuleIndex([r]),
+    )
+    expect(m).toBeNull()
   })
 })
