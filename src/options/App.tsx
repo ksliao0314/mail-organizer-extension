@@ -121,6 +121,7 @@ type StatusData = {
   primaryRootPath: string
   internalSubjectCategories: string[]
   aiIncludeFewShotExamples: boolean
+  harvestEnabled: boolean
   syncEnabled: boolean
   syncMachineId: string
   lastSyncAt: string
@@ -494,6 +495,39 @@ export default function App() {
   async function toggleAiIncludeFewShot(value: boolean) {
     await send({ type: 'setSettings', patch: { aiIncludeFewShotExamples: value } })
     await refresh()
+  }
+
+  const [harvestBusy, setHarvestBusy] = useState(false)
+  const [harvestResult, setHarvestResult] = useState<string | null>(null)
+  async function toggleHarvestEnabled(value: boolean) {
+    await send({ type: 'setSettings', patch: { harvestEnabled: value } })
+    setHarvestResult(null)
+    await refresh()
+  }
+  async function runHarvest() {
+    setHarvestBusy(true)
+    setHarvestResult(null)
+    try {
+      const r = await send<{ scannedFolders: number; candidates: number; disabled?: boolean }>({
+        type: 'harvestManualFilings',
+      })
+      if (!r.ok) {
+        setHarvestResult(`掃描失敗:${r.message ?? r.code ?? '未知錯誤'}`)
+      } else if (r.data?.disabled) {
+        setHarvestResult('尚未啟用,請先打開上方開關')
+      } else {
+        const { scannedFolders = 0, candidates = 0 } = r.data ?? {}
+        setHarvestResult(
+          candidates > 0
+            ? `掃了 ${scannedFolders} 個資料夾,發現 ${candidates} 筆你手動歸檔的信,已納入路由參考(僅供參考,不會自動搬信)。`
+            : `掃了 ${scannedFolders} 個資料夾,沒有新的手動歸檔。`,
+        )
+      }
+    } catch (e) {
+      setHarvestResult(`掃描失敗:${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setHarvestBusy(false)
+    }
   }
 
   // Poll while scan in progress
@@ -1245,6 +1279,42 @@ export default function App() {
             <p className="mt-1.5 text-[10px] text-muted-foreground">
               切換立即生效、下次分類就會反映。規則「直接命中」邏輯不受此設定影響、只影響送 Claude 的 prompt。
             </p>
+          </CardContent>
+        </Card>
+
+        {/* Manual-filing harvester (opt-in, thread-memory only) */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">從你在 Outlook 的手動歸檔學習</CardTitle>
+            <CardDescription>
+              啟用後,你可以掃描案件資料夾,找出你直接在 Outlook 拖曳歸檔(沒經過本工具)的信,
+              把它們的歸檔位置納入「路由參考」。這只是<strong>提示</strong>——下次同對話 / 同主旨的信會被
+              帶往同資料夾當建議,<strong>不會自動搬信、也不會產生規則</strong>,本機保存、不跨機器同步。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={status?.harvestEnabled ?? false}
+                onChange={(e) => void toggleHarvestEnabled(e.target.checked)}
+                className="size-4 accent-foreground"
+              />
+              <span className="text-sm">啟用手動歸檔學習(預設關)</span>
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                {status?.harvestEnabled ? '已啟用' : '已停用'}
+              </span>
+            </label>
+            {status?.harvestEnabled && (
+              <div className="space-y-1.5">
+                <Button size="sm" variant="outline" onClick={() => void runHarvest()} disabled={harvestBusy}>
+                  {harvestBusy ? '掃描中…' : '立即掃描手動歸檔'}
+                </Button>
+                {harvestResult && (
+                  <p className="text-[11px] text-muted-foreground">{harvestResult}</p>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 

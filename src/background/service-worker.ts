@@ -496,6 +496,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           primaryRootPath: settings.primaryRootPath,
           internalSubjectCategories: settings.internalSubjectCategories,
           aiIncludeFewShotExamples: settings.aiIncludeFewShotExamples,
+          harvestEnabled: settings.harvestEnabled === true,
           syncEnabled: settings.syncEnabled,
           syncMachineId: settings.syncMachineId,
           lastSyncAt: settings.lastSyncAt,
