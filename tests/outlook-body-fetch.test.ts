@@ -69,3 +69,27 @@ describe('MESSAGE_SELECT_DEFAULT regression lock', () => {
     expect(url).toContain('BodyPreview') // sanity: the cheap preview stays
   })
 })
+
+describe('listFolderMessages $orderby', () => {
+  it('defaults to ReceivedDateTime desc (unchanged for existing callers)', async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ value: [] }))
+    await makeApi().listFolderMessages('inbox')
+    const url = String(fetchSpy.mock.calls[0]![0])
+    expect(url).toContain('$orderby=ReceivedDateTime%20desc')
+  })
+
+  it('accepts a custom orderby (harvester) alongside a filter', async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ value: [] }))
+    await makeApi().listFolderMessages('folder-id', {
+      orderby: 'LastModifiedDateTime desc',
+      filter: 'LastModifiedDateTime gt 2026-01-01T00:00:00Z',
+      top: 10,
+    })
+    const url = String(fetchSpy.mock.calls[0]![0])
+    expect(url).toContain('$orderby=LastModifiedDateTime%20desc')
+    expect(url).not.toContain('$orderby=ReceivedDateTime') // orderby swapped, not just appended
+    expect(url).toContain('$filter=')
+    expect(url).toContain('LastModifiedDateTime%20gt')
+    expect(url).toContain('$top=10')
+  })
+})

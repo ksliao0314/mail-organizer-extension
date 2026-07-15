@@ -332,6 +332,15 @@ export class OutlookApi {
        * future scoped-fetch needs.
        */
       filter?: string
+      /**
+       * Optional OData $orderby. Defaults to `ReceivedDateTime desc` (unchanged
+       * for every existing caller). The harvester passes `LastModifiedDateTime
+       * desc`: a manually-filed email keeps its old ReceivedDateTime, so it is
+       * never the ReceivedDateTime-newest message in the folder and is invisible
+       * to the default sort — but a move rewrites LastModifiedDateTime to ~the
+       * time it entered the folder, surfacing it.
+       */
+      orderby?: string
       signal?: AbortSignal
     } = {},
   ): Promise<Email[]> {
@@ -342,7 +351,7 @@ export class OutlookApi {
       `$top=${top}`,
       `$skip=${skip}`,
       `$select=${select}`,
-      `$orderby=ReceivedDateTime%20desc`,
+      `$orderby=${encodeURIComponent(opts.orderby ?? 'ReceivedDateTime desc')}`,
     ]
     if (opts.filter) {
       parts.push(`$filter=${encodeURIComponent(opts.filter)}`)
