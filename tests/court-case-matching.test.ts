@@ -194,3 +194,72 @@ describe('extractCourtCaseNumbers format coverage', () => {
     expect(extractCourtCaseNumbers('114年度訴更（一）字第14號')).toContain('114訴更一14')
   })
 })
+
+// ---- B3-C5: internal-body case matching ------------------------------------
+
+function caseCodeRule(signal: string, targetFolderPath: string, over: Partial<Rule> = {}): Rule {
+  return newRule({
+    type: 'case_code',
+    signal,
+    targetFolderId: 'fid_long_enough_to_pass_id_validation_xxx',
+    targetFolderPath,
+    confidence: 0.9,
+    source: 'ai_confirmed',
+    ...over,
+  })
+}
+function domainRule(signal: string, targetFolderPath: string): Rule {
+  return newRule({
+    type: 'domain',
+    signal,
+    targetFolderId: 'fid_long_enough_to_pass_id_validation_xxx',
+    targetFolderPath,
+    confidence: 0.8,
+    source: 'ai_confirmed',
+  })
+}
+
+describe('internal-body case matching (batch-3)', () => {
+  it('routes on a body case number when the subject has none', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '開庭通知', BodyPreview: '本件 112訴304 敬請出席' }))
+    expect(m?.rule.targetFolderPath).toBe('case/304')
+    expect(m?.reason).toContain('內文含案號')
+  })
+
+  it('routes on a body case CODE against a case_code rule', () => {
+    const r = caseCodeRule('25A0067A', 'case/A')
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '案件 25A0067A 相關文件' }))
+    expect(m?.rule.targetFolderPath).toBe('case/A')
+    expect(m?.reason).toContain('內文含案件代號')
+  })
+
+  it('IGNORES the body when the subject carries its own case number', () => {
+    // Subject case 112訴204 has no rule; body case 112訴304 has a rule.
+    // Subject-first gate → body is not consulted → no match (falls to AI).
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '112年度訴字第204號 通知', BodyPreview: '參照 112訴304' }))
+    expect(m).toBeNull()
+  })
+
+  it('does NOT route when the body is ambiguous (>1 distinct case)', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const m = matchOne([r], makeEmail({ Id: 'e', Subject: '通知', BodyPreview: '本件 112訴304，另案 113訴500' }))
+    expect(m).toBeNull()
+  })
+
+  it('a domain rule wins over a body case number (priority)', () => {
+    const dom = domainRule('court.example.tw', 'domain/court')
+    const cc = subjectRule('112訴304', 'case/304')
+    const m = matchOne(
+      [dom, cc],
+      makeEmail({
+        Id: 'e',
+        Subject: '通知',
+        From: { EmailAddress: { Address: 'clerk@court.example.tw' } },
+        BodyPreview: '本件 112訴304',
+      }),
+    )
+    expect(m?.rule.targetFolderPath).toBe('domain/court')
+  })
+})

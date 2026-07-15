@@ -1286,6 +1286,31 @@ export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcom
     }
   }
   if (bestDomain) return bestDomain
+  // Internal-body case pass (batch-3, priority ~3.5 — after domain, before
+  // plain subject_keyword). Fires ONLY when the subject carries no case number
+  // AND the body has exactly ONE distinct case identifier (caseSignalsForMatch
+  // gate). Bodies are noisy — they quote the opponent's OTHER case, cite prior
+  // cases — so we route on a body case number only when it's unambiguous, and
+  // only against STRUCTURAL case rules (case_code / court-case), never plain
+  // subject / domain rules. Placed after domain so a stable domain rule wins
+  // over a noisy body signal; anything ambiguous falls through to AI (safe).
+  // NOTE: at preflight time email.bodyText is not yet fetched, so this reads
+  // the 250-char BodyPreview — a first-250 hit routes here; a deeper one goes
+  // to AI, which can then learn a rule for next time (B3-C6).
+  const bodyCase = caseSignalsForMatch(email)
+  if (bodyCase.source === 'body' && !bodyCase.bodyAmbiguous) {
+    for (const r of index.caseCodeRules) {
+      if (bodyCase.caseCodes.some((c) => c.toUpperCase() === r.signal.toUpperCase())) {
+        return { rule: r, reason: `內文含案件代號「${r.signal}」` }
+      }
+    }
+    for (const r of index.courtCaseSubjectRules) {
+      const cc = courtCaseSignal(r.signal)
+      if (cc && bodyCase.courtCases.includes(cc)) {
+        return { rule: r, reason: `內文含案號「${cc}」` }
+      }
+    }
+  }
   // subject_keyword (priority 4) — linear, no index possible without
   // bringing in a substring data structure (trie / aho-corasick).
   // Bucket is sorted longest-signal-first by buildRuleIndex so
