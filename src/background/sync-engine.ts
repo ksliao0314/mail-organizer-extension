@@ -856,14 +856,52 @@ async function doPush(
       // cloud (just some extra dead chunks).
       await chrome.storage.sync.set(writes)
     } catch (e) {
-      // Quota / network errors. Surface in console + persistent error so
-      // the options UI can show "sync broken" (Bug #J). Don't update
-      // lastSyncAt so a retry remains possible.
       const errMsg = e instanceof Error ? e.message : String(e)
-      console.warn(`[mail-organizer] sync push (${reason}): chrome.storage.sync.set failed`, e)
-      await recordSyncError({ source: 'push', reason: errMsg })
-      await logError('sync:push', errMsg, { reason })
-      return { pushed: false, reason: errMsg }
+      // Quota-wedge recovery (audit H1 — a failure branch the G3 reorder
+      // opened): the sync quota is enforced on the post-set bucket TOTAL,
+      // i.e. new payload + still-stored orphan chunks. Near quota, a
+      // shrinking library can make that union exceed the limit forever —
+      // and the orphan cleanup that would free the space sat AFTER this
+      // set, unreachable. Pruning more rules doesn't help (payload shrinks,
+      // orphan set grows one-for-one), so the user was permanently wedged
+      // until 停用並清除雲端資料. Recovery: ONLY on a quota error, remove
+      // the orphans first and retry the set once. This briefly reopens the
+      // pre-G3 window (old meta referencing removed chunks) — acceptable
+      // because (a) it triggers only when the push is already failing
+      // permanently, and (b) remote pulls are union-mode + tombstone-aware
+      // (Bug #E), so missing chunks no longer silently drop rules.
+      const orphanKeys = [...orphanRuleKeys, ...orphanTombKeys, ...orphanActivityKeys]
+      const isQuota = /quota/i.test(errMsg)
+      if (isQuota && orphanKeys.length > 0) {
+        try {
+          console.warn(
+            `[mail-organizer] sync push (${reason}): quota exceeded with ` +
+              `${orphanKeys.length} orphan chunk(s) still stored — removing orphans and retrying once`,
+          )
+          await chrome.storage.sync.remove(orphanKeys)
+          await chrome.storage.sync.set(writes)
+          // Recovered — fall through to the normal post-set path (the
+          // orphan cleanup below re-removes already-gone keys, a no-op).
+        } catch (e2) {
+          const retryMsg = e2 instanceof Error ? e2.message : String(e2)
+          console.warn(
+            `[mail-organizer] sync push (${reason}): retry after orphan removal also failed`,
+            e2,
+          )
+          await recordSyncError({ source: 'push', reason: retryMsg })
+          await logError('sync:push', retryMsg, { reason })
+          return { pushed: false, reason: retryMsg }
+        }
+      } else {
+        // Non-quota errors (network etc.) or nothing to free. Surface in
+        // console + persistent error so the options UI can show "sync
+        // broken" (Bug #J). Don't update lastSyncAt so a retry remains
+        // possible.
+        console.warn(`[mail-organizer] sync push (${reason}): chrome.storage.sync.set failed`, e)
+        await recordSyncError({ source: 'push', reason: errMsg })
+        await logError('sync:push', errMsg, { reason })
+        return { pushed: false, reason: errMsg }
+      }
     }
 
     // Orphan cleanup AFTER the authoritative write — non-fatal. If it fails

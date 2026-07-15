@@ -35,7 +35,11 @@ export type ContentRequest = { type: 'fetch_token' }
 
 export type ContentResponse =
   | { ok: true; secret: string; expiresOn: number }
-  | { ok: false; code: 'NO_TOKEN' | 'EXPIRED' | 'NOT_ON_OWA'; message: string }
+  | {
+      ok: false
+      code: 'NO_TOKEN' | 'EXPIRED' | 'NOT_ON_OWA' | 'MULTIPLE_ACCOUNTS'
+      message: string
+    }
 
 // channel names --------------------------------------------------------------
 

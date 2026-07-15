@@ -1,7 +1,7 @@
 {
   "name": "mail-organizer-extension",
   "private": true,
-  "version": "1.0.3",
+  "version": "1.0.4",
   "type": "module",
   "description": "Outlook 郵件 AI 歸類擴充工具",
   "license": "GPL-3.0-or-later",

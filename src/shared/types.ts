@@ -544,7 +544,23 @@ export type UndoSnapshot = {
     subject: string
     destinationFolderId: string
     destinationFolderPath?: string
+    /**
+     * Learning-reversal keys (H2). Captured from the plan item so 撤回 can
+     * also revert what the batch TAUGHT the system — without these, the
+     * misfiling was deterministically re-proposed next batch and grew
+     * stickier each cycle (memory streak + rule hit counts kept climbing).
+     */
+    conversationId?: string
+    normalizedSubject?: string
+    /** Rule that drove this move (plan source === 'rule'). Undo counts as
+     *  an override against it, feeding the empirical-accuracy demotion. */
+    ruleId?: string
   }>
+  /**
+   * Rules minted by THIS batch's AI-confirmed learning. Deleted on undo
+   * (with tombstones, so the same wrong mapping isn't auto-re-learned).
+   */
+  mintedRuleIds?: string[]
   /** For user messaging only — these are NOT undoable from here. */
   deletedCount: number
   newFolderCount: number

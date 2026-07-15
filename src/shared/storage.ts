@@ -1094,6 +1094,50 @@ export async function recordSubjectFilings(
   })
 }
 
+/**
+ * Mark thread-memory entries as CONTESTED (H2 undo learning-reversal).
+ * Bumps conflictCount and resets stableStreak for each given key, under
+ * the same locks the filing writers use. matchThreadMemory only trusts
+ * entries with conflictCount === 0, so this immediately stops the
+ * pre-filter from auto-routing follow-ups to the folder the user just
+ * reverted — without deleting the entry (it earns trust back through
+ * DECAY_AFTER_STABLE consecutive same-folder filings, exactly like any
+ * organically-detected conflict).
+ */
+export async function markThreadMemoryConflicts(opts: {
+  convIds?: string[]
+  normalizedSubjects?: string[]
+}): Promise<void> {
+  const convIds = (opts.convIds ?? []).filter(Boolean)
+  const subjects = (opts.normalizedSubjects ?? []).filter(Boolean)
+  if (convIds.length > 0) {
+    await withConversationMemoryLock(async () => {
+      const map = await getConversationMemory()
+      let dirty = false
+      for (const id of convIds) {
+        const prev = map[id]
+        if (!prev) continue
+        map[id] = { ...prev, conflictCount: (prev.conflictCount ?? 0) + 1, stableStreak: 0 }
+        dirty = true
+      }
+      if (dirty) await chrome.storage.local.set({ [KEY_CONVERSATION_MEMORY]: map })
+    })
+  }
+  if (subjects.length > 0) {
+    await withSubjectMemoryLock(async () => {
+      const map = await getSubjectMemory()
+      let dirty = false
+      for (const s of subjects) {
+        const prev = map[s]
+        if (!prev) continue
+        map[s] = { ...prev, conflictCount: (prev.conflictCount ?? 0) + 1, stableStreak: 0 }
+        dirty = true
+      }
+      if (dirty) await chrome.storage.local.set({ [KEY_SUBJECT_MEMORY]: map })
+    })
+  }
+}
+
 export async function getThreadMemoryCounts(): Promise<{
   conversationEntries: number
   subjectEntries: number

@@ -2463,7 +2463,14 @@ function PlanScreen({
     // "Format painter": copy source's action+target to all OTHER checked rows.
     const otherIds = new Set([...selectedIds].filter((id) => id !== source.emailId))
     if (otherIds.size === 0) return
-    onBulkApply(otherIds, buildPropagateTransform(source))
+    // Mark painted rows userTouched (audit P2): the painter is an EXPLICIT
+    // user decision, so same-subject auto-propagation must not quietly
+    // overwrite it later. The auto-propagation path in handleItemChange
+    // deliberately does NOT set the flag (documented last-write-wins for
+    // untouched siblings) — hence the wrapper here instead of baking it
+    // into the shared transform.
+    const base = buildPropagateTransform(source)
+    onBulkApply(otherIds, (item) => ({ ...base(item), userTouched: true }))
     setSelectedIds(new Set())
   }
 
@@ -2497,6 +2504,9 @@ function PlanScreen({
     setPropagateToast({ count: targetIds.size, key: Date.now() })
   }
 
+  // Bulk 全部刪除/全部保留 set userTouched (audit P2): these are explicit
+  // user decisions — without the flag, a later same-subject auto-propagation
+  // could silently flip a bulk-保留 row back to 刪除.
   function applyDelete() {
     onBulkApply(selectedIds, (item) => ({
       ...item,
@@ -2507,6 +2517,7 @@ function PlanScreen({
       suggestedParentPath: undefined,
       source: item.source === 'rule' ? 'ai' : item.source,
       ruleId: item.source === 'rule' ? undefined : item.ruleId,
+      userTouched: true,
     }))
     setSelectedIds(new Set())
   }
@@ -2521,6 +2532,7 @@ function PlanScreen({
       suggestedParentPath: undefined,
       source: item.source === 'rule' ? 'ai' : item.source,
       ruleId: item.source === 'rule' ? undefined : item.ruleId,
+      userTouched: true,
     }))
     setSelectedIds(new Set())
   }

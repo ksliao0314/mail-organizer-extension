@@ -927,6 +927,74 @@ describe('P-1: writeFolderActivity skips chrome.storage.local.set on no-op', () 
   })
 })
 
+// ---- H1: quota-wedge recovery ---------------------------------------------
+//
+// The G3 reorder (set new payload BEFORE removing orphan chunks) meant the
+// quota check ran against new payload + stranded orphans. Near the sync
+// quota, a shrinking library could exceed that union forever — and the
+// orphan cleanup that would free the space sat after the failing set,
+// unreachable. Recovery: on a QUOTA error only, remove orphans and retry
+// the set once.
+
+describe('H1: doPush quota-wedge recovery', () => {
+  const QUOTA_ERR = 'QUOTA_BYTES quota exceeded'
+
+  async function seedLocalAndOrphans() {
+    await addRules([rule({ signal: 'wedge.com' })]) // → 1 rule chunk on push
+    // Stranded high-index chunks from an earlier, larger library.
+    await chrome.storage.sync.set({
+      syncRules_1: { index: 1, items: [] },
+      syncRules_2: { index: 2, items: [] },
+    })
+  }
+
+  it('quota failure with orphans stored → removes orphans, retries once, push succeeds', async () => {
+    await seedLocalAndOrphans()
+    const setMock = chrome.storage.sync.set as ReturnType<typeof vi.fn>
+    setMock.mockImplementationOnce(async () => {
+      throw new Error(QUOTA_ERR)
+    })
+    const r = await pushNow('test')
+    expect(r.pushed).toBe(true)
+    const cloud = await chrome.storage.sync.get(null)
+    expect(cloud['syncRules_0']).toBeDefined() // new payload landed
+    expect(cloud['syncRules_1']).toBeUndefined() // orphans freed
+    expect(cloud['syncRules_2']).toBeUndefined()
+  })
+
+  it('non-quota failure → no orphan removal, push reports failure', async () => {
+    await seedLocalAndOrphans()
+    const setMock = chrome.storage.sync.set as ReturnType<typeof vi.fn>
+    setMock.mockImplementationOnce(async () => {
+      throw new Error('network down')
+    })
+    const r = await pushNow('test')
+    expect(r.pushed).toBe(false)
+    const cloud = await chrome.storage.sync.get(null)
+    // Orphans untouched — crash-safety path must not delete chunks that a
+    // still-live old meta may reference.
+    expect(cloud['syncRules_1']).toBeDefined()
+    expect(cloud['syncRules_2']).toBeDefined()
+  })
+
+  it('quota failure persisting after orphan removal → push reports failure', async () => {
+    await seedLocalAndOrphans()
+    const setMock = chrome.storage.sync.set as ReturnType<typeof vi.fn>
+    setMock
+      .mockImplementationOnce(async () => {
+        throw new Error(QUOTA_ERR)
+      })
+      .mockImplementationOnce(async () => {
+        throw new Error(QUOTA_ERR)
+      })
+    const r = await pushNow('test')
+    expect(r.pushed).toBe(false)
+    // lastSyncAt untouched so a later retry remains possible.
+    const settings = await getSettings()
+    expect(settings.lastSyncAt).toBe('')
+  })
+})
+
 // ---- Bug #O: concurrent doPull guard -------------------------------------
 
 describe('Bug #O: doPull refuses re-entry while another pull is in flight', () => {

@@ -7,7 +7,7 @@ import type { ContentRequest, ContentResponse } from '@/shared/messages'
 
 function readMsalToken(): ContentResponse {
   const nowSec = Date.now() / 1000
-  const candidates: Array<{ secret: string; expiresOn: number }> = []
+  const candidates: Array<{ secret: string; expiresOn: number; homeAccountId: string }> = []
 
   for (const key of Object.keys(localStorage)) {
     if (!key.includes('msal')) continue
@@ -30,7 +30,11 @@ function readMsalToken(): ContentResponse {
     if (!Number.isFinite(expiresOn)) continue
     if (expiresOn <= nowSec) continue
 
-    candidates.push({ secret: val.secret, expiresOn })
+    candidates.push({
+      secret: val.secret,
+      expiresOn,
+      homeAccountId: typeof val.homeAccountId === 'string' ? val.homeAccountId : '',
+    })
   }
 
   if (candidates.length === 0) {
@@ -38,6 +42,26 @@ function readMsalToken(): ContentResponse {
       ok: false,
       code: 'NO_TOKEN',
       message: 'localStorage 內找不到有效 MSAL token，可能尚未登入或 scope 不含 Mail.ReadWrite',
+    }
+  }
+
+  // Multi-account guard (audit H4): when TWO accounts are signed into the
+  // same OWA origin, localStorage holds a Mail.ReadWrite token for BOTH.
+  // "Latest expiry" correlates with whichever account MSAL renewed most
+  // recently — NOT with the mailbox on screen — and every destructive call
+  // downstream goes to /me for whichever token wins. Picking wrong means
+  // moving/deleting mail in the OTHER account's mailbox. We can't reliably
+  // tell which mailbox the page is showing from the isolated world, so
+  // refuse outright and tell the user to sign the extra account out.
+  const distinctAccounts = new Set(
+    candidates.map((c) => c.homeAccountId).filter((id) => id !== ''),
+  )
+  if (distinctAccounts.size > 1) {
+    return {
+      ok: false,
+      code: 'MULTIPLE_ACCOUNTS',
+      message:
+        '偵測到此瀏覽器登入了多個 Microsoft 帳號。為避免整理到錯誤的信箱，請先登出其他帳號、只保留要整理的那一個，再重新載入 Outlook。',
     }
   }
 

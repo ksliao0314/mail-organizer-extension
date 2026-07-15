@@ -22,6 +22,7 @@ import {
   bumpRuleHits,
   bumpRuleOverrides,
   decodeCompound,
+  deleteRule,
   encodeCompound,
   extractCaseCodes,
   extractCourtCaseNumbers,
@@ -41,6 +42,7 @@ import {
   getRuleTombstones,
   getSettings,
   getUndoSnapshot,
+  markThreadMemoryConflicts,
   recordConversationFilings,
   recordFolderActivityFromBatch,
   recordRuleEvents,
@@ -523,8 +525,13 @@ export async function startExecute(
     // target". They're mutually exclusive per item via wasUserOverride.
     let aiConfirmedAdded = 0
     let aiOverriddenAdded = 0
+    // Rule ids minted by THIS batch's AI-confirmed learning — recorded in
+    // the undo snapshot so 撤回 can delete them (H2 learning reversal).
+    let mintedRuleIds: string[] = []
     try {
-      aiConfirmedAdded = await generateAiConfirmedRules(plan, state.results)
+      const gen = await generateAiConfirmedRules(plan, state.results)
+      aiConfirmedAdded = gen.added
+      mintedRuleIds = gen.addedIds
     } catch (e) {
       console.warn('[mail-organizer] generateAiConfirmedRules failed (non-fatal)', e)
     }
@@ -642,7 +649,7 @@ export async function startExecute(
     // via Outlook's own Deleted Items; folder cleanup would amplify undo's
     // blast radius beyond what users expect from "撤回").
     try {
-      await captureUndoSnapshot(state)
+      await captureUndoSnapshot(state, plan, mintedRuleIds)
     } catch (e) {
       console.warn('[mail-organizer] captureUndoSnapshot failed (non-fatal)', e)
     }
@@ -1227,7 +1234,7 @@ function ruleNormSignal(r: Pick<Rule, 'type' | 'signal'>): string {
 async function generateAiConfirmedRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
-): Promise<number> {
+): Promise<{ added: number; addedIds: string[] }> {
   // Snapshot of currently-enabled rules — only used for dedup checks.
   // The atomic addRulesFilteringTombstones call below ensures we don't
   // clobber concurrent writers and respects user tombstones.
@@ -1395,7 +1402,10 @@ async function generateAiConfirmedRules(
   // a concurrent deleteRule could land between filter and write, letting
   // us auto-resurrect a rule the user just deleted.
   const { added } = await addRulesFilteringTombstones(newRules)
-  return added.length
+  // Ids are threaded into the undo snapshot (H2) so 撤回 can delete the
+  // rules this batch just minted — otherwise the reverted misfiling is
+  // deterministically re-proposed next batch.
+  return { added: added.length, addedIds: added.map((r) => r.id) }
 }
 
 /**
@@ -1612,20 +1622,37 @@ export async function generateAiOverrideRules(
 
 const UNDO_ALARM_NAME = 'undo-expire'
 
-async function captureUndoSnapshot(state: ExecuteState): Promise<void> {
-  const moves = state.results
-    .filter(
-      (r) =>
-        (r.status === 'moved' || r.status === 'folder_created') &&
-        r.newMessageId &&
-        r.destinationFolderId,
-    )
-    .map((r) => ({
-      newMessageId: r.newMessageId!,
+async function captureUndoSnapshot(
+  state: ExecuteState,
+  plan: PlanItem[],
+  mintedRuleIds: string[],
+): Promise<void> {
+  // state.results is index-aligned with plan (initialState maps plan →
+  // results 1:1 and the item loop writes results[i] for plan[i]) — walk by
+  // index so each move can carry its learning-reversal keys (H2).
+  const moves: UndoSnapshot['moves'] = []
+  for (let i = 0; i < state.results.length; i++) {
+    const r = state.results[i]!
+    if (
+      (r.status !== 'moved' && r.status !== 'folder_created') ||
+      !r.newMessageId ||
+      !r.destinationFolderId
+    ) {
+      continue
+    }
+    const item = plan[i]
+    const normalized = normalizeSubject(item?.emailSubject ?? '')
+    moves.push({
+      newMessageId: r.newMessageId,
       subject: r.subject,
-      destinationFolderId: r.destinationFolderId!,
+      destinationFolderId: r.destinationFolderId,
       destinationFolderPath: r.destinationFolderPath,
-    }))
+      conversationId: item?.conversationId,
+      normalizedSubject:
+        normalized.length >= MIN_NORMALIZED_SUBJECT_LEN ? normalized : undefined,
+      ruleId: item?.source === 'rule' ? item.ruleId : undefined,
+    })
+  }
 
   if (moves.length === 0) return
 
@@ -1635,6 +1662,7 @@ async function captureUndoSnapshot(state: ExecuteState): Promise<void> {
     createdAt: now,
     expiresAt: now + UNDO_WINDOW_MS,
     moves,
+    ...(mintedRuleIds.length > 0 ? { mintedRuleIds } : {}),
     deletedCount: state.summary.deleted,
     newFolderCount: state.summary.foldersCreated,
   }
@@ -1681,12 +1709,14 @@ export async function executeUndo(api: OutlookApi): Promise<UndoResult> {
 
   const errors: UndoResult['errors'] = []
   let restored = 0
+  const restoredMoves: UndoSnapshot['moves'] = []
   await holdKeepAlive()
   try {
     for (const m of snap.moves) {
       try {
         await api.moveMessage(m.newMessageId, 'inbox')
         restored++
+        restoredMoves.push(m)
       } catch (e) {
         const message =
           e instanceof OutlookError
@@ -1696,6 +1726,48 @@ export async function executeUndo(api: OutlookApi): Promise<UndoResult> {
             : String(e)
         errors.push({ subject: m.subject, message })
       }
+    }
+
+    // ---- Learning reversal (H2) ---------------------------------------
+    // The batch flushed its learning BEFORE the undo window even opened
+    // (rule hits, thread-memory filings, freshly-minted ai_confirmed
+    // rules). Reverting only the emails left all of that in place, so the
+    // same misfiling was deterministically re-proposed next batch — and
+    // got STICKIER each cycle. Reverse it for the moves that actually
+    // restored; skip entirely when nothing came back (the mailbox still
+    // matches what was learned). Each step is independent + non-fatal.
+    if (restoredMoves.length > 0) {
+      // (a) Undo counts as an override against the driving rules — feeds
+      //     the empirical-accuracy demotion (high error rate → auto
+      //     disable), same as editing the row before execute would have.
+      const overrideTally = new Map<string, number>()
+      for (const m of restoredMoves) {
+        if (m.ruleId) overrideTally.set(m.ruleId, (overrideTally.get(m.ruleId) ?? 0) + 1)
+      }
+      if (overrideTally.size > 0) {
+        await bumpRuleOverrides(overrideTally).catch((e) =>
+          console.warn('[mail-organizer] undo override tally failed (non-fatal)', e),
+        )
+      }
+      // (b) Delete the rules THIS batch minted from AI-confirmed learning.
+      //     deleteRule writes a tombstone, so the same wrong mapping can't
+      //     be auto-re-learned next batch either.
+      for (const id of snap.mintedRuleIds ?? []) {
+        await deleteRule(id).catch((e) =>
+          console.warn('[mail-organizer] undo minted-rule delete failed (non-fatal)', e),
+        )
+      }
+      // (c) Contest the thread-memory entries this batch reinforced —
+      //     conflictCount>0 stops the pre-filter from trusting them until
+      //     they re-earn a stable streak.
+      await markThreadMemoryConflicts({
+        convIds: [...new Set(restoredMoves.map((m) => m.conversationId).filter((v): v is string => !!v))],
+        normalizedSubjects: [
+          ...new Set(restoredMoves.map((m) => m.normalizedSubject).filter((v): v is string => !!v)),
+        ],
+      }).catch((e) =>
+        console.warn('[mail-organizer] undo thread-memory contest failed (non-fatal)', e),
+      )
     }
   } finally {
     await clearUndoSnapshot()

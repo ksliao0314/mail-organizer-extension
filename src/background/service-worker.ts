@@ -413,6 +413,33 @@ chrome.runtime.onMessage.addListener(
   },
 )
 
+/**
+ * Retry a Claude API call on TRANSIENT failures (audit P2): 429 rate limit,
+ * 529 overloaded (common at peak hours), other 5xx, and network blips. Up to
+ * 2 retries with 5s → 15s backoff — mirrors the convention the Outlook layer
+ * already follows for 429. Everything else (401/403/NO_API_KEY/PARSE_ERROR)
+ * rethrows immediately: retrying won't help and the caller decides whether
+ * the error is chunk-local or run-fatal. The SW stays alive through the
+ * waits because the classify loop holds the keep-alive alarm.
+ */
+async function withClaudeTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const waitsMs = [5_000, 15_000]
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn()
+    } catch (e) {
+      const transient =
+        e instanceof ClassifierError && /^(NETWORK|HTTP_(429|5\d\d))$/.test(e.code)
+      if (!transient || attempt >= waitsMs.length) throw e
+      console.warn(
+        `[mail-organizer] Claude 暫時性錯誤 ${(e as ClassifierError).code}，` +
+          `${waitsMs[attempt]! / 1000}s 後重試 (${attempt + 1}/${waitsMs.length})`,
+      )
+      await new Promise((r) => setTimeout(r, waitsMs[attempt]))
+    }
+  }
+}
+
 async function handle(msg: AnyRequest): Promise<PopupResponse> {
   switch (msg.type) {
     // ---- Production handlers (used by popup #6) ----------------------------
@@ -1331,14 +1358,16 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
 
           for (let ci = 0; ci < chunks.length; ci++) {
             try {
-              const result = await classifyBatch(
-                {
-                  emails: chunks[ci]!,
-                  folderTree: pf.tree,
-                  excludePrefixes: settings.excludeFolderPrefixes,
-                  rules: currentRules,
-                },
-                settings,
+              const result = await withClaudeTransientRetry(() =>
+                classifyBatch(
+                  {
+                    emails: chunks[ci]!,
+                    folderTree: pf.tree,
+                    excludePrefixes: settings.excludeFolderPrefixes,
+                    rules: currentRules,
+                  },
+                  settings,
+                ),
               )
               if (result.truncated) {
                 // Audit: floor at 0. parsedCount is the PRE-dedup raw action
@@ -1397,13 +1426,20 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                 e instanceof ClassifierError
                   ? { code: `CLASSIFIER_${e.code}`, message: e.message }
                   : { code: 'AI_FAILED', message: e instanceof Error ? e.message : String(e) }
-              // Skip remaining chunks; downstream backstop turns them to skip.
-              // `chunks.slice(ci).flat()` *includes the chunk that just failed*
-              // — dedup against aiPlan so successful entries from earlier in the
-              // same chunk (or popup-pushed duplicates) don't get a phantom
-              // "skip" stub piled on top, which would skew completedEmails
-              // and downstream summary counts.
-              const remaining = chunks.slice(ci).flat()
+              // Chunk-local vs run-fatal (audit P2). PARSE_ERROR is a glitch
+              // in THIS chunk's response — stub-skip just this chunk and keep
+              // classifying the rest. Everything else (transient errors that
+              // survived the retry wrapper = service still down; 401/403 =
+              // won't recover) aborts the remaining chunks as before.
+              const chunkLocal =
+                e instanceof ClassifierError && e.code === 'PARSE_ERROR'
+              // Stub-skip the affected emails; downstream backstop keeps
+              // counts honest. The affected set *includes the chunk that just
+              // failed* — dedup against aiPlan so successful entries from
+              // earlier in the same chunk (or popup-pushed duplicates) don't
+              // get a phantom "skip" stub piled on top, which would skew
+              // completedEmails and downstream summary counts.
+              const remaining = chunkLocal ? chunks[ci]! : chunks.slice(ci).flat()
               const already = new Set(aiPlan.map((p) => p.emailId))
               const errReason = `AI 分類失敗：${aiError.code}`
               const skipStub = (m: Email): PlanItem => ({
@@ -1432,7 +1468,9 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                   }
                 }
               }
-              break
+              if (!chunkLocal) break
+              // chunk-local: fall through to the per-chunk progress write
+              // below and continue with the next chunk.
             }
 
             // After each chunk, push partial plan to progress

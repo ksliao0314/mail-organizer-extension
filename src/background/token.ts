@@ -20,7 +20,11 @@ type CachedToken = { secret: string; expiresOn: number }
 
 export type TokenResult =
   | { ok: true; secret: string; expiresOn: number }
-  | { ok: false; code: 'NO_TOKEN' | 'NOT_ON_OWA' | 'EXPIRED' | 'TAB_UNREACHABLE'; message: string }
+  | {
+      ok: false
+      code: 'NO_TOKEN' | 'NOT_ON_OWA' | 'EXPIRED' | 'TAB_UNREACHABLE' | 'MULTIPLE_ACCOUNTS'
+      message: string
+    }
 
 function nowSec(): number {
   return Date.now() / 1000
