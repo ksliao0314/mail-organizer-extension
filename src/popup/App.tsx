@@ -574,10 +574,13 @@ export default function App() {
       if (
         existing.ok &&
         existing.data &&
-        typeof existing.data.startedAt === 'number' &&
-        existing.data.startedAt > execStartedAt
+        (existing.data.done === false ||
+          (typeof existing.data.startedAt === 'number' &&
+            existing.data.startedAt > execStartedAt))
       ) {
-        return // a genuine prefetch is already running / done — leave it
+        // 活的 classify（進行中，可能是部分執行留下的）或真正的
+        // prefetch — 都不要動它。殘渣必然 done:true 且早於 execute。
+        return
       }
       if (existing.ok && existing.data) {
         // Stale residue from the batch we just executed — clear it so the
@@ -962,11 +965,17 @@ export default function App() {
     // newer ⇔ genuine prefetch; anything else gets discarded and we
     // re-classify from a fresh inbox fetch (where the ledger filter
     // handles Outlook's listing lag).
+    // 刀3 (2026-07)：done === false 的 progress 一律視為「活的」。殘渣
+    // 必然是 done:true（見上面的推導）— 但部分執行（AI 分類中先執行規則
+    // 命中）打破了「執行前 classify 必已完成」的前提：執行後 classify
+    // 仍在跑、其 startedAt 早於 execute，卻是貨真價實的進行中工作，
+    // 不能被當殘渣清掉。
     const isFreshPrefetch =
       prefetched != null &&
-      executeStartedAt != null &&
-      typeof prefetched.startedAt === 'number' &&
-      prefetched.startedAt > executeStartedAt
+      (prefetched.done === false ||
+        (executeStartedAt != null &&
+          typeof prefetched.startedAt === 'number' &&
+          prefetched.startedAt > executeStartedAt))
     if (!prefetched || !isFreshPrefetch) {
       // No prefetch available (or stale residue) — clean start.
       await send({ type: 'clearAiClassifyProgress' })
@@ -975,7 +984,27 @@ export default function App() {
     }
     // Promote the prefetched result into a plan phase. If AI is still
     // running we land in plan with aiPending so progress keeps polling.
-    const items: PlanItem[] = [...prefetched.rulePlan, ...prefetched.aiPlan]
+    //
+    // 刀3：部分執行後，progress 裡仍留著「剛剛已執行那批」的 plan 項 —
+    // 把已終局處理（移動/刪除/建夾/保留）的 email 濾掉，只讓「還沒處理
+    // 的」進入新 plan。error/cancelled 保留 — 那些信還在收件匣，該給
+    // 使用者重試的機會。
+    const executedIds = new Set(
+      phase.kind === 'done'
+        ? phase.state.results
+            .filter(
+              (r) =>
+                r.status === 'moved' ||
+                r.status === 'deleted' ||
+                r.status === 'folder_created' ||
+                r.status === 'skipped',
+            )
+            .map((r) => r.emailId)
+        : [],
+    )
+    const items: PlanItem[] = [...prefetched.rulePlan, ...prefetched.aiPlan].filter(
+      (i) => !executedIds.has(i.emailId),
+    )
     if (items.length === 0 && prefetched.done) {
       // Edge case: prefetch completed but inbox was empty — fall through.
       await send({ type: 'clearAiClassifyProgress' })
@@ -2362,8 +2391,10 @@ function PlanScreen({
         return
       }
 
-      // Pause the rest of the shortcuts while AI is still classifying
-      if (aiPending) return
+      // 刀3 (UI/UX 檢討 2026-07)：AI 分類中不再封鎖鍵盤 — 律師每批開頭
+      // 有 30-60 秒盯著已可審的規則命中列卻按不了 j/k/d/s，一天 2-3 批
+      // 就是每天數分鐘死時間。安全性：focusedIndex 對 displayItems.length
+      // 有 clamp，AI 結果只會 append、不會位移既有 index。
 
       // F15 (2026-06-03): navigate the VISIBLE list (displayItems), not
       // filteredItems. Rows are rendered from displayItems, which omits
@@ -3049,9 +3080,23 @@ function PlanScreen({
               含 {counts.delete} 件刪除・可回復
             </span>
           )}
-          <Button onClick={onConfirmExecute} disabled={movableValid === 0 || !!aiPending}>
-            <Play /> {aiPending ? '等 AI 完成…' : `執行 ${movableValid} 個`}
-          </Button>
+          {/* 刀3：AI 分類中不再鎖死執行 — 已完成的（規則命中＋已分類的
+              AI 項）可先執行，剩餘的分類繼續在背景跑，完成後從「繼續歸檔」
+              接手（consume 路徑會濾掉已執行的信）。 */}
+          {aiPending ? (
+            <Button
+              variant="outline"
+              onClick={onConfirmExecute}
+              disabled={movableValid === 0}
+              title="AI 還在分類剩餘郵件 — 先執行目前清單，分類完成後可從「繼續歸檔」接續處理其餘郵件"
+            >
+              <Play /> 先執行 {movableValid} 個
+            </Button>
+          ) : (
+            <Button onClick={onConfirmExecute} disabled={movableValid === 0}>
+              <Play /> 執行 {movableValid} 個
+            </Button>
+          )}
         </div>
       </div>
     </div>

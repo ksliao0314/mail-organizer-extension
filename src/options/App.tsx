@@ -328,6 +328,23 @@ export default function App() {
     window.location.hash = 'rules-library/all'
   }, [])
 
+  // 刀3 (2026-07)：popup 判斷依據面板的「編輯這條規則 →」深連結。popup
+  // 以 chrome.tabs.create 開 options 並帶 ?edit=<ruleId>；這裡消費一次
+  // 後從網址移除（replaceState），避免重新整理時再度彈出編輯抽屜。
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const editId = params.get('edit')
+    if (!editId) return
+    requestEditRule(editId)
+    params.delete('edit')
+    const qs = params.toString()
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`,
+    )
+  }, [requestEditRule])
+
   const refresh = useCallback(async () => {
     const r = await send<StatusData>({ type: 'getStatus' })
     if (r.ok && r.data) {

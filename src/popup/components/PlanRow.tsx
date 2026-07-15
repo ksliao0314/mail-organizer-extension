@@ -605,6 +605,24 @@ export function RuleTraceBlock({
           {item.reason && (
             <div className="italic text-muted-foreground">{item.reason}</div>
           )}
+          {/* 刀3 (2026-07)：編輯出口。舊動線「這封為什麼跑去那裡→修規則」
+              要 7+ 步（換頁、手動搜尋、還可能被預設篩選擋住）；現在一鍵
+              開 options 並直接彈出該規則的編輯抽屜（?edit= 深連結）。 */}
+          <div className="pt-1 flex items-center gap-2 flex-wrap">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-[10px]"
+              onClick={() => {
+                void chrome.tabs.create({
+                  url: `${chrome.runtime.getURL('src/options/index.html')}?edit=${encodeURIComponent(mr.id)}#rules-library/all`,
+                })
+              }}
+              title="開啟規則庫並直接編輯這條規則"
+            >
+              編輯這條規則 →
+            </Button>
+          </div>
           {onToggleRule && mr.enabled && !localDisabled && (
             <div className="pt-1">
               <Button
