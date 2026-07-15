@@ -1417,6 +1417,24 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           }
 
           for (let ci = 0; ci < chunks.length; ci++) {
+            // Full-body fetch (batch-3): ONLY the conversation reps that
+            // actually reach Claude get their UniqueBody pulled, so body case
+            // numbers surface in the prompt (B3-C4) and can sink into learning
+            // (B3-C6). Rule/thread-routed mail and non-rep siblings are never
+            // fetched — this single subset gate is what bounds the extra Graph
+            // round-trips + token cost. Fail-soft: on error the email keeps
+            // only its 250-char BodyPreview. The undefined-guard makes SW-
+            // restart recovery re-runs idempotent.
+            await Promise.all(
+              chunks[ci]!.map(async (m) => {
+                if (m.bodyText !== undefined) return
+                try {
+                  m.bodyText = await api.getMessageBody(m.Id)
+                } catch (e) {
+                  console.warn('[mail-organizer] getMessageBody failed (non-fatal)', m.Id, e)
+                }
+              }),
+            )
             try {
               const result = await withClaudeTransientRetry(() =>
                 classifyBatch(
