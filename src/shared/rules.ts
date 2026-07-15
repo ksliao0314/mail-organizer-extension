@@ -23,6 +23,7 @@ import {
 import type {
   Email,
   MailFolderNode,
+  PlanItem,
   Rule,
   RuleEvent,
   RuleSnapshot,
@@ -1648,6 +1649,86 @@ export function courtCaseSignal(signal: string): string | null {
     if (cleanType) return `${year}${cleanType}${num}`
   }
   return null
+}
+
+// ---- Body case-number gate (batch-3) ---------------------------------------
+//
+// Email bodies are far noisier than subjects — they quote prior cases
+// ("參照 111上YY"), mention the opponent's OTHER case ("相對人另案 112訴XX"),
+// cite attachments. So the SINGLE gate below, shared by BOTH the matching side
+// (rules) and the learning side (execute), enforces the conservative policy:
+//   1. Subject-first: if the subject carries ANY structured case identifier,
+//      use ONLY those and ignore the body entirely.
+//   2. Body only as fallback, and only structured IDs (court-case / case_code)
+//      — full-subject needles never touch the body (catastrophic false match).
+//   3. `bodyAmbiguous` flags >1 distinct body identifier so the learning side
+//      can refuse to mint a rule (matching may still use them; learning won't).
+// Making this ONE function is the core alignment point: it stops the learning
+// side from minting a rule the matching side would never fire (which the stale
+// sweep would then hard-delete after 100 days).
+
+export type EligibleCaseSignals = {
+  courtCases: string[]
+  caseCodes: string[]
+  source: 'subject' | 'body' | 'none'
+  /** Body carried >1 distinct case identifier — too ambiguous to learn from. */
+  bodyAmbiguous: boolean
+}
+
+export function gateCaseSignals(
+  subjectCourt: string[],
+  subjectCodes: string[],
+  bodyCourt: string[],
+  bodyCodes: string[],
+): EligibleCaseSignals {
+  if (subjectCourt.length > 0 || subjectCodes.length > 0) {
+    return {
+      courtCases: subjectCourt,
+      caseCodes: subjectCodes,
+      source: 'subject',
+      bodyAmbiguous: false,
+    }
+  }
+  const distinct = new Set([...bodyCourt, ...bodyCodes])
+  if (distinct.size === 0) {
+    return { courtCases: [], caseCodes: [], source: 'none', bodyAmbiguous: false }
+  }
+  return {
+    courtCases: bodyCourt,
+    caseCodes: bodyCodes,
+    source: 'body',
+    bodyAmbiguous: distinct.size > 1,
+  }
+}
+
+/** Matching-side view. Body input degrades gracefully: `bodyText` (800 chars,
+ *  AI bucket) when present, else the 250-char `BodyPreview` already on hand. */
+export function caseSignalsForMatch(
+  email: Pick<Email, 'Subject' | 'bodyText' | 'BodyPreview'>,
+): EligibleCaseSignals {
+  const body = email.bodyText ?? email.BodyPreview ?? ''
+  return gateCaseSignals(
+    extractCourtCaseNumbers(email.Subject ?? ''),
+    extractCaseCodes(email.Subject ?? ''),
+    extractCourtCaseNumbers(body),
+    extractCaseCodes(body),
+  )
+}
+
+/** Learning-side view. Body identifiers are pre-computed at classify time into
+ *  `bodyCaseNumbers`/`bodyCaseCodes` (from the full 800-char bodyText); fall
+ *  back to re-extracting from `bodyPreview` for plan items that lack them. */
+export function caseSignalsForLearning(
+  item: Pick<PlanItem, 'emailSubject' | 'bodyCaseNumbers' | 'bodyCaseCodes' | 'bodyPreview'>,
+): EligibleCaseSignals {
+  const bodyCourt = item.bodyCaseNumbers ?? extractCourtCaseNumbers(item.bodyPreview ?? '')
+  const bodyCodes = item.bodyCaseCodes ?? extractCaseCodes(item.bodyPreview ?? '')
+  return gateCaseSignals(
+    extractCourtCaseNumbers(item.emailSubject ?? ''),
+    extractCaseCodes(item.emailSubject ?? ''),
+    bodyCourt,
+    bodyCodes,
+  )
 }
 
 // Whitespace-collapse (folds U+3000 ideographic space, NBSP, runs of ASCII

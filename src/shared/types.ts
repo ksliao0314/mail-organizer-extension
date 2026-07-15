@@ -25,6 +25,13 @@ export type Email = {
   Subject: string
   BodyPreview: string
   /**
+   * Normalised plain-text body (batch-3). Fetched on demand via
+   * `getMessageBody` (UniqueBody, Prefer:text) ONLY for the AI-bucket subset —
+   * emails that miss rules/thread and go to Claude. Absent on list results and
+   * rule/thread-routed mail; consumers use `bodyText ?? BodyPreview`.
+   */
+  bodyText?: string
+  /**
    * Outlook's conversation grouping — all messages in the same email
    * thread share this. Smart batching groups by this so Claude only
    * classifies the representative of each conversation.
@@ -142,6 +149,15 @@ export type PlanItem = {
    * can show inline preview on row expand without an extra round-trip.
    */
   bodyPreview?: string
+  /**
+   * Case identifiers extracted from the email BODY at classify time (batch-3),
+   * from the 800-char bodyText — kept separate from subject identifiers so the
+   * learning loop can apply the stricter body gate (subject-first, distinct===1,
+   * lower confidence). Empty/absent when the subject already carried a case
+   * number (body is then ignored) or none was found.
+   */
+  bodyCaseNumbers?: string[]
+  bodyCaseCodes?: string[]
   /**
    * Outlook's `ConversationId` — used by smart batching to send only one
    * representative email per thread to Claude. Siblings inherit the AI's
