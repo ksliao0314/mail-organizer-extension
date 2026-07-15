@@ -80,6 +80,7 @@ import {
   toggleRule,
   upsertRule,
 } from '@/shared/rules'
+import { filterHarvestCandidates, type HarvestScanItem } from '@/background/harvest'
 import {
   applyImport,
   type ImportStrategy,
@@ -97,7 +98,9 @@ import {
   getFolderActivity,
   getFolderActivityRefreshAt,
   getFolderCache,
+  getLastHarvestAt,
   getMetrics,
+  getMovedByUsLedger,
   getRecentlyProcessedIds,
   getRuleEvents,
   getRuleTombstones,
@@ -109,8 +112,11 @@ import {
   getUndoSnapshot,
   getWeeklyDigestState,
   mergeFolderActivityScan,
+  recordConversationFilings,
   recordRuleEvents,
+  recordSubjectFilings,
   setFolderActivityRefreshAt,
+  setLastHarvestAt,
   setFolderCache,
   setSettings,
   setWeeklyDigestState,
@@ -758,6 +764,109 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       }
     }
 
+    case 'harvestManualFilings': {
+      // Manual-filing harvester (opt-in). Scans case folders for mail the
+      // lawyer filed by hand in Outlook (ordered by LastModifiedDateTime so
+      // recently-MOVED — not recently-received — mail surfaces), filters out
+      // our own moves / rule-covered / already-known routes, and feeds what's
+      // left into thread-memory as HARVESTED (soft hint, never auto-route,
+      // never a rule). Decoupled from refreshFolderActivity (quick-jump).
+      try {
+        const settings = await getSettings()
+        if (!settings.harvestEnabled) {
+          return { ok: true, data: { scannedFolders: 0, candidates: 0, disabled: true } }
+        }
+        const cache = await getFolderCache()
+        if (!cache) return { ok: false, code: 'NO_CACHE', message: '尚未抓過資料夾、請先跑一次歸類' }
+        const tok = await getOwaToken()
+        if (!tok.ok) return { ok: false, code: 'NO_TOKEN', message: '無法取得 OWA token' }
+        const rootPath = settings.primaryRootPath
+        if (!rootPath) {
+          return { ok: false, code: 'NO_ROOT_CONFIGURED', message: '尚未設定主要根資料夾' }
+        }
+        const root = flattenFolderTree(cache.tree).find((f) => f.path === rootPath)
+        if (!root) return { ok: false, code: 'NO_ROOT', message: `找不到「${rootPath}」根目錄` }
+        const targets: MailFolderNode[] = []
+        const collectLeaves = (nodes: MailFolderNode[]): void => {
+          for (const n of nodes) {
+            if (n.children.length === 0) targets.push(n)
+            else collectLeaves(n.children)
+          }
+        }
+        collectLeaves(root.children)
+        const excludes = settings.excludeFolderPrefixes
+        const HARVEST_SCAN_CAP = 200
+        const limited = targets
+          .filter((n) => !excludes.some((p) => n.path.startsWith(p)))
+          .slice(0, HARVEST_SCAN_CAP)
+        const lastHarvestAt = await getLastHarvestAt()
+        // $filter skips folders unchanged since the last harvest (server-side
+        // empty) — the key cost control that offsets top:10.
+        const filter = lastHarvestAt ? `LastModifiedDateTime gt ${lastHarvestAt}` : undefined
+        const scanned: HarvestScanItem[] = []
+        let scannedFolders = 0
+        let errored = 0
+        for (const node of limited) {
+          try {
+            const msgs = await api.listFolderMessages(node.id, {
+              top: 10,
+              select: 'Id,Subject,From,ConversationId,LastModifiedDateTime',
+              orderby: 'LastModifiedDateTime desc',
+              ...(filter ? { filter } : {}),
+            })
+            for (const m of msgs) {
+              scanned.push({
+                id: m.Id,
+                subject: m.Subject ?? '',
+                from: m.From?.EmailAddress?.Address,
+                conversationId: m.ConversationId,
+                folderId: node.id,
+                folderPath: node.path,
+              })
+            }
+            scannedFolders++
+          } catch (e) {
+            errored++
+            console.warn(`[mail-organizer] harvest scan failed for ${node.path}`, e)
+          }
+        }
+        const [rules, movedByUs, convMemory, subjectMemory] = await Promise.all([
+          listRules(),
+          getMovedByUsLedger(),
+          getConversationMemory(),
+          getSubjectMemory(),
+        ])
+        const candidates = filterHarvestCandidates(scanned, {
+          movedByUs,
+          ruleIndex: buildRuleIndex(rules),
+          convMemory,
+          subjectMemory,
+        })
+        const convFilings = candidates
+          .filter((c) => c.conversationId)
+          .map((c) => ({ convId: c.conversationId!, folderId: c.folderId, folderPath: c.folderPath }))
+        const subjectFilings = candidates
+          .filter((c) => c.normalizedSubject)
+          .map((c) => ({
+            normalizedSubject: c.normalizedSubject!,
+            folderId: c.folderId,
+            folderPath: c.folderPath,
+          }))
+        if (convFilings.length > 0) await recordConversationFilings(convFilings, { harvested: true })
+        if (subjectFilings.length > 0) await recordSubjectFilings(subjectFilings, { harvested: true })
+        // Advance the watermark only when at least one folder scanned OK, so a
+        // transient token/network failure doesn't skip the window next time.
+        if (scannedFolders > 0) await setLastHarvestAt(new Date().toISOString())
+        return { ok: true, data: { scannedFolders, errored, candidates: candidates.length } }
+      } catch (e) {
+        return {
+          ok: false,
+          code: 'HARVEST_ERROR',
+          message: e instanceof Error ? e.message : String(e),
+        }
+      }
+    }
+
     case 'getOnboardingState': {
       // First-run wizard decision logic. The popup needs to distinguish
       // THREE cases on a fresh machine:
@@ -1103,7 +1212,11 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
             // decide rather than auto-routing to the latest target.
             // conflictCount earns its way back to 0 via DECAY_AFTER_STABLE
             // consecutive same-folder filings (see recordConversationFilings).
-            if (e && (e.conflictCount ?? 0) === 0) {
+            // `!e.harvested`: a harvested-only entry (inferred from Outlook
+            // drag-drop, never plan-reviewed) is NOT trusted for auto-route —
+            // it only surfaces as a soft hint below until a real filing
+            // confirms it.
+            if (e && (e.conflictCount ?? 0) === 0 && !e.harvested) {
               const node = folderIndex.get(e.folderId)
               if (node) {
                 return {
@@ -1118,7 +1231,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           const norm = normalizeSubject(m.Subject ?? '')
           if (norm.length >= MIN_NORMALIZED_SUBJECT_LEN) {
             const e = subjectMemory[norm]
-            if (e && (e.conflictCount ?? 0) === 0) {
+            if (e && (e.conflictCount ?? 0) === 0 && !e.harvested) {
               const node = folderIndex.get(e.folderId)
               if (node) {
                 return {
@@ -1144,6 +1257,9 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
             if (e) {
               const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
               if (path) {
+                if (e.harvested && (e.conflictCount ?? 0) === 0) {
+                  return `依你在 Outlook 的手動歸檔，此對話近期歸於「${path}」（僅供參考）`
+                }
                 return (e.conflictCount ?? 0) > 0
                   ? `此對話近期在「${path}」與其他資料夾間擺盪、歸屬不穩定（僅供參考）`
                   : `此對話近期曾歸於「${path}」（僅供參考）`
@@ -1155,7 +1271,11 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
             const e = subjectMemory[norm]
             if (e) {
               const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
-              if (path) return `同主旨郵件近期曾歸於「${path}」（僅供參考）`
+              if (path) {
+                return e.harvested
+                  ? `依你在 Outlook 的手動歸檔，同主旨郵件近期歸於「${path}」（僅供參考）`
+                  : `同主旨郵件近期曾歸於「${path}」（僅供參考）`
+              }
             }
           }
           return null

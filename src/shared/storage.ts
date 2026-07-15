@@ -580,6 +580,21 @@ export async function addToMovedByUsLedger(entries: MovedByUsEntry[]): Promise<v
   })
 }
 
+// Timestamp of the last manual-filing harvest — the harvester's $filter uses
+// it (`LastModifiedDateTime gt lastHarvestAt`) so each run only scans folders
+// that changed since, and unchanged folders return empty server-side.
+const KEY_LAST_HARVEST_AT = 'lastHarvestAt'
+
+export async function getLastHarvestAt(): Promise<string | null> {
+  const r = await chrome.storage.local.get(KEY_LAST_HARVEST_AT)
+  const v = r[KEY_LAST_HARVEST_AT]
+  return typeof v === 'string' ? v : null
+}
+
+export async function setLastHarvestAt(iso: string): Promise<void> {
+  await chrome.storage.local.set({ [KEY_LAST_HARVEST_AT]: iso })
+}
+
 // ---- Rule tombstones -------------------------------------------------------
 
 export async function getRuleTombstones(): Promise<RuleTombstone[]> {
@@ -1056,6 +1071,7 @@ export async function getSubjectMemory(): Promise<ThreadMemoryMap> {
  */
 export async function recordConversationFilings(
   filings: Array<{ convId: string; folderId: string; folderPath: string }>,
+  opts: { harvested?: boolean } = {},
 ): Promise<void> {
   if (filings.length === 0) return
   await withConversationMemoryLock(async () => {
@@ -1063,7 +1079,7 @@ export async function recordConversationFilings(
     const now = new Date().toISOString()
     for (const f of filings) {
       if (!f.convId) continue
-      map[f.convId] = nextThreadMemoryEntry(map[f.convId], f.folderId, f.folderPath, now)
+      map[f.convId] = nextThreadMemoryEntry(map[f.convId], f.folderId, f.folderPath, now, opts.harvested === true)
     }
     const pruned = pruneThreadMemory(map, CONVERSATION_MEMORY_CAP)
     await chrome.storage.local.set({ [KEY_CONVERSATION_MEMORY]: pruned })
@@ -1086,9 +1102,16 @@ function nextThreadMemoryEntry(
   folderId: string,
   folderPath: string,
   now: string,
+  harvested = false,
 ): ThreadMemoryEntry {
+  // An entry stays "harvested-only" iff EVERY filing so far was harvested. Any
+  // real (plan-reviewed) filing confirms the route and permanently clears the
+  // flag; a later harvest filing on a confirmed entry does NOT re-flag it.
+  const harvestedFlag = harvested && (!prev || prev.harvested === true)
+  const withHarvest = (e: ThreadMemoryEntry): ThreadMemoryEntry =>
+    harvestedFlag ? { ...e, harvested: true } : e
   if (!prev) {
-    return { folderId, folderPath, lastFiledAt: now, timesFiled: 1, conflictCount: 0, stableStreak: 1 }
+    return withHarvest({ folderId, folderPath, lastFiledAt: now, timesFiled: 1, conflictCount: 0, stableStreak: 1 })
   }
   const timesFiled = prev.timesFiled + 1
   let conflictCount = prev.conflictCount ?? 0
@@ -1115,7 +1138,7 @@ function nextThreadMemoryEntry(
   // Fully rehabilitated → forget the nest pointer.
   if (conflictCount === 0) previousFolderId = undefined
 
-  return {
+  return withHarvest({
     folderId,
     folderPath,
     lastFiledAt: now,
@@ -1123,7 +1146,7 @@ function nextThreadMemoryEntry(
     conflictCount,
     stableStreak,
     ...(previousFolderId != null ? { previousFolderId } : {}),
-  }
+  })
 }
 
 /**
@@ -1145,6 +1168,7 @@ function nextThreadMemoryEntry(
 
 export async function recordSubjectFilings(
   filings: Array<{ normalizedSubject: string; folderId: string; folderPath: string }>,
+  opts: { harvested?: boolean } = {},
 ): Promise<void> {
   if (filings.length === 0) return
   await withSubjectMemoryLock(async () => {
@@ -1157,6 +1181,7 @@ export async function recordSubjectFilings(
         f.folderId,
         f.folderPath,
         now,
+        opts.harvested === true,
       )
     }
     const pruned = pruneThreadMemory(map, SUBJECT_MEMORY_CAP)

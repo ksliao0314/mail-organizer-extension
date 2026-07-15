@@ -327,6 +327,13 @@ export type Settings = {
    */
   aiIncludeFewShotExamples: boolean
   /**
+   * Manual-filing harvester (opt-in, default off). When on, the tool scans
+   * case folders for mail you filed by hand in Outlook and feeds the routing
+   * into thread-memory (soft, non-authoritative — surfaced as a hint, never an
+   * auto-route or a rule). Local-only, never synced.
+   */
+  harvestEnabled?: boolean
+  /**
    * Cross-machine sync via the browser's account sync (chrome.storage.sync).
    * Disabled by default — opt-in via Options UI. Sync covers:
    *   - rules where source !== 'auto_scan' (auto_scan re-derived per machine
@@ -450,6 +457,14 @@ export type ThreadMemoryEntry = {
    * again). Cleared once conflictCount decays back to 0.
    */
   previousFolderId?: string
+  /**
+   * True when EVERY filing for this key so far came from the manual-filing
+   * harvester (inferred from Outlook drag-drop), never from a plan the lawyer
+   * reviewed. Harvested-only entries are NOT trusted for auto-route even at
+   * conflictCount===0 — they only surface as a soft "依你近期手動歸檔" hint,
+   * until a real plan-review filing confirms the route and clears this flag.
+   */
+  harvested?: boolean
 }
 
 /**
@@ -558,6 +573,7 @@ export const DEFAULT_SETTINGS: Settings = {
   primaryRootPath: '',
   internalSubjectCategories: [],
   aiIncludeFewShotExamples: true,
+  harvestEnabled: false,
   syncEnabled: false,
   syncMachineId: '',
   lastSyncAt: '',
