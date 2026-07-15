@@ -167,6 +167,16 @@ export type PlanItem = {
    */
   threadMatch?: { kind: 'convId' | 'subject'; previousFolderPath: string }
   /**
+   * Set on a `thread`-routed item when a broad rule (domain / sender /
+   * subject_keyword) ALSO matched and agreed on the same destination (優化
+   * 2026-07). Thread precedence hides that rule, so its matchCount /
+   * lastUsedAt would freeze and the 100-day stale sweep would eventually
+   * hard-delete it — even though it's been silently correct all along.
+   * execute credits a hit to this rule (when the item is un-edited) so a
+   * consistently-agreeing rule survives.
+   */
+  agreeingRuleId?: string
+  /**
    * Captured at rule-match time and preserved across user edits even
    * after `source` flips to 'ai'. Lets execute attribute "user overrode
    * this rule" back to the original rule, so we can track empirical
@@ -415,6 +425,15 @@ export type ThreadMemoryEntry = {
    * earn back its routing fallback after an accidental cross-filing.
    */
   stableStreak?: number
+  /**
+   * The folder this key routed to BEFORE the most recent conflict (優化
+   * 2026-07). When a subsequent filing returns to this folder ("回巢"), we
+   * treat it as the thread reverting to its established home rather than a
+   * SECOND conflict — so a single legitimate cross-folder filing doesn't
+   * double-penalize (A→B counts once; the A→…→A return no longer counts
+   * again). Cleared once conflictCount decays back to 0.
+   */
+  previousFolderId?: string
 }
 
 /**

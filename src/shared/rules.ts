@@ -1088,9 +1088,18 @@ export const TYPE_PRIORITY: Record<RuleType, number> = {
  *
  * Tests in tests/rules.test.ts pin this contract.
  */
-export function ruleBeatsThread(rule: Pick<Rule, 'type' | 'source'>): boolean {
+export function ruleBeatsThread(
+  rule: Pick<Rule, 'type' | 'source'> & { signal?: string },
+): boolean {
   if (rule.type === 'case_code' || rule.type === 'compound') return true
   if (rule.source === 'user_manual') return true
+  // A subject_keyword rule whose signal IS a court case number is a
+  // structural unique identifier — treat it like case_code so it wins over
+  // thread memory (優化 2026-07). All auto-learned court-case rules are the
+  // subject_keyword type (chooseLearningSignal P2).
+  if (rule.type === 'subject_keyword' && rule.signal && courtCaseSignal(rule.signal)) {
+    return true
+  }
   return false
 }
 
@@ -1119,6 +1128,16 @@ export function matchEmail(email: Email, rules: Rule[]): MatchOutcome | null {
 export type RuleIndex = {
   caseCodeRules: Rule[]
   compoundRules: Rule[]
+  /**
+   * subject_keyword rules whose signal IS a court case number (優化
+   * 2026-07). Kept in their own bucket and matched AFTER compound but
+   * BEFORE domain — a structural unique identifier must outrank a broad
+   * plain-domain rule (the same-client-multiple-cases hole). This bucket
+   * order INTENTIONALLY diverges from TYPE_PRIORITY (subject_keyword=4);
+   * compareRulePriority still sorts these as priority 4 for within-library
+   * ordering, only the match path elevates them.
+   */
+  courtCaseSubjectRules: Rule[]
   /** Map from normalized domain → rules targeting that domain. Sorted by priority. */
   domainMap: Map<string, Rule[]>
   /** Subject-keyword rules sorted by effective confidence desc (no easy index). */
@@ -1132,6 +1151,7 @@ export function buildRuleIndex(rules: Rule[]): RuleIndex {
   const index: RuleIndex = {
     caseCodeRules: [],
     compoundRules: [],
+    courtCaseSubjectRules: [],
     domainMap: new Map(),
     subjectKeywordRules: [],
     senderMap: new Map(),
@@ -1171,7 +1191,10 @@ export function buildRuleIndex(rules: Rule[]): RuleIndex {
         break
       }
       case 'subject_keyword':
-        index.subjectKeywordRules.push(r)
+        // Pure court-case-number subject rules go in their own high-priority
+        // bucket (優化 2026-07); everything else stays a plain subject rule.
+        if (courtCaseSignal(r.signal)) index.courtCaseSubjectRules.push(r)
+        else index.subjectKeywordRules.push(r)
         break
       case 'sender': {
         const s = r.signal.toLowerCase().trim()
@@ -1189,6 +1212,9 @@ export function buildRuleIndex(rules: Rule[]): RuleIndex {
   // Re-sort subject_keyword bucket by longest-signal-first. Other
   // buckets already have the right sort from `compareRulePriority`.
   index.subjectKeywordRules.sort(subjectKeywordSort)
+  // Court-case bucket: distinct case numbers rarely collide, but keep the
+  // same longest-first / confidence sort for determinism.
+  index.courtCaseSubjectRules.sort(subjectKeywordSort)
   return index
 }
 
@@ -1227,6 +1253,14 @@ export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcom
   // compound (priority 2)
   for (const r of index.compoundRules) {
     const reason = matchCompound(r.signal, email)
+    if (reason) return { rule: r, reason }
+  }
+  // court-case subject rules (優化 2026-07) — checked here, between compound
+  // and domain, so a structural case-number identifier outranks a broad
+  // plain-domain rule (same-client-multiple-cases: 主旨帶 B 案案號的信不再
+  //被 @client.com→A 案規則搶先誤歸).
+  for (const r of index.courtCaseSubjectRules) {
+    const reason = matchSubjectKeyword(r.signal, email)
     if (reason) return { rule: r, reason }
   }
   // domain (priority 3) — O(K) where K = email address count (≤ 6 normally)
@@ -1379,7 +1413,26 @@ function matchSender(address: string, email: Email): string | null {
 
 function matchSubjectKeyword(keyword: string, email: Email): string | null {
   if (!keyword || !email.Subject) return null
-  if (email.Subject.toLowerCase().includes(keyword.toLowerCase())) {
+  // Canonical case-number equivalence (優化 2026-07): the learning side
+  // stores the COMPACT form (「112訴304」) but official court notices use the
+  // FULL form (「112年度訴字第304號」). Plain substring never matched across
+  // the two forms — so a case-number rule couldn't even match the notice
+  // that taught it, and (never firing) got hard-deleted by the 100-day
+  // stale sweep. When the signal IS a pure case number, compare against the
+  // subject's extracted case-number set instead.
+  const cc = courtCaseSignal(keyword)
+  if (cc) {
+    if (extractCourtCaseNumbers(email.Subject).includes(cc)) {
+      return `主旨含案號「${cc}」`
+    }
+    // fall through — the exact literal might still appear verbatim
+  }
+  // Whitespace-collapsed + digit-boundary-aware substring. Collapse fixes
+  // learn-side normalized / match-side raw whitespace mismatches; the
+  // boundary stops 「112訴20」 from matching 「112訴204」.
+  const hay = collapseSubjectWhitespace(email.Subject.toLowerCase())
+  const needle = collapseSubjectWhitespace(keyword.toLowerCase())
+  if (subjectIncludesBoundary(hay, needle)) {
     return `主旨含「${keyword}」`
   }
   return null
@@ -1518,27 +1571,45 @@ export function extractCaseCodes(text: string): string[] {
 // we reject the match — it's almost certainly a date expression that
 // happened to fit the shape (e.g. "112年5月" looks like compact form).
 
-const COURT_CASE_COMPACT_RE = /(?<!\d)(1\d{2})([一-龥]{1,5})(\d{1,5})(?!\d)/g
-const COURT_CASE_FULL_RE = /(?<!\d)(1\d{2})年(?:度)?([一-龥]{1,5}?)字?第(\d{1,5})號?/g
+// Case-type char class allows full-width / half-width parentheses so
+// 分案字別 like 「訴更(一)字」/「訴更（一）」 are captured; normalizeCaseType
+// strips the parens back out so the canonical compact form is 「訴更一」.
+const COURT_CASE_COMPACT_RE = /(?<!\d)(1\d{2})([一-龥（）()]{1,5})(\d{1,5})(?!\d)/g
+const COURT_CASE_FULL_RE = /(?<!\d)(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字?第(\d{1,5})號?/g
 const DATE_STOPWORD_RE = /[年月日時分秒週]/
+
+// Anchored variants — used to test whether a whole SIGNAL string *is* a
+// court case number (vs merely contains one). A full-subject signal that
+// embeds a case number (e.g. 「112訴204 通知會議」) must NOT be treated as a
+// case-number signal — it keeps plain substring semantics.
+const COURT_CASE_COMPACT_ANCHOR = /^(1\d{2})([一-龥（）()]{1,5})(\d{1,5})$/
+const COURT_CASE_FULL_ANCHOR = /^(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字?第(\d{1,5})號?$/
+
+/** Fold full-width digits (０-９, U+FF10–FF19) to ASCII so Taiwanese court
+ *  e-notices that use full-width numerals normalize to the same canonical
+ *  form as half-width. */
+function foldFullWidthDigits(text: string): string {
+  return text.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xff10 + 0x30))
+}
 
 /**
  * Normalize a captured case-type segment by dropping the 字 / 第 connectors
- * that some forms include but the compact form omits. e.g. "上字第" → "上",
- * "訴字" → "訴". If stripping leaves an empty string the case has no real
- * type name and we reject it.
+ * and any parentheses that some forms include but the compact form omits.
+ * e.g. "上字第" → "上", "訴字" → "訴", "訴更(一)字" → "訴更一". If stripping
+ * leaves an empty string the case has no real type name and we reject it.
  */
 function normalizeCaseType(type: string): string {
-  return type.replace(/[字第]/g, '')
+  return type.replace(/[字第（）()]/g, '')
 }
 
 export function extractCourtCaseNumbers(text: string): string[] {
   if (!text) return []
+  const folded = foldFullWidthDigits(text)
   const cases = new Set<string>()
   // Full form first (anchors on 年/字/第 keywords are unambiguous) so we
   // don't mis-extract from substrings that the compact pattern could also
   // match.
-  for (const m of text.matchAll(COURT_CASE_FULL_RE)) {
+  for (const m of folded.matchAll(COURT_CASE_FULL_RE)) {
     const [, year, type, num] = m
     if (!year || !type || !num) continue
     if (DATE_STOPWORD_RE.test(type)) continue
@@ -1546,7 +1617,7 @@ export function extractCourtCaseNumbers(text: string): string[] {
     if (!cleanType) continue
     cases.add(`${year}${cleanType}${num}`)
   }
-  for (const m of text.matchAll(COURT_CASE_COMPACT_RE)) {
+  for (const m of folded.matchAll(COURT_CASE_COMPACT_RE)) {
     const [, year, type, num] = m
     if (!year || !type || !num) continue
     if (DATE_STOPWORD_RE.test(type)) continue
@@ -1555,6 +1626,64 @@ export function extractCourtCaseNumbers(text: string): string[] {
     cases.add(`${year}${cleanType}${num}`)
   }
   return [...cases]
+}
+
+/**
+ * If `signal` IS (not merely contains) a single court case number — in
+ * compact 「112訴304」 or full 「112年度訴字第304號」 form — return its
+ * canonical compact form; else null. This gates the canonical-equivalence
+ * matching below so only pure case-number rules get cross-form matching;
+ * full-subject signals that happen to embed a case number keep substring
+ * semantics. Cheap: two anchored regexes, no allocation on the common miss.
+ */
+export function courtCaseSignal(signal: string): string | null {
+  const s = foldFullWidthDigits(signal.trim())
+  for (const re of [COURT_CASE_COMPACT_ANCHOR, COURT_CASE_FULL_ANCHOR]) {
+    const m = re.exec(s)
+    if (!m) continue
+    const [, year, type, num] = m
+    if (!year || !type || !num) continue
+    if (DATE_STOPWORD_RE.test(type)) continue
+    const cleanType = normalizeCaseType(type)
+    if (cleanType) return `${year}${cleanType}${num}`
+  }
+  return null
+}
+
+// Whitespace-collapse (folds U+3000 ideographic space, NBSP, runs of ASCII
+// space — all common in Taiwanese official mail) so a signal learned from a
+// subject with odd spacing still matches. `\s` in JS already covers U+3000
+// and U+00A0.
+function collapseSubjectWhitespace(s: string): string {
+  return s.replace(/\s+/g, ' ')
+}
+
+const ANY_DIGIT_RE = /[0-9０-９]/
+
+/**
+ * Boundary-aware substring test for subject matching. Plain `includes`
+ * lets 「112訴20」 (case 20) match a subject containing 「112訴204」 (case
+ * 204) — a silent misfile at the highest-trust rule tier. When the needle
+ * ends (or starts) with a digit, require the adjacent subject character to
+ * NOT be a digit (either width). Non-numeric needles behave exactly like
+ * `includes`.
+ */
+function subjectIncludesBoundary(haystack: string, needle: string): boolean {
+  if (!needle) return false
+  const startDigit = ANY_DIGIT_RE.test(needle[0]!)
+  const endDigit = ANY_DIGIT_RE.test(needle[needle.length - 1]!)
+  if (!startDigit && !endDigit) return haystack.includes(needle)
+  let from = 0
+  for (;;) {
+    const idx = haystack.indexOf(needle, from)
+    if (idx < 0) return false
+    const before = idx > 0 ? haystack[idx - 1]! : ''
+    const after = idx + needle.length < haystack.length ? haystack[idx + needle.length]! : ''
+    const okBefore = !startDigit || !ANY_DIGIT_RE.test(before)
+    const okAfter = !endDigit || !ANY_DIGIT_RE.test(after)
+    if (okBefore && okAfter) return true
+    from = idx + 1
+  }
 }
 
 // ---- Single-email subject signal (整段主旨, 2026-05-27 redesign) ----------

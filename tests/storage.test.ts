@@ -194,6 +194,40 @@ describe('subjectMemory conflictCount decay', () => {
     expect(mem['baz']?.stableStreak).toBe(0)
     expect(mem['baz']?.conflictCount).toBeGreaterThanOrEqual(1)
   })
+
+  // 優化 2026-07: return-to-nest must not double-penalize.
+  it('returning to the pre-conflict home does NOT count as a second conflict', async () => {
+    // A → B (conflict, cc=1, home remembered = A) → A (回巢, NOT a new conflict)
+    await recordSubjectFilings([{ normalizedSubject: 'k', folderId: 'A', folderPath: 'PA' }])
+    await recordSubjectFilings([{ normalizedSubject: 'k', folderId: 'B', folderPath: 'PB' }])
+    await recordSubjectFilings([{ normalizedSubject: 'k', folderId: 'A', folderPath: 'PA' }])
+    const mem = await getSubjectMemory()
+    expect(mem['k']?.conflictCount).toBe(1) // NOT 2
+    expect(mem['k']?.folderId).toBe('A') // back home
+    expect(mem['k']?.stableStreak).toBe(1) // streak resumed, not reset
+  })
+
+  it('recovers to conflictCount 0 after ~5 filings once returned home (was ~8)', async () => {
+    await recordSubjectFilings([{ normalizedSubject: 'm', folderId: 'A', folderPath: 'PA' }])
+    await recordSubjectFilings([{ normalizedSubject: 'm', folderId: 'B', folderPath: 'PB' }]) // cc=1
+    await recordSubjectFilings([{ normalizedSubject: 'm', folderId: 'A', folderPath: 'PA' }]) // 回巢, streak=1
+    // 5 more home filings: streak 2,3,4,5,6 — the 6th crosses threshold → cc 1→0.
+    for (let i = 0; i < 5; i++) {
+      await recordSubjectFilings([{ normalizedSubject: 'm', folderId: 'A', folderPath: 'PA' }])
+    }
+    const mem = await getSubjectMemory()
+    expect(mem['m']?.conflictCount).toBe(0)
+    expect(mem['m']?.previousFolderId).toBeUndefined()
+  })
+
+  it('oscillating A/B/A/B keeps accumulating conflicts (stays disqualified)', async () => {
+    await recordSubjectFilings([{ normalizedSubject: 'o', folderId: 'A', folderPath: 'PA' }])
+    await recordSubjectFilings([{ normalizedSubject: 'o', folderId: 'B', folderPath: 'PB' }]) // cc=1, home=A
+    await recordSubjectFilings([{ normalizedSubject: 'o', folderId: 'A', folderPath: 'PA' }]) // 回巢, cc=1
+    await recordSubjectFilings([{ normalizedSubject: 'o', folderId: 'B', folderPath: 'PB' }]) // new conflict, cc=2
+    const mem = await getSubjectMemory()
+    expect(mem['o']?.conflictCount).toBe(2)
+  })
 })
 
 // ---- folderActivity.latestMessage preservation (added 2026-05-22) ---------

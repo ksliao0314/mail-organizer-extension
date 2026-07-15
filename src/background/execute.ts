@@ -21,6 +21,7 @@ import {
   addRulesFilteringTombstones,
   bumpRuleHits,
   bumpRuleOverrides,
+  courtCaseSignal,
   decodeCompound,
   deleteRule,
   encodeCompound,
@@ -32,10 +33,12 @@ import {
   mutateRules,
   newRule,
   normalizeSignal,
+  toggleRule,
 } from '@/shared/rules'
 import {
   addFolderToCache,
   addToRecentlyProcessed,
+  appendBatchStat,
   addToSkipHistory,
   bumpMetrics,
   clearUndoSnapshot,
@@ -368,6 +371,23 @@ export async function startExecute(
           )
         }
 
+        // Thread-shadowed rule keep-alive (優化 2026-07). A broad rule that
+        // agreed with the thread route (agreeingRuleId) gets a hit credited
+        // — but only when the user DIDN'T edit the row (an edit means the
+        // rule/thread target was wrong, so don't reward it). Prevents the
+        // stale sweep from hard-deleting a silently-correct rule.
+        if (
+          item.source === 'thread' &&
+          item.agreeingRuleId &&
+          !item.userTouched &&
+          (status === 'moved' || status === 'folder_created')
+        ) {
+          ruleHitTally.set(
+            item.agreeingRuleId,
+            (ruleHitTally.get(item.agreeingRuleId) ?? 0) + 1,
+          )
+        }
+
         // Thread memory writeback. Record convId + normalized subject
         // for every successful move into a real folder. We do this even
         // for thread-sourced rows so the entry's timesFiled keeps
@@ -461,6 +481,33 @@ export async function startExecute(
         await bumpRuleOverrides(ruleOverrideTally)
       } catch (e) {
         console.warn('[mail-organizer] bumpRuleOverrides flush failed (non-fatal)', e)
+      }
+      // Fast structural-override recovery (優化 2026-07). A structural
+      // identifier (case_code, or a court-case-shaped subject/compound rule)
+      // can't legitimately map to two folders — so ONE user correction is
+      // sufficient evidence the rule's target is wrong. The normal
+      // overrideCount→effectiveConfidence demotion needs matchCount≥10 and
+      // auto-disable needs ≥20, which lets a freshly-wrong case rule keep
+      // winning for weeks (and, with first-sight minting now enabled, wrong
+      // structural rules are more reachable). Disable them immediately.
+      // user_manual rules are exempt (sacred). Matches the same axiom the
+      // conflict-gate already uses (execute.ts isConflictProneSignal).
+      try {
+        const snapshot = await listRules()
+        const byId = new Map(snapshot.map((r) => [r.id, r]))
+        for (const id of ruleOverrideTally.keys()) {
+          const r = byId.get(id)
+          if (!r || !r.enabled || r.source === 'user_manual') continue
+          const structural =
+            r.type === 'case_code' ||
+            ((r.type === 'subject_keyword' || r.type === 'compound') &&
+              isStructuralCourtCaseRule(r))
+          if (structural) {
+            await toggleRule(id, false, { actor: 'system' }).catch(() => {})
+          }
+        }
+      } catch (e) {
+        console.warn('[mail-organizer] structural override recovery failed (non-fatal)', e)
       }
     }
     // Flush accumulated rule-hit bumps in a single atomic update.
@@ -643,6 +690,56 @@ export async function startExecute(
       foldersCreated: state.summary.foldersCreated,
       errors: state.summary.errors,
     })
+
+    // Per-source stats ledger (優化 2026-07) — the instrument for telling
+    // WHICH axis (rule / AI / thread) is erring over time. All derivable
+    // from plan + results here; previously computed and discarded.
+    try {
+      const planned = { rule: 0, thread: 0, ai: 0, unresolved: 0 }
+      const overrides = { rule: 0, ai: 0, thread: 0 }
+      let gateResolved = 0
+      for (let i = 0; i < plan.length; i++) {
+        const item = plan[i]!
+        const res = state.results[i]
+        const terminal =
+          res?.status === 'moved' || res?.status === 'deleted' || res?.status === 'folder_created'
+        // planned: bucket by how the ITEM was sourced when the plan was built.
+        // A user edit flips a rule/thread item's source to 'ai', so this
+        // counts post-edit source — which is what "how many did the human
+        // end up treating as AI-level decisions" should reflect.
+        if (item.source === 'rule') planned.rule++
+        else if (item.source === 'thread') planned.thread++
+        else if (item.source === 'unresolved') planned.unresolved++
+        else planned.ai++
+        if (!terminal) continue
+        // overrides.rule: a rule fired but the user changed action/target.
+        if (item.source !== 'rule' && item.originalRuleId) overrides.rule++
+        // overrides.ai: user changed the AI's own verdict.
+        if (item.source === 'ai' && wasUserOverride(item)) overrides.ai++
+        // overrides.thread: user re-targeted away from the thread's home.
+        if (
+          item.source === 'thread' &&
+          item.userTouched &&
+          item.threadMatch &&
+          finalTargetPath(item) !== item.threadMatch.previousFolderPath
+        ) {
+          overrides.thread++
+        }
+        // gateResolved: AI had an answer that the confidence gate demoted to
+        // unresolved, and the user resolved it (aiOriginalAction survives).
+        if (item.source === 'unresolved' && item.aiOriginalAction !== undefined) gateResolved++
+      }
+      await appendBatchStat({
+        at: new Date(state.finishedAt ?? Date.now()).toISOString(),
+        planned,
+        moved: state.summary.moved,
+        deleted: state.summary.deleted,
+        overrides,
+        gateResolved,
+      })
+    } catch (e) {
+      console.warn('[mail-organizer] batch stats ledger failed (non-fatal)', e)
+    }
 
     // Capture undo snapshot — only when there's actually something to undo.
     // Deletes and folder creates aren't reversed here (delete is recoverable
@@ -1231,6 +1328,24 @@ function ruleNormSignal(r: Pick<Rule, 'type' | 'signal'>): string {
   return normalizeSignal(r.type, r.signal)
 }
 
+/**
+ * True when a rule is a court-case structural identifier: a subject_keyword
+ * whose signal IS a case number, or a compound whose subject condition is.
+ * Used by the fast structural-override recovery (優化 2026-07).
+ */
+function isStructuralCourtCaseRule(r: Rule): boolean {
+  if (r.type === 'subject_keyword') return courtCaseSignal(r.signal) != null
+  if (r.type === 'compound') {
+    const parsed = decodeCompound(r.signal)
+    return (
+      parsed?.conditions.some(
+        (c) => c.type === 'subject_keyword' && courtCaseSignal(c.value) != null,
+      ) ?? false
+    )
+  }
+  return false
+}
+
 async function generateAiConfirmedRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
@@ -1248,15 +1363,6 @@ async function generateAiConfirmedRules(
     const item = plan[i]!
     const result = results[i]!
     if (result.status !== 'moved' && result.status !== 'folder_created') continue
-    // Accept both:
-    //   - source === 'ai': AI was confident, user accepted.
-    //   - source === 'unresolved': either (a) AI was below threshold and
-    //     the user filled in / confirmed the suggestion, or (b) AI failed
-    //     entirely and the user picked a folder from scratch. Both are
-    //     human-validated intent worth learning from. wasUserOverride
-    //     below still separates "user changed AI's guess" → ai_overridden
-    //     path from "user agreed with AI / had no AI to override" → here.
-    if (item.source !== 'ai' && item.source !== 'unresolved') continue
     if (item.action !== 'move' && item.action !== 'new_folder') continue
     // User overrode the AI's verdict — handled by generateAiOverrideRules.
     // Skip here so we don't mis-attribute the user's choice to AI confidence.
@@ -1264,6 +1370,31 @@ async function generateAiConfirmedRules(
 
     const sig = chooseLearningSignal(item, internalDomainSet, existing)
     if (!sig) continue
+
+    // Structural unique identifier = court case number or Latin case code.
+    // These can't legitimately map to two folders, so they're safe to learn
+    // on FIRST sight — even from a rule- or thread-routed success, not only
+    // AI-accepted mail (優化 2026-07, items「首見即學」+「thread→rule」).
+    const isStructural =
+      sig.type === 'case_code' ||
+      ('featureKind' in sig && sig.featureKind === 'court_case')
+
+    // Source gate:
+    //   - ai / unresolved: always eligible (AI was confident & accepted, or
+    //     the user resolved it — human-validated intent).
+    //   - rule / thread: eligible ONLY for structural IDs. This lets a case
+    //     number routed by thread memory (or by a DIFFERENT rule, e.g. a
+    //     plain-domain rule) mint a durable, syncable, cross-sender case
+    //     rule — closing the thread-memory learning dead-end. Non-structural
+    //     rule/thread hits stay excluded (they'd just re-mint what already
+    //     routed them, or overfit a broad subject).
+    if (
+      item.source !== 'ai' &&
+      item.source !== 'unresolved' &&
+      !isStructural
+    ) {
+      continue
+    }
 
     const targetPath =
       item.action === 'move'

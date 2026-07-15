@@ -1203,6 +1203,16 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                 kind: threadHit.kind,
                 previousFolderPath: threadHit.previousFolderPath,
               },
+              // If a broad rule also matched and agrees on the destination,
+              // remember it so execute can keep its hit-count / lastUsedAt
+              // alive (優化 2026-07: thread-shadowed rules were starved →
+              // stale-swept). Compare by id first, path as fallback.
+              ...(outcome &&
+              ((outcome.rule.targetFolderId &&
+                outcome.rule.targetFolderId === threadHit.folderId) ||
+                outcome.rule.targetFolderPath === threadHit.folderPath)
+                ? { agreeingRuleId: outcome.rule.id }
+                : {}),
             })
             continue
           }

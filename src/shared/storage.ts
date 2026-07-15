@@ -44,6 +44,7 @@ const KEY_WEEKLY_DIGEST = 'weeklyDigest'
 const KEY_CONVERSATION_MEMORY = 'conversationMemory'
 const KEY_SUBJECT_MEMORY = 'subjectMemory'
 const KEY_RECENTLY_PROCESSED = 'recentlyProcessed'
+const KEY_BATCH_STATS = 'batchStats'
 
 // FOLDER_ACTIVITY_CAP / FOLDER_ACTIVITY_MAX_AGE_MS / TOMBSTONE_CAP /
 // RULE_HISTORY_CAP: see src/shared/constants.ts.
@@ -322,6 +323,7 @@ const withTombstoneLock = createWriteMutex()
 const withConversationMemoryLock = createWriteMutex()
 const withSubjectMemoryLock = createWriteMutex()
 const withRecentlyProcessedLock = createWriteMutex()
+const withBatchStatsLock = createWriteMutex()
 // F11 (2026-06-03): the rule-history audit log did an unserialized
 // read-append-write. Callers invoke recordRuleEvents AFTER their
 // mutateRules critical section has released (so the rules lock doesn't
@@ -1007,33 +1009,67 @@ export async function recordConversationFilings(
     const now = new Date().toISOString()
     for (const f of filings) {
       if (!f.convId) continue
-      const prev = map[f.convId]
-      const sameFolder = prev?.folderId === f.folderId
-      const conflict = !!prev && !sameFolder
-      // Streak / decay book-keeping, parallel to recordSubjectFilings:
-      let nextStreak: number
-      let nextConflict = prev?.conflictCount ?? 0
-      if (conflict) {
-        nextStreak = 0
-        nextConflict += 1
-      } else {
-        nextStreak = (prev?.stableStreak ?? 0) + 1
-        if (nextStreak > DECAY_AFTER_STABLE && nextConflict > 0) {
-          nextConflict -= 1
-        }
-      }
-      map[f.convId] = {
-        folderId: f.folderId,
-        folderPath: f.folderPath,
-        lastFiledAt: now,
-        timesFiled: (prev?.timesFiled ?? 0) + 1,
-        conflictCount: nextConflict,
-        stableStreak: nextStreak,
-      }
+      map[f.convId] = nextThreadMemoryEntry(map[f.convId], f.folderId, f.folderPath, now)
     }
     const pruned = pruneThreadMemory(map, CONVERSATION_MEMORY_CAP)
     await chrome.storage.local.set({ [KEY_CONVERSATION_MEMORY]: pruned })
   })
+}
+
+/**
+ * Shared conflict / streak / decay book-keeping for both conversation and
+ * subject memory (優化 2026-07 — was duplicated inline in both writers).
+ *
+ * Return-to-nest fix: a single legitimate cross-folder filing used to be
+ * double-penalized — A→B raised conflictCount to 1, then the A→…→A return
+ * raised it to 2 (and reset the streak), so recovery took ~8 filings
+ * (~4 months for a bi-weekly thread). Now the folder we leave on a conflict
+ * is remembered in `previousFolderId`; a later filing BACK to it is treated
+ * as the thread reverting home, not a new conflict.
+ */
+function nextThreadMemoryEntry(
+  prev: ThreadMemoryEntry | undefined,
+  folderId: string,
+  folderPath: string,
+  now: string,
+): ThreadMemoryEntry {
+  if (!prev) {
+    return { folderId, folderPath, lastFiledAt: now, timesFiled: 1, conflictCount: 0, stableStreak: 1 }
+  }
+  const timesFiled = prev.timesFiled + 1
+  let conflictCount = prev.conflictCount ?? 0
+  let stableStreak: number
+  let previousFolderId = prev.previousFolderId
+
+  if (prev.folderId === folderId) {
+    // Same folder — extend streak; decay one conflict past the threshold.
+    stableStreak = (prev.stableStreak ?? 0) + 1
+    if (stableStreak > DECAY_AFTER_STABLE && conflictCount > 0) conflictCount -= 1
+  } else if (previousFolderId != null && folderId === previousFolderId) {
+    // 回巢 — reverting to the pre-conflict home. NOT a new conflict; resume
+    // the streak and let decay apply, but keep the accumulated conflict
+    // history (a long-oscillating thread stays disqualified).
+    stableStreak = (prev.stableStreak ?? 0) + 1
+    if (stableStreak > DECAY_AFTER_STABLE && conflictCount > 0) conflictCount -= 1
+    previousFolderId = undefined
+  } else {
+    // Genuine conflict to a new folder — remember the home we're leaving.
+    conflictCount += 1
+    stableStreak = 0
+    previousFolderId = prev.folderId
+  }
+  // Fully rehabilitated → forget the nest pointer.
+  if (conflictCount === 0) previousFolderId = undefined
+
+  return {
+    folderId,
+    folderPath,
+    lastFiledAt: now,
+    timesFiled,
+    conflictCount,
+    stableStreak,
+    ...(previousFolderId != null ? { previousFolderId } : {}),
+  }
 }
 
 /**
@@ -1062,32 +1098,12 @@ export async function recordSubjectFilings(
     const now = new Date().toISOString()
     for (const f of filings) {
       if (!f.normalizedSubject) continue
-      const prev = map[f.normalizedSubject]
-      const sameFolder = prev?.folderId === f.folderId
-      const conflict = !!prev && !sameFolder
-      // Streak / decay book-keeping. Conflict resets the streak; same
-      // folder extends it. Decay only kicks in past the threshold so a
-      // newly-conflicted entry stays disqualified for a meaningful
-      // re-validation period (5 consecutive same-folder filings).
-      let nextStreak: number
-      let nextConflict = prev?.conflictCount ?? 0
-      if (conflict) {
-        nextStreak = 0
-        nextConflict += 1
-      } else {
-        nextStreak = (prev?.stableStreak ?? 0) + 1
-        if (nextStreak > DECAY_AFTER_STABLE && nextConflict > 0) {
-          nextConflict -= 1
-        }
-      }
-      map[f.normalizedSubject] = {
-        folderId: f.folderId,
-        folderPath: f.folderPath,
-        lastFiledAt: now,
-        timesFiled: (prev?.timesFiled ?? 0) + 1,
-        conflictCount: nextConflict,
-        stableStreak: nextStreak,
-      }
+      map[f.normalizedSubject] = nextThreadMemoryEntry(
+        map[f.normalizedSubject],
+        f.folderId,
+        f.folderPath,
+        now,
+      )
     }
     const pruned = pruneThreadMemory(map, SUBJECT_MEMORY_CAP)
     await chrome.storage.local.set({ [KEY_SUBJECT_MEMORY]: pruned })
@@ -1136,6 +1152,43 @@ export async function markThreadMemoryConflicts(opts: {
       if (dirty) await chrome.storage.local.set({ [KEY_SUBJECT_MEMORY]: map })
     })
   }
+}
+
+// ---- Per-batch classification stats (優化 2026-07) ------------------------
+//
+// The measurement instrument the other optimizations are validated against:
+// answers "which axis is erring" — rule vs AI vs thread — over time.
+// Everything here is derivable in execute at batch end; before this it was
+// computed and thrown away. Kept in its own local key with its own mutex,
+// capped so it can't grow unbounded (~300 batches ≈ many months).
+
+export type BatchStat = {
+  at: string
+  /** How the plan's items were sourced (before the user's edits). */
+  planned: { rule: number; thread: number; ai: number; unresolved: number }
+  moved: number
+  deleted: number
+  /** User corrections, attributed by what routed the item. */
+  overrides: { rule: number; ai: number; thread: number }
+  /** Confidence-gated items (AI had an answer but gate skipped it) the user then resolved. */
+  gateResolved: number
+}
+
+const BATCH_STATS_CAP = 300
+
+export async function appendBatchStat(stat: BatchStat): Promise<void> {
+  await withBatchStatsLock(async () => {
+    const r = await chrome.storage.local.get(KEY_BATCH_STATS)
+    const list = Array.isArray(r[KEY_BATCH_STATS]) ? (r[KEY_BATCH_STATS] as BatchStat[]) : []
+    list.push(stat)
+    if (list.length > BATCH_STATS_CAP) list.splice(0, list.length - BATCH_STATS_CAP)
+    await chrome.storage.local.set({ [KEY_BATCH_STATS]: list })
+  })
+}
+
+export async function getBatchStats(): Promise<BatchStat[]> {
+  const r = await chrome.storage.local.get(KEY_BATCH_STATS)
+  return Array.isArray(r[KEY_BATCH_STATS]) ? (r[KEY_BATCH_STATS] as BatchStat[]) : []
 }
 
 export async function getThreadMemoryCounts(): Promise<{
