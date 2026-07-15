@@ -629,3 +629,93 @@ describe('classifyBatch exemplars opt-out', () => {
     expect(body).not.toContain('敏感客戶')
   })
 })
+
+// ---- classifyBatch batch-2 wiring integration (added 2026-07) --------------
+//
+// Locks the end-to-end assembly the batch-2 unit tests don't cover: given
+// rules + threadHints + recentFolders, the OUTGOING request must actually
+// carry the case-number detection line (B2-B), the case→folder map (B2-B),
+// the per-email thread hint (B2-C) and the recent-active-folders block
+// (B2-D) — AND with the right cache posture (map cached, active folders NOT).
+// Without this, a future edit to classifyBatch's message assembly or the
+// preflight→classifyAi handoff could silently drop a block and every unit
+// test would stay green.
+describe('classifyBatch batch-2 prompt wiring', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  async function captureBody(): Promise<string> {
+    let captured = ''
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit) => {
+        captured = typeof init.body === 'string' ? init.body : ''
+        return mockClaudeResponse()
+      }),
+    )
+    const settings: Settings = {
+      ...DEFAULT_SETTINGS,
+      claudeApiKey: 'sk-ant-test',
+      aiIncludeFewShotExamples: true,
+    }
+    await classifyBatch(
+      {
+        emails: [
+          {
+            Id: 'e1',
+            Subject: '112年度訴字第204號 開庭通知',
+            From: { EmailAddress: { Address: 'court@example.gov' } },
+          } as Email,
+        ],
+        folderTree: tree(),
+        excludePrefixes: [],
+        // A court-case subject rule so buildCaseMapBlock emits a row.
+        rules: [
+          exemplarRule({
+            type: 'subject_keyword',
+            signal: '112訴204',
+            targetFolderPath: '03/甲案',
+            matchCount: 40,
+          }),
+        ],
+        threadHints: { e1: '此對話近期曾歸於「03/乙案」（僅供參考）' },
+        recentFolders: ['03/丙案', '03/丁案'],
+      },
+      settings,
+    )
+    return captured
+  }
+
+  it('carries B2-B detection + B2-C hint + B2-D active folders in the request', async () => {
+    const body = await captureBody()
+    // B2-B: per-email detected case identifier line
+    expect(body).toContain('識別碼')
+    expect(body).toContain('112訴204')
+    // B2-B: known case→folder map block
+    expect(body).toContain('已知案號')
+    expect(body).toContain('03/甲案')
+    // B2-C: per-email soft thread hint
+    expect(body).toContain('線索')
+    expect(body).toContain('03/乙案')
+    // B2-D: recent-active-folders block
+    expect(body).toContain('本工具近期歸檔的資料夾')
+    expect(body).toContain('03/丙案')
+  })
+
+  it('caches the case map but NOT the active-folders block', async () => {
+    const body = await captureBody()
+    const parsed = JSON.parse(body) as {
+      messages: Array<{ content: Array<{ type: string; text: string; cache_control?: unknown }> }>
+    }
+    const content = parsed.messages[0]!.content
+    const caseMapBlock = content.find((c) => c.text?.includes('已知案號'))
+    const activeBlock = content.find((c) => c.text?.includes('本工具近期歸檔的資料夾'))
+    expect(caseMapBlock).toBeDefined()
+    expect(activeBlock).toBeDefined()
+    // Map is derived from the slow-changing rule set → cached.
+    expect(caseMapBlock!.cache_control).toBeDefined()
+    // Active folders churn every batch → must stay OUT of the cached prefix.
+    expect(activeBlock!.cache_control).toBeUndefined()
+  })
+})
