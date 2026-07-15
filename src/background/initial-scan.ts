@@ -748,9 +748,23 @@ export async function startInitialScan(opts: {
     // rules still went out fine.
     if (convFilings.length > 0 || subjectFilings.length > 0) {
       try {
+        // Seed as HARVESTED (harvester review fix): this thread memory is
+        // derived from existing FOLDER CONTENTS, not a plan the lawyer
+        // reviewed — the same weak evidence class as the manual-filing
+        // harvester. Marking it harvested keeps it a soft hint (never
+        // auto-route) until a real execute filing confirms the route, and —
+        // crucially — stops a re-scan from CLEARING a harvested flag the
+        // harvester set (which would silently escalate a drag-drop inference
+        // to a 0.95 auto-route). Auto-routing here still works via the
+        // auto_scan RULES this scan mints; only the secondary thread-memory
+        // signal is softened. Only execute.ts (plan-reviewed) clears the flag.
         await Promise.all([
-          convFilings.length > 0 ? recordConversationFilings(convFilings) : Promise.resolve(),
-          subjectFilings.length > 0 ? recordSubjectFilings(subjectFilings) : Promise.resolve(),
+          convFilings.length > 0
+            ? recordConversationFilings(convFilings, { harvested: true })
+            : Promise.resolve(),
+          subjectFilings.length > 0
+            ? recordSubjectFilings(subjectFilings, { harvested: true })
+            : Promise.resolve(),
         ])
       } catch (e) {
         console.warn('[mail-organizer] thread memory seed failed (non-fatal)', e)

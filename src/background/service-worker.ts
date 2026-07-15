@@ -855,9 +855,16 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           }))
         if (convFilings.length > 0) await recordConversationFilings(convFilings, { harvested: true })
         if (subjectFilings.length > 0) await recordSubjectFilings(subjectFilings, { harvested: true })
-        // Advance the watermark only when at least one folder scanned OK, so a
-        // transient token/network failure doesn't skip the window next time.
-        if (scannedFolders > 0) await setLastHarvestAt(new Date().toISOString())
+        // Advance the watermark ONLY when EVERY target folder scanned OK
+        // (errored === 0). The $filter next run is `LastModifiedDateTime gt
+        // lastHarvestAt` applied to all folders, so advancing after a partial
+        // failure would permanently skip a failed folder's window — a manual
+        // filing that landed there before this run would never be seen again
+        // (review fix). harvest is re-runnable, so waiting for a clean pass is
+        // cheap insurance against silently losing a filing.
+        if (scannedFolders > 0 && errored === 0) {
+          await setLastHarvestAt(new Date().toISOString())
+        }
         return { ok: true, data: { scannedFolders, errored, candidates: candidates.length } }
       } catch (e) {
         return {
@@ -1259,7 +1266,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
               const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
               if (path) {
                 if (e.harvested && (e.conflictCount ?? 0) === 0) {
-                  return `依你在 Outlook 的手動歸檔，此對話近期歸於「${path}」（僅供參考）`
+                  return `依你既有的 Outlook 歸檔，此對話近期歸於「${path}」（僅供參考）`
                 }
                 return (e.conflictCount ?? 0) > 0
                   ? `此對話近期在「${path}」與其他資料夾間擺盪、歸屬不穩定（僅供參考）`
@@ -1274,7 +1281,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
               const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
               if (path) {
                 return e.harvested
-                  ? `依你在 Outlook 的手動歸檔，同主旨郵件近期歸於「${path}」（僅供參考）`
+                  ? `依你既有的 Outlook 歸檔，同主旨郵件近期歸於「${path}」（僅供參考）`
                   : `同主旨郵件近期曾歸於「${path}」（僅供參考）`
               }
             }

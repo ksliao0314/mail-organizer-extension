@@ -34,4 +34,14 @@ describe('harvested flag on thread-memory (C3)', () => {
     const mem = await getConversationMemory()
     expect(mem.c1!.harvested).toBeUndefined()
   })
+
+  it('a second folder-content filing (e.g. re-scan) does NOT clear an existing harvested flag', async () => {
+    // The P2 fix: harvest marks C harvested; a later initial-scan re-seed —
+    // now also {harvested:true} — must keep it soft, not silently escalate it
+    // to an auto-route. Only a real execute filing clears it.
+    await recordConversationFilings(filing(), { harvested: true })
+    await recordConversationFilings(filing(), { harvested: true })
+    const mem = await getConversationMemory()
+    expect(mem.c1!.harvested).toBe(true)
+  })
 })

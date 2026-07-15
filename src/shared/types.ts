@@ -458,11 +458,13 @@ export type ThreadMemoryEntry = {
    */
   previousFolderId?: string
   /**
-   * True when EVERY filing for this key so far came from the manual-filing
-   * harvester (inferred from Outlook drag-drop), never from a plan the lawyer
-   * reviewed. Harvested-only entries are NOT trusted for auto-route even at
-   * conflictCount===0 — they only surface as a soft "依你近期手動歸檔" hint,
-   * until a real plan-review filing confirms the route and clears this flag.
+   * True when EVERY filing for this key so far was derived from FOLDER
+   * CONTENTS (the manual-filing harvester, or the initial-scan seed), never
+   * from a plan the lawyer reviewed. Graph can't prove a human filed it, so
+   * this weak-evidence class is NOT trusted for auto-route even at
+   * conflictCount===0 — it only surfaces as a soft "依你既有的 Outlook 歸檔"
+   * hint, until a real plan-reviewed execute filing confirms the route and
+   * permanently clears this flag.
    */
   harvested?: boolean
 }
