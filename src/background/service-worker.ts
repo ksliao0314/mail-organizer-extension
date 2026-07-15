@@ -2310,11 +2310,18 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       // strategy:
       //   'keep_highest' — keep the most-confident rule, DELETE the rest
       //                    (writes tombstones — losers won't auto-resurrect)
+      //   'keep_one'     — keep the rule the USER picked (msg.keepId),
+      //                    DELETE the rest (same tombstone semantics).
+      //                    Manual counterpart of keep_highest for when the
+      //                    right answer isn't the highest-confidence one.
       //   'disable_all'  — disable every rule in this conflict group
       //                    (reversible; for "park it for now" intent)
       const ruleIds = Array.isArray(msg.ruleIds) ? (msg.ruleIds as string[]) : []
-      const strategy = msg.strategy as 'keep_highest' | 'disable_all'
-      if (ruleIds.length === 0 || !['keep_highest', 'disable_all'].includes(strategy)) {
+      const strategy = msg.strategy as 'keep_highest' | 'disable_all' | 'keep_one'
+      if (
+        ruleIds.length === 0 ||
+        !['keep_highest', 'disable_all', 'keep_one'].includes(strategy)
+      ) {
         return { ok: false, code: 'INVALID_INPUT', message: '參數錯誤' }
       }
       const all = await listRules()
@@ -2327,6 +2334,12 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       if (strategy === 'keep_highest') {
         const sorted = [...group].sort((a, b) => b.confidence - a.confidence)
         keepId = sorted[0]!.id
+      } else if (strategy === 'keep_one') {
+        const requested = typeof msg.keepId === 'string' ? msg.keepId : ''
+        if (!group.some((r) => r.id === requested)) {
+          return { ok: false, code: 'INVALID_INPUT', message: 'keepId 不在衝突群組內' }
+        }
+        keepId = requested
       }
 
       let disabled = 0

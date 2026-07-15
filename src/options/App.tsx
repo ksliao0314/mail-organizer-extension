@@ -621,8 +621,12 @@ export default function App() {
     return r
   }
 
-  async function resolveConflict(ruleIds: string[], strategy: 'keep_highest' | 'disable_all') {
-    await send({ type: 'resolveConflict', ruleIds, strategy })
+  async function resolveConflict(
+    ruleIds: string[],
+    strategy: 'keep_highest' | 'disable_all' | 'keep_one',
+    keepId?: string,
+  ) {
+    await send({ type: 'resolveConflict', ruleIds, strategy, ...(keepId ? { keepId } : {}) })
     void refreshRules()
   }
 
@@ -1686,7 +1690,11 @@ type RuleLibraryViewProps = {
   onDelete: (ruleId: string) => Promise<boolean>
   onCreate: (input: { type: RuleType; signal: string; targetFolderId: string; targetFolderPath: string; confidence: number }) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
-  onResolveConflict: (ruleIds: string[], strategy: 'keep_highest' | 'disable_all') => Promise<void>
+  onResolveConflict: (
+    ruleIds: string[],
+    strategy: 'keep_highest' | 'disable_all' | 'keep_one',
+    keepId?: string,
+  ) => Promise<void>
   onSplitConflict: (items: Array<{ ruleId: string; keywords: string[] }>) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onAutoUpgradeConflict: (ruleIds: string[]) => Promise<{ ok: true; data?: { created: number; disabled: number } } | { ok: false; code: string; message: string }>
   onSuggestKeywords: (folderIds: string[]) => Promise<{ ok: true; data?: { suggestions: string[][]; recentSubjects: string[][] } } | { ok: false; code: string; message: string }>
@@ -1860,6 +1868,7 @@ function RuleLibraryViewBody(props: RuleLibraryViewProps) {
         onSplitConflict={onSplitConflict}
         onAutoUpgradeConflict={onAutoUpgradeConflict}
         onSuggestKeywords={onSuggestKeywords}
+        onEditRule={onEditRule}
       />
     )
   }
@@ -3771,7 +3780,13 @@ type ConflictsViewProps = {
   rules: Rule[]
   conflicts: Array<{ type: string; signal: string; ruleIds: string[]; targets: string[] }>
   tree: MailFolderNode[] | null
-  onResolveConflict: (ruleIds: string[], strategy: 'keep_highest' | 'disable_all') => Promise<void>
+  onResolveConflict: (
+    ruleIds: string[],
+    strategy: 'keep_highest' | 'disable_all' | 'keep_one',
+    keepId?: string,
+  ) => Promise<void>
+  /** Jump to 全部規則 view with this rule's detail drawer + editor open. */
+  onEditRule: (ruleId: string) => void
   onSplitConflict: (items: Array<{ ruleId: string; keywords: string[] }>) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onAutoUpgradeConflict: (ruleIds: string[]) => Promise<{ ok: true; data?: { created: number; disabled: number } } | { ok: false; code: string; message: string }>
   onSuggestKeywords: (folderIds: string[]) => Promise<{ ok: true; data?: { suggestions: string[][]; recentSubjects: string[][] } } | { ok: false; code: string; message: string }>
@@ -3783,9 +3798,11 @@ type ConflictsViewProps = {
  * fallbacks (keep highest, disable all) are tucked behind 「進階」.
  */
 function ConflictsView({
+  rules,
   conflicts,
   onResolveConflict,
   onAutoUpgradeConflict,
+  onEditRule,
 }: ConflictsViewProps) {
   type UpgradeState =
     | { status: 'idle' }
@@ -3836,6 +3853,21 @@ function ConflictsView({
           const cKey = conflictKey(c)
           const upgrade = upgradeStateByKey[cKey] ?? { status: 'idle' as const }
           const supportsAutoUpgrade = c.type === 'domain' || c.type === 'sender'
+          // Resolve the group's full Rule objects so each side of the
+          // conflict shows its evidence (confidence / hits / accuracy /
+          // source) and offers per-rule actions — the card used to show
+          // bare target paths with no way to edit or to know which rule
+          // 「保留最高」 would keep.
+          const group = c.ruleIds
+            .map((id) => rules.find((r) => r.id === id))
+            .filter((r): r is Rule => !!r)
+          // EXACTLY the SW resolver's keep_highest selection (sort by
+          // confidence desc; stable sort breaks ties by group order) — so
+          // the「會保留」badge always matches what the button really does.
+          const winner =
+            group.length > 0
+              ? [...group].sort((a, b) => b.confidence - a.confidence)[0]
+              : undefined
 
           return (
             <Card key={cKey}>
@@ -3847,12 +3879,86 @@ function ConflictsView({
                     </Badge>
                     <code className="font-mono text-xs">{c.signal}</code>
                   </div>
-                  <ul className="mt-2 space-y-0.5 text-[11px] text-muted-foreground pl-3">
-                    {c.targets.map((t, i) => (
-                      <li key={i} className="font-mono">
-                        → {t}
-                      </li>
-                    ))}
+                  <ul className="mt-2 space-y-1">
+                    {group.map((r) => {
+                      const acc =
+                        r.matchCount > 0
+                          ? Math.round(
+                              ((r.matchCount - (r.overrideCount ?? 0)) / r.matchCount) * 100,
+                            )
+                          : null
+                      return (
+                        <li
+                          key={r.id}
+                          className="flex items-center gap-2 flex-wrap rounded border border-border bg-muted/20 px-2 py-1.5 text-[11px]"
+                        >
+                          <span
+                            className="font-mono flex-1 min-w-[160px] truncate"
+                            title={r.targetFolderPath}
+                          >
+                            → {r.targetFolderPath}
+                          </span>
+                          {winner?.id === r.id && group.length > 1 && (
+                            <Badge
+                              variant="outline"
+                              className="text-[9px] shrink-0 border-emerald-400 text-emerald-700"
+                              title="信心值最高 —「保留最高、刪其餘」會保留這條"
+                            >
+                              保留最高會留這條
+                            </Badge>
+                          )}
+                          {!r.enabled && (
+                            <Badge variant="outline" className="text-[9px] shrink-0">
+                              已停用
+                            </Badge>
+                          )}
+                          <span className="font-mono text-muted-foreground shrink-0 tabular-nums">
+                            conf {r.confidence.toFixed(2)}
+                          </span>
+                          <span className="font-mono text-muted-foreground shrink-0 tabular-nums">
+                            命中 {r.matchCount}
+                            {acc !== null ? ` · ${acc}%` : ''}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground shrink-0">
+                            {SOURCE_LABEL[r.source]}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onEditRule(r.id)}
+                            className="underline underline-offset-2 text-muted-foreground hover:text-foreground shrink-0"
+                            title="到「全部規則」開啟這條規則的編輯抽屜"
+                          >
+                            編輯
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const others = group.length - 1
+                              if (
+                                !confirm(
+                                  `保留「${r.targetFolderPath}」這條、刪除其餘 ${others} 條?\n(刪除會寫入墓碑、AI 不會再自動學回同樣的規則)`,
+                                )
+                              ) {
+                                return
+                              }
+                              void onResolveConflict(c.ruleIds, 'keep_one', r.id)
+                            }}
+                            className="underline underline-offset-2 text-red-700 hover:text-red-800 shrink-0"
+                            title="手動指定保留這條，刪除群組內其他規則"
+                          >
+                            保留這條
+                          </button>
+                        </li>
+                      )
+                    })}
+                    {/* Stale conflict data (rule ids no longer resolvable
+                        locally) — fall back to the bare target list. */}
+                    {group.length === 0 &&
+                      c.targets.map((t, i) => (
+                        <li key={i} className="font-mono text-[11px] text-muted-foreground pl-3">
+                          → {t}
+                        </li>
+                      ))}
                   </ul>
                 </div>
 
@@ -3917,7 +4023,23 @@ function ConflictsView({
                         size="sm"
                         variant="outline"
                         className="text-[10px] h-7 border-red-300 text-red-700 hover:bg-red-50"
-                        onClick={() => void onResolveConflict(c.ruleIds, 'keep_highest')}
+                        disabled={!winner}
+                        title={
+                          winner
+                            ? `會保留信心最高的「${winner.targetFolderPath}」(conf ${winner.confidence.toFixed(2)})`
+                            : '無法解析衝突群組的規則'
+                        }
+                        onClick={() => {
+                          if (!winner) return
+                          if (
+                            !confirm(
+                              `保留信心最高的「${winner.targetFolderPath}」(conf ${winner.confidence.toFixed(2)})、刪除其餘 ${group.length - 1} 條?\n(刪除會寫入墓碑、AI 不會再自動學回同樣的規則)`,
+                            )
+                          ) {
+                            return
+                          }
+                          void onResolveConflict(c.ruleIds, 'keep_highest')
+                        }}
                       >
                         保留最高、刪其餘
                       </Button>
