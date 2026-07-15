@@ -1740,22 +1740,23 @@ export function gateCaseSignals(
   }
 }
 
-// Body case extraction operates on the SAME window on both sides so a learned
-// rule can actually fire and ambiguity is judged consistently (batch-3 review
-// fix). Matching reads ONLY the fully-fetched `bodyText` — NEVER the 250-char
-// BodyPreview. Rationale: on a truncated preview the ambiguity check is blind
-// to a second case number sitting past char 250, so an email that merely CITES
-// another party's case in its first lines (真正主案在深處) could be silently
-// routed to that cited case's folder without AI review. Requiring the full
-// body means: at preflight (no bodyText) the body pass simply does not fire —
-// body-case mail flows to the AI, which reads the full body and routes it
-// correctly; the learned rule then fires on future SUBJECT occurrences.
-const BODY_CASE_WINDOW = 800
-
+// Body case extraction reads the FULL fetched `bodyText` on both sides — no
+// separate window slice (batch-3 review fix). Two invariants ride on this:
+//   (1) Symmetry: matching (here) and learning (actionToPlanItem) both extract
+//       from the same `email.bodyText` string, so a learned case rule can
+//       always fire and ambiguity is judged identically — bound by shared
+//       input, not by two constants that could drift apart.
+//   (2) Ambiguity safety: the veto (bodyAmbiguous = >1 distinct case) must see
+//       EVERY case number in the body. Slicing to a narrower window would hide
+//       a second, deeper case number, letting an email that merely CITES
+//       another party's case get routed there without AI review. The single
+//       upper bound is getMessageBody's own fetch cap (the string we hold).
+// Never reads the 250-char BodyPreview — at preflight (no bodyText) the body
+// pass simply doesn't fire; body-case mail flows to the AI (full body) there.
 export function caseSignalsForMatch(
   email: Pick<Email, 'Subject' | 'bodyText'>,
 ): EligibleCaseSignals {
-  const body = (email.bodyText ?? '').slice(0, BODY_CASE_WINDOW)
+  const body = email.bodyText ?? ''
   return gateCaseSignals(
     extractCourtCaseNumbers(email.Subject ?? ''),
     extractCaseCodes(email.Subject ?? ''),

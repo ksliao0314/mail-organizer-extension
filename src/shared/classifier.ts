@@ -720,12 +720,14 @@ export function actionToPlanItem(
   // (caseSignalsForLearning). Only attached when non-empty to keep PlanItems
   // lean. The subject-first gate itself lives in caseSignalsForLearning; here
   // we just record what the body carried.
-  // Extract from the fully-fetched body ONLY (batch-3 review fix) — the same
-  // window/source the matching side reads. NO BodyPreview fallback: learning a
-  // case from the 250-char preview would mint a rule the matching side (which
-  // requires the full body) can never fire → stale-swept. Absent bodyText ⇒ no
-  // body case learned (the email flows to / was routed by the AI regardless).
-  const bodyForCase = (email.bodyText ?? '').slice(0, BODY_PROMPT_CHARS)
+  // Extract from the FULL fetched body — the exact same `email.bodyText` string
+  // the matching side (caseSignalsForMatch) reads, so learning and matching are
+  // symmetric by construction (batch-3 review fix). NOT sliced to
+  // BODY_PROMPT_CHARS: that constant governs only the AI PROMPT budget and is
+  // documented as tunable; coupling the case window to it would let a prompt
+  // tweak silently reintroduce the learn≠match asymmetry. No BodyPreview
+  // fallback — absent bodyText ⇒ no body case learned.
+  const bodyForCase = email.bodyText ?? ''
   const bodyCaseNumbers = extractCourtCaseNumbers(bodyForCase)
   const bodyCaseCodes = extractCaseCodes(bodyForCase)
   const base = {

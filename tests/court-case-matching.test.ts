@@ -317,3 +317,29 @@ describe('matchBodyCaseWithIndex (full-body re-match used by classifyAi)', () =>
     expect(m).toBeNull()
   })
 })
+
+// ---- review fix: ambiguity veto + routing scan the FULL body, not 800 ------
+
+describe('matchBodyCaseWithIndex full-body window (review fix)', () => {
+  it('vetoes when a SECOND case sits beyond the old 800-char window', () => {
+    // X at ~char 5, Y at ~char 915. The old 800-slice would hide Y → distinct=1
+    // → misroute to X. Full-body scan sees both → ambiguous → null (safe).
+    const r = subjectRule('112訴304', 'case/304')
+    const bodyText = '本件 112訴304 ' + '　'.repeat(900) + ' 另案 113訴500'
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '通知', bodyText }),
+      buildRuleIndex([r]),
+    )
+    expect(m).toBeNull()
+  })
+
+  it('routes on a SINGLE case that sits beyond char 800', () => {
+    const r = subjectRule('112訴304', 'case/304')
+    const bodyText = '前言 '.repeat(300) + ' 本件 112訴304 敬請' // case well past 800
+    const m = matchBodyCaseWithIndex(
+      makeEmail({ Id: 'e', Subject: '通知', bodyText }),
+      buildRuleIndex([r]),
+    )
+    expect(m?.rule.targetFolderPath).toBe('case/304')
+  })
+})
