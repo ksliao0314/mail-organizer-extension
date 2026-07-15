@@ -43,6 +43,10 @@ function computeRetryWaitMs(retryAfterHeader: string | null, attempt: number): n
   return Math.min(Math.max(base, 0), MAX_RETRY_AFTER_MS)
 }
 
+// IMPORTANT (batch-3): do NOT add Body / UniqueBody here. This select feeds
+// every list call (inbox scan, folder scans) — pulling full bodies would blow
+// the response size 10-50× and invite 429s. Full body is fetched per-message,
+// on demand, only for the AI-bucket subset via getMessageBody().
 const MESSAGE_SELECT_DEFAULT = [
   'Id',
   'Subject',
@@ -57,6 +61,23 @@ const MESSAGE_SELECT_DEFAULT = [
   'HasAttachments',
   'Flag',
 ].join(',')
+
+// Minimal HTML→text fallback used ONLY when the server ignores our
+// Prefer:text header and still returns HTML. This is NOT a security
+// sanitiser — the result is never rendered, only scanned for case numbers by
+// regex — so a plain tag-strip + a few entity decodes is enough. (Self-writing
+// a real sanitiser is unsafe in an MV3 worker with no DOMParser.)
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
 
 export class OutlookError extends Error {
   constructor(
@@ -132,6 +153,7 @@ export class OutlookApi {
     path: string,
     body?: unknown,
     signal?: AbortSignal,
+    extraHeaders?: Record<string, string>,
   ): Promise<T> {
     let forceToken = false
     let triedRefresh = false
@@ -158,6 +180,7 @@ export class OutlookApi {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
             Accept: 'application/json',
+            ...extraHeaders,
           },
           body: body === undefined ? undefined : JSON.stringify(body),
           signal,
@@ -331,6 +354,29 @@ export class OutlookApi {
       opts.signal,
     )
     return r.value
+  }
+
+  /**
+   * Fetch one message's body as plain text (batch-3). Uses UniqueBody so
+   * quoted reply history is dropped — a case number quoted from a prior email
+   * must not pollute this message's body case detection. `Prefer:text` makes
+   * the server return plain text (no unsafe client-side HTML handling). The
+   * stripHtmlToText fallback only fires if the server ignores Prefer. Truncated
+   * defensively so a pathological body can't blow the response we hold in
+   * memory; the prompt layer truncates again to its own budget.
+   */
+  async getMessageBody(messageId: string, signal?: AbortSignal): Promise<string> {
+    const r = await this.request<{ UniqueBody?: { ContentType?: string; Content?: string } }>(
+      'GET',
+      `/me/messages/${messageId}?$select=UniqueBody`,
+      undefined,
+      signal,
+      { Prefer: 'outlook.body-content-type="text"' },
+    )
+    const content = r.UniqueBody?.Content ?? ''
+    const type = (r.UniqueBody?.ContentType ?? '').toLowerCase()
+    const text = type === 'html' ? stripHtmlToText(content) : content
+    return text.length > 4000 ? text.slice(0, 4000) : text
   }
 
   async moveMessage(messageId: string, destinationFolderId: string, signal?: AbortSignal): Promise<{ Id: string }> {
