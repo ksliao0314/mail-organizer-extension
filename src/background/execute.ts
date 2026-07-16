@@ -45,6 +45,7 @@ import {
   clearUndoSnapshot,
   getRuleTombstones,
   getSettings,
+  getSubjectMemory,
   getUndoSnapshot,
   markThreadMemoryConflicts,
   recordConversationFilings,
@@ -1400,7 +1401,15 @@ export async function generateAiConfirmedRules(
   // Snapshot of currently-enabled rules — only used for dedup checks.
   // The atomic addRulesFilteringTombstones call below ensures we don't
   // clobber concurrent writers and respects user tombstones.
-  const [existing, settings] = await Promise.all([listRules(), getSettings()])
+  // subjectMemory: read AFTER this batch's recordSubjectFilings flush (the
+  // execute pipeline records filings before calling us), so the current
+  // filing is already counted — the birth gate below reads timesFiled ≥ 2
+  // as "at least one PRIOR filing".
+  const [existing, settings, subjectMemory] = await Promise.all([
+    listRules(),
+    getSettings(),
+    getSubjectMemory(),
+  ])
   const internalDomainSet = new Set(
     settings.internalDomains.map((d) => d.toLowerCase()),
   )
@@ -1455,6 +1464,43 @@ export async function generateAiConfirmedRules(
         ? joinFolderPath(item.suggestedParentPath, item.suggestedFolderName.trim())
         : undefined
     if (!targetPath) continue
+
+    // 兩次觀察出生閘門 (2026-07-16): full_subject 訊號不再首見即鑄。
+    // 實測 325 條規則庫中 73% 是 compound/full_subject、其中 71% 從未
+    // 命中過 — 大多數主旨一輩子只出現一次，同 thread 的回信本來就由
+    // thread memory 接住。改為: SubjectMemory 中同主旨已有至少一次
+    // 「先前的」真實歸檔到同一資料夾才鑄永久規則 (timesFiled ≥ 2 —
+    // recordSubjectFilings 在本函式之前已記下本次，見上方註解)。
+    // 第一與第二次之間的跨 thread 同主旨信多花一次 AI 呼叫，屬預期成本。
+    //
+    // 範圍: 只擋被動 AI 確認 (source === 'ai')。使用者主動解決
+    // (unresolved) 與 override 路徑 (generateAiOverrideRules) 表達了
+    // 明確人為意圖，維持立即學習。結構化案號 (court_case / case_code)
+    // 不是 full_subject、不受影響。
+    if (item.source === 'ai' && 'featureKind' in sig && sig.featureKind === 'full_subject') {
+      const key = normalizeSubject(item.emailSubject ?? '')
+      // 閘門只在「兩次觀察機制實際可運作」時生效: SubjectMemory 的所有
+      // 寫入端都以 MIN_NORMALIZED_SUBJECT_LEN(8) 為門檻，2–7 字的短主旨
+      // 永遠不會被記錄 — 對它們套閘門不是延後一輪、是無限封鎖。短主旨
+      // 類維持原本的首見即鑄（量少、且 compound 有寄件人錨定）。
+      //
+      // 已知且接受的邊界: 同一批含 2+ 封同主旨信（同 thread 的回信一起
+      // 進批次）時，本批的 recordSubjectFilings 一次灌成 timesFiled=2，
+      // 閘門會放行 — 首見即鑄。方向是 wrongly-kept（便宜），且該主旨至少
+      // 展現過批內重複，不值得為它引入跨批次的觀察記帳。
+      if (key.length >= MIN_NORMALIZED_SUBJECT_LEN) {
+        const entry = subjectMemory[key]
+        const observedBefore =
+          !!entry &&
+          entry.folderPath === targetPath &&
+          entry.timesFiled >= 2 &&
+          // 主旨曾在資料夾間搖擺 → 壞規則候選，比照 matchThreadMemory
+          // 的 auto-route 門檻: 無衝突且非 harvested-only 才信任。
+          (entry.conflictCount ?? 0) === 0 &&
+          entry.harvested !== true
+        if (!observedBefore) continue
+      }
+    }
 
     // Dedup against ALL rules (including disabled). Previously we only checked
     // enabled rules, which let AI-confirmed creation keep regenerating

@@ -12,6 +12,7 @@
 //
 // Within the same type, higher `confidence` wins, then later `lastUsedAt`.
 
+import { CASE_CLOSED_PURGE_DAYS } from './constants'
 import {
   addRuleTombstones,
   clearMatchingTombstones,
@@ -484,12 +485,37 @@ export async function bumpRuleOverrides(overrides: Map<string, number>): Promise
 //   - orphaned rules: separate concern (folder gone).
 
 const STALE_AGE_DAYS_DEFAULT = 100
+// Class-differentiated cutoff for never-matched full_subject rules
+// (2026-07-16). 實測: 規則庫 73% 是 full_subject 類、其中 71% 從未命中 —
+// 大多數主旨一輩子只出現一次，這類死規則等 100 天太慢（同步預算已被
+// 撐爆）。45 天足以涵蓋「主旨會再出現」的正常週期; 結構化案號 / domain /
+// sender 維持 100 天不變。只影響 matchCount === 0 的分支 — 命中過的
+// full_subject 規則證明過價值，仍走 100 天 last-used 標準。
+const FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT = 45
 // High-error-rate auto-disable thresholds. A rule with this many
 // override events out of total matches is clearly mis-routing; let it
 // rest. User can re-enable in the rules UI if the recent overrides
 // were exceptional.
 const HIGH_ERROR_RATE_MIN_SAMPLES = 20
 const HIGH_ERROR_RATE_THRESHOLD = 0.5
+
+/**
+ * True when a rule's subject condition is an ENTIRE normalized subject
+ * (featureKind 'full_subject') rather than a structural court-case number.
+ * featureKind isn't persisted on Rule, so classify from the stored signal:
+ * subject_keyword whose signal is NOT a case number, or compound whose
+ * subject condition is NOT a case number. Mirrors execute.ts's
+ * isStructuralCourtCaseRule (the complement, for subject-bearing types).
+ */
+export function isFullSubjectRule(r: Pick<Rule, 'type' | 'signal'>): boolean {
+  if (r.type === 'subject_keyword') return courtCaseSignal(r.signal) == null
+  if (r.type === 'compound') {
+    const parsed = decodeCompound(r.signal)
+    const subj = parsed?.conditions.find((c) => c.type === 'subject_keyword')
+    return subj != null && courtCaseSignal(subj.value) == null
+  }
+  return false
+}
 
 /**
  * Hard-delete rules that share the same `(type, normalizeSignal, targetFolderPath)`
@@ -659,11 +685,13 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
  *   - `orphaned === true` (handled by reconcile UI)
  */
 export async function autoDisableStaleRules(
-  options: { now?: number; staleDays?: number } = {},
+  options: { now?: number; staleDays?: number; fullSubjectNeverMatchedDays?: number } = {},
 ): Promise<StaleAutoDisableReport> {
   const now = options.now ?? Date.now()
   const staleDays = options.staleDays ?? STALE_AGE_DAYS_DEFAULT
   const cutoffMs = staleDays * 86_400_000
+  const fullSubjectCutoffMs =
+    (options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT) * 86_400_000
   const disabled: Rule[] = []
   const byReason = { stale: 0, highErrorRate: 0, legacyToken: 0 }
   const auditEvents: RuleEvent[] = []
@@ -683,7 +711,12 @@ export async function autoDisableStaleRules(
         reason = 'legacy_token'
       } else if (r.matchCount === 0) {
         const createdMs = Date.parse(r.createdAt)
-        if (Number.isFinite(createdMs) && now - createdMs >= cutoffMs) {
+        // full_subject 類的死規則走 45 天短週期 (見
+        // FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT 的說明)。謂詞只依賴
+        // 同步欄位 (type / signal / matchCount / createdAt) — 每台機器
+        // 的 sweep 各自判定、結果相同，維持無 tombstone 硬刪的收斂性。
+        const cutoff = isFullSubjectRule(r) ? fullSubjectCutoffMs : cutoffMs
+        if (Number.isFinite(createdMs) && now - createdMs >= cutoff) {
           reason = 'stale'
         }
       } else if (r.matchCount >= HIGH_ERROR_RATE_MIN_SAMPLES) {
@@ -753,6 +786,141 @@ export async function autoDisableStaleRules(
     await logRuleEvents(auditEvents)
   }
   return { disabled, byReason }
+}
+
+/** Exact segment-prefix match: path IS the prefix, or lives under it. */
+function pathUnderAnyPrefix(path: string, prefixes: readonly string[]): boolean {
+  return prefixes.some((p) => p.length > 0 && (path === p || path.startsWith(p + '/')))
+}
+
+/**
+ * Two-phase closed-case retirement, Phase 1 (2026-07-16) — SYMMETRIC:
+ *   - retire: an ENABLED rule whose targetFolderPath sits under any
+ *     closed-case archive prefix → enabled=false + reason 'case_closed'.
+ *     Applies to ALL sources including user_manual — the user moving the
+ *     case folder into the archive tree is a NEWER statement of intent
+ *     than the rule, and a rule pointing into the archive silently files
+ *     new mail where nobody looks. (user_manual is still exempt from the
+ *     Phase-2 hard delete below.)
+ *   - revive: a rule retired with 'case_closed' whose path is NO LONGER
+ *     under any archive prefix (folder moved back out — reconcile has
+ *     just refreshed stored paths by folderId) → re-enable. This is the
+ *     case-reopen path; it does NOT rely on new mail arriving (the
+ *     alreadyCovered dedup in generateAiConfirmedRules blocks re-mint
+ *     while a disabled twin exists, so mail-driven re-enable would never
+ *     fire — the folder's LOCATION is the single source of truth).
+ *
+ * Call sites: classify preflight (right after reconcileRulesAgainstTree,
+ * fresh paths, before matching — closes the "rule still routes into the
+ * archive" window) and runSweep (best-effort catch-up with stored paths;
+ * Phase 1 also propagates cross-machine via rule sync, so a machine that
+ * never runs preflight still converges).
+ */
+export async function applyClosedCaseRetirement(
+  closedCasePrefixes: readonly string[],
+  options: { now?: number } = {},
+): Promise<{ retired: number; revived: number; rules: Rule[] }> {
+  const nowMs = options.now ?? Date.now()
+  const nowIso = new Date(nowMs).toISOString()
+  let retiredRules: Rule[] = []
+  let revivedRules: Rule[] = []
+
+  // Returns the post-mutation array so the classify-preflight caller can
+  // refresh its in-memory snapshot — it captured `rules` from the reconcile
+  // mutateRules BEFORE this ran, and building the match index from that
+  // stale capture would let a just-retired rule still route this round.
+  const updated = await mutateRules<Rule[]>((rules) => {
+    const retired: Rule[] = []
+    const revived: Rule[] = []
+    const next = rules.map((r) => {
+      if (r.orphaned) return r
+      const underArchive =
+        closedCasePrefixes.length > 0 && pathUnderAnyPrefix(r.targetFolderPath, closedCasePrefixes)
+      if (r.enabled && underArchive) {
+        const updated: Rule = {
+          ...r,
+          enabled: false,
+          autoDisabledAt: nowIso,
+          autoDisabledReason: 'case_closed',
+        }
+        retired.push(updated)
+        return updated
+      }
+      // Revive fires even when the prefix list is emptied — un-designating
+      // an archive tree releases every rule it had retired.
+      if (!r.enabled && r.autoDisabledReason === 'case_closed' && !underArchive) {
+        const updated: Rule = {
+          ...r,
+          enabled: true,
+          autoDisabledAt: undefined,
+          autoDisabledReason: undefined,
+        }
+        revived.push(updated)
+        return updated
+      }
+      return r
+    })
+    retiredRules = retired
+    revivedRules = revived
+    if (retired.length === 0 && revived.length === 0) {
+      return { next: rules, result: rules }
+    }
+    return { next, result: next }
+  })
+
+  const auditEvents: RuleEvent[] = [...retiredRules, ...revivedRules].map((r) => ({
+    kind: 'toggle',
+    ruleId: r.id,
+    at: nowMs,
+    actor: 'system',
+    enabled: r.enabled,
+    type: r.type,
+    signal: r.signal,
+    targetFolderPath: r.targetFolderPath,
+  }))
+  if (auditEvents.length > 0) {
+    await logRuleEvents(auditEvents)
+  }
+  return { retired: retiredRules.length, revived: revivedRules.length, rules: updated }
+}
+
+/**
+ * Two-phase closed-case retirement, Phase 2 (2026-07-16): hard-delete
+ * rules that have sat in 'case_closed' for CASE_CLOSED_PURGE_DAYS+.
+ * No tombstone — mirrors the stale-delete semantics, so a genuinely
+ * reopened case re-learns via first-sight once the twin is gone.
+ *
+ * SYNC-SAFETY INVARIANT (do not weaken): a no-tombstone hard delete is
+ * only convergent because this predicate is a pure function of SYNCED
+ * fields (autoDisabledReason + autoDisabledAt) and runs in runSweep on
+ * EVERY machine — each machine deletes the same rules itself, so a
+ * union-mode pull can resurrect a copy for at most one sweep interval.
+ * Event-triggered deletion (preflight etc.) must never hard-delete
+ * directly; it goes through the Phase-1 soft-disable that propagates.
+ *
+ * user_manual rules are exempt — destroying a user-created artifact
+ * crosses a line; they stay soft-disabled (visible in the rules UI)
+ * until the user deletes them.
+ */
+export async function purgeExpiredClosedCaseRules(
+  options: { now?: number; purgeDays?: number } = {},
+): Promise<{ purged: number }> {
+  const now = options.now ?? Date.now()
+  const purgeMs = (options.purgeDays ?? CASE_CLOSED_PURGE_DAYS) * 86_400_000
+  let purged = 0
+  await mutateRules((rules) => {
+    const next = rules.filter((r) => {
+      if (r.enabled || r.autoDisabledReason !== 'case_closed') return true
+      if (r.source === 'user_manual') return true
+      const disabledMs = Date.parse(r.autoDisabledAt ?? '')
+      if (!Number.isFinite(disabledMs) || now - disabledMs < purgeMs) return true
+      purged++
+      return false
+    })
+    if (purged === 0) return { next: rules, result: undefined }
+    return { next, result: undefined }
+  })
+  return { purged }
 }
 
 /**
