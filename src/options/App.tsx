@@ -3308,27 +3308,43 @@ function RuleLibraryActionsMenu({
 
   async function handleExport() {
     setOpen(false)
-    const r = await send<{ json: string; filename: string }>({ type: 'exportRules' })
+    // SW contract (service-worker.ts exportRules): { payload, count,
+    // tombstoneCount }. This used to read r.data.json / r.data.filename —
+    // fields the SW never returned — so the download was a 9-byte file
+    // containing the literal string "undefined", named after the blob UUID
+    // (chrome.downloads falls back to the URL when filename is undefined).
+    const r = await send<{ payload: string; count: number; tombstoneCount: number }>({
+      type: 'exportRules',
+    })
     if (!r.ok || !r.data) {
       // Same feedback idiom as handleImportFile below.
       alert(`匯出失敗:${(!r.ok && (r.message ?? r.code)) || '背景沒回傳資料'}`)
       return
     }
+    // Shape guard: never let a contract drift silently produce an
+    // "undefined" file again — fail loudly instead.
+    if (typeof r.data.payload !== 'string' || r.data.payload.length === 0) {
+      alert('匯出失敗:背景回傳格式不符（缺 payload）')
+      return
+    }
     let url: string | null = null
     try {
-      const blob = new Blob([r.data.json], { type: 'application/json' })
+      const blob = new Blob([r.data.payload], { type: 'application/json' })
       url = URL.createObjectURL(blob)
+      // Filename convention mirrors exportDiagnostic / exportSettings.
+      const ts = new Date().toISOString().slice(0, 10)
+      const filename = `mail-organizer-rules-${ts}.json`
       // Prefer chrome.downloads — a detached anchor.click() is blocked in
       // some MV3 contexts (notably the FAB iframe) and silently does
       // nothing; and revoking the blob URL synchronously could cut off the
       // download before it started. Mirrors exportDiagnostic /
       // exportSettings, which were hardened for exactly this.
       if (chrome.downloads?.download) {
-        await chrome.downloads.download({ url, filename: r.data.filename, saveAs: false })
+        await chrome.downloads.download({ url, filename, saveAs: false })
       } else {
         const a = document.createElement('a')
         a.href = url
-        a.download = r.data.filename
+        a.download = filename
         document.body.appendChild(a)
         a.click()
         a.remove()
