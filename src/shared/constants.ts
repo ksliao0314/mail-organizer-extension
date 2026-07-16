@@ -74,6 +74,14 @@ export const SYNC_SCHEMA_VERSION = 3
 /** Local backup-snapshot rotation. */
 export const MAX_BACKUPS = 5
 
+/**
+ * Two-phase closed-case retirement (2026-07-16): days a rule stays
+ * soft-disabled (autoDisabledReason 'case_closed') before the sweep
+ * hard-deletes it. 使用者實務: 結案後信件尾巴約 15 天 → 取 2 倍保險。
+ * Phase 1 的軟停用已同步到所有機器，30 天只是等每台機器都看過。
+ */
+export const CASE_CLOSED_PURGE_DAYS = 30
+
 /** Recent-pushes log carried in syncMeta for multi-machine visibility. */
 export const SYNC_RECENT_PUSHES_CAP = 20
 

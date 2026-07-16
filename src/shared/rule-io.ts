@@ -264,7 +264,12 @@ function validateRule(r: Record<string, unknown> | null | undefined, idx: number
   if (
     r.autoDisabledReason === 'stale' ||
     r.autoDisabledReason === 'high-error-rate' ||
-    r.autoDisabledReason === 'legacy_token'
+    r.autoDisabledReason === 'legacy_token' ||
+    // case_closed MUST survive import/transit: the two-phase retirement
+    // sweep's hard-delete predicate keys on this value — stripping it here
+    // would leave the other machine's copy soft-disabled forever (never
+    // purged) and break cross-machine convergence.
+    r.autoDisabledReason === 'case_closed'
   ) {
     rule.autoDisabledReason = r.autoDisabledReason
   }

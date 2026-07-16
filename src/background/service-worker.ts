@@ -61,6 +61,7 @@ import { filterFolderActivity } from '@/shared/folder-activity-filter'
 import type { PopupResponse } from '@/shared/messages'
 import {
   addRulesFilteringTombstones,
+  applyClosedCaseRetirement,
   applyConfidenceCap,
   deleteRule,
   diffSnapshots,
@@ -485,6 +486,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           folderCacheCount: cache ? flattenFolderTree(cache.tree).length : 0,
           rulesCount: rules.length,
           excludePrefixes: settings.excludeFolderPrefixes,
+          closedCasePrefixes: settings.closedCasePrefixes ?? [],
           batchSize: settings.batchSize,
           aiConfidenceThreshold: settings.aiConfidenceThreshold,
           skipFlagged: settings.skipFlagged,
@@ -1108,7 +1110,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
           newlyOrphaned: 0,
           unorphaned: 0,
         }
-        const rules = await mutateRules<Rule[]>((current) => {
+        let rules = await mutateRules<Rule[]>((current) => {
           const recon = reconcileRulesAgainstTree(current, tree)
           reconcileSummary = recon.summary
           if (
@@ -1152,6 +1154,28 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
             `[mail-organizer] reconcile: ${reconcileSummary.pathsUpdated} paths updated, ` +
               `${reconcileSummary.newlyOrphaned} newly orphaned, ${reconcileSummary.unorphaned} unorphaned`,
           )
+        }
+
+        // 結案退場 Phase 1 (2026-07-16) — reconcile 剛把規則路徑按
+        // folderId 刷新過，此刻的 targetFolderPath 是即時真相。搬進
+        // 「結案歸檔」樹的規則在 matching 之前軟停用（同時修掉「規則
+        // 默默把新信歸進已歸檔資料夾」的舊 bug），搬出者對稱復職。
+        // 硬刪除只發生在 runSweep 的 Phase 2（30 天後、逐機收斂）。
+        try {
+          const closedPrefixes = settings.closedCasePrefixes ?? []
+          const retirement = await applyClosedCaseRetirement(closedPrefixes)
+          // Refresh the in-memory snapshot — `rules` above was captured from
+          // the reconcile mutateRules; without this, buildRuleIndex below
+          // would still see just-retired rules as enabled for this round.
+          rules = retirement.rules
+          if (retirement.retired > 0 || retirement.revived > 0) {
+            console.info(
+              `[mail-organizer] closed-case retirement: ${retirement.retired} retired, ` +
+                `${retirement.revived} revived (archive prefixes: ${closedPrefixes.length})`,
+            )
+          }
+        } catch (e) {
+          console.warn('[mail-organizer] closed-case retirement failed (non-fatal)', e)
         }
 
         // Pre-filter pass 1: drop emails the user already decided to keep in
@@ -1879,6 +1903,16 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
         clean.excludeFolderPrefixes = raw.excludeFolderPrefixes
       }
       if (
+        Array.isArray(raw.closedCasePrefixes) &&
+        raw.closedCasePrefixes.every((s) => typeof s === 'string')
+      ) {
+        // Trim + drop empties — the retirement predicate does exact
+        // segment-prefix matching, a stray space would silently never match.
+        clean.closedCasePrefixes = raw.closedCasePrefixes
+          .map((s) => s.trim().replace(/^\/+|\/+$/g, ''))
+          .filter((s) => s.length > 0)
+      }
+      if (
         typeof raw.aiConfidenceThreshold === 'number' &&
         Number.isFinite(raw.aiConfidenceThreshold)
       ) {
@@ -1941,6 +1975,17 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       }
       if (typeof raw.harvestEnabled === 'boolean') {
         clean.harvestEnabled = raw.harvestEnabled
+      }
+      // 結案歸檔 prefix 必須維持「排除清單的子集」: excludeFolderPrefixes
+      // 被改寫時（設定匯入 / 手改 JSON），把 closedCasePrefixes 修剪到新
+      // 清單之內。否則孤兒 prefix 會繼續觸發退場＋30 天硬刪，而 UI 的
+      // 勾選列表（從排除清單派生）完全沒有入口能看到或取消它。
+      if (clean.excludeFolderPrefixes !== undefined) {
+        const normPrefix = (s: string) => s.trim().replace(/^\/+|\/+$/g, '')
+        const allowed = new Set(clean.excludeFolderPrefixes.map(normPrefix))
+        const base =
+          clean.closedCasePrefixes ?? (await getSettings()).closedCasePrefixes ?? []
+        clean.closedCasePrefixes = base.filter((s) => allowed.has(s))
       }
       const next = await setSettings(clean)
       return {

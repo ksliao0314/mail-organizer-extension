@@ -110,6 +110,7 @@ type StatusData = {
   model: string
   rulesCount: number
   excludePrefixes: string[]
+  closedCasePrefixes: string[]
   batchSize: number
   aiConfidenceThreshold: number
   skipFlagged: boolean
@@ -836,6 +837,9 @@ export default function App() {
 
   const [exportError, setExportError] = useState<string | null>(null)
   const [exportSavedAt, setExportSavedAt] = useState<number | null>(null)
+  // 結案歸檔勾選進行中 — 擋連點: onChange 以 status 快照做 read-modify-write,
+  // 兩個未完成的 toggle 會互相蓋寫（後者用舊快照算 next）。
+  const [closedPrefixBusy, setClosedPrefixBusy] = useState(false)
 
   async function exportDiagnostic() {
     setExportError(null)
@@ -1438,6 +1442,49 @@ export default function App() {
                 ))}
               </div>
             </div>
+            {(status?.excludePrefixes ?? []).length > 0 && (
+              <div className="pt-1 border-t border-border space-y-1.5">
+                <p className="text-muted-foreground">結案歸檔自動退場</p>
+                <p className="text-[10px] text-muted-foreground">
+                  勾選後,案件資料夾搬進該樹時其規則自動停用(標「已結案退場」,搬出即復職),
+                  停用滿 30 天由每日清理刪除。未勾選的前綴只維持「不掃描」。
+                </p>
+                {(status?.excludePrefixes ?? []).map((p) => {
+                  // 儲存值經 SW handler 正規化（trim + 去頭尾斜線），但
+                  // excludePrefixes 是原樣儲存 — 比對與寫入都必須先做同一套
+                  // 正規化，否則含斜線/空白的 prefix 會「退場已生效、勾選框
+                  // 卻顯示未勾且永遠取消不掉」。
+                  const norm = (s: string) => s.trim().replace(/^\/+|\/+$/g, '')
+                  const stored = status?.closedCasePrefixes ?? []
+                  const checked = stored.includes(norm(p))
+                  return (
+                    <label key={p} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={closedPrefixBusy}
+                        onChange={async (e) => {
+                          setClosedPrefixBusy(true)
+                          try {
+                            const next = e.target.checked
+                              ? [...stored, norm(p)]
+                              : stored.filter((x) => x !== norm(p))
+                            await send({ type: 'setSettings', patch: { closedCasePrefixes: next } })
+                            await refresh()
+                          } finally {
+                            setClosedPrefixBusy(false)
+                          }
+                        }}
+                      />
+                      <span className="font-mono text-[11px]">{p}</span>
+                      {checked && (
+                        <span className="text-[10px] text-muted-foreground">＝結案歸檔區</span>
+                      )}
+                    </label>
+                  )
+                })}
+              </div>
+            )}
             <div className="flex items-baseline justify-between">
               <span className="text-muted-foreground flex items-center gap-1">
                 <ListChecks className="size-3.5" />
@@ -2176,6 +2223,7 @@ function DormantRulesView({
     if (reason === 'legacy_token') return '舊版拆詞型(可能誤命中)'
     if (reason === 'high-error-rate') return '高錯誤率'
     if (reason === 'stale') return '長期未命中'
+    if (reason === 'case_closed') return '已結案退場(資料夾在結案歸檔區;搬出即自動復職)'
     return '未知'
   }
 
@@ -5347,6 +5395,7 @@ function SettingsExportImportRow({
         claudeModel: status.model,
         batchSize: status.batchSize,
         excludeFolderPrefixes: status.excludePrefixes,
+        closedCasePrefixes: status.closedCasePrefixes,
         aiConfidenceThreshold: status.aiConfidenceThreshold,
         skipFlagged: status.skipFlagged,
         showOwaFab: status.showOwaFab,

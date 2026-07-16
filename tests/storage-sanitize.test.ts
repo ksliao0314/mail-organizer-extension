@@ -121,6 +121,19 @@ describe('getSettings sanitize', () => {
     expect(cleaned.harvestEnabled).toBe(false)
   })
 
+  it('closedCasePrefixes round-trips through setSettings (3-layer whitelist)', async () => {
+    await setSettings({ closedCasePrefixes: ['05已完成案件'] })
+    const after = await getSettings()
+    expect(after.closedCasePrefixes).toEqual(['05已完成案件'])
+    // Re-sanitize on next read keeps it.
+    expect((await getSettings()).closedCasePrefixes).toEqual(['05已完成案件'])
+  })
+
+  it('closedCasePrefixes defaults to [] when unset', async () => {
+    await chrome.storage.local.set({ settings: { claudeApiKey: 'x' } })
+    expect((await getSettings()).closedCasePrefixes).toEqual([])
+  })
+
   it('harvestEnabled round-trips through setSettings (was silently stripped)', async () => {
     // Regression: harvestEnabled was in the Settings type + DEFAULT_SETTINGS
     // but absent from ALLOWED_SETTINGS_KEYS and sanitizeSettings, so the

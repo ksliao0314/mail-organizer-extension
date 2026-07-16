@@ -114,9 +114,17 @@ export type Rule = {
    *     extracted from a subject). The new design uses the entire
    *     normalized subject; legacy token rules are over-broad (fire on
    *     unrelated mail containing the fragment) and get retired.
+   *   - 'case_closed' (2026-07-16): the rule's target folder sits under a
+   *     user-designated closed-case archive tree (settings.
+   *     closedCasePrefixes). Phase 1 of two-phase retirement: soft-disable
+   *     here propagates via sync to every machine; the sweep hard-deletes
+   *     (no tombstone) after CASE_CLOSED_PURGE_DAYS — except user_manual
+   *     rules, which stay soft-disabled forever. SYMMETRIC: moving the
+   *     folder back OUT of the archive tree auto-re-enables the rule on
+   *     the next preflight / sweep.
    * Cleared along with `autoDisabledAt` on user re-enable.
    */
-  autoDisabledReason?: 'stale' | 'high-error-rate' | 'legacy_token'
+  autoDisabledReason?: 'stale' | 'high-error-rate' | 'legacy_token' | 'case_closed'
 }
 
 // Plan items ------------------------------------------------------------------
@@ -238,6 +246,17 @@ export type Settings = {
   claudeModel: string
   batchSize: number
   excludeFolderPrefixes: string[]
+  /**
+   * Folder-path prefixes the user marked as CLOSED-CASE archive trees
+   * (2026-07-16). Distinct from excludeFolderPrefixes ("don't scan here"):
+   * a prefix listed here additionally triggers two-phase rule retirement —
+   * rules whose target folder moves under one of these trees soft-disable
+   * with autoDisabledReason 'case_closed' (and re-enable if the folder
+   * moves back out). Chosen in Options from among excludeFolderPrefixes.
+   * SYNCED (not per-device): the retirement sweep predicate must see the
+   * same value on every machine to converge.
+   */
+  closedCasePrefixes: string[]
   /**
    * Auto-gate AI plan items whose confidence falls below this threshold.
    * Gated items become `action: 'skip'` so they stay in inbox for manual
@@ -565,6 +584,7 @@ export const DEFAULT_SETTINGS: Settings = {
   claudeModel: 'claude-sonnet-4-6',
   batchSize: 50,
   excludeFolderPrefixes: [],
+  closedCasePrefixes: [],
   aiConfidenceThreshold: 0.5,
   skipFlagged: true,
   showOwaFab: true,

@@ -48,6 +48,26 @@ describe('sync-codec round-trip', () => {
     expect(back[0]).toEqual(r)
   })
 
+  it('round-trips every autoDisabledReason (incl. case_closed for two-phase retirement)', () => {
+    const reasons: NonNullable<Rule['autoDisabledReason']>[] = [
+      'stale',
+      'high-error-rate',
+      'legacy_token',
+      'case_closed',
+    ]
+    const rules = reasons.map((reason, i) =>
+      rule({
+        id: `r-${i}`,
+        enabled: false,
+        autoDisabledAt: '2026-07-01T00:00:00.000Z',
+        autoDisabledReason: reason,
+      }),
+    )
+    const back = decodeRulesFromSync(encodeRulesForSync(rules))
+    // case_closed 掉了 → 對機的 Phase 2 purge 謂詞永不觸發（不收斂）。
+    expect(back.map((r) => r.autoDisabledReason)).toEqual(reasons)
+  })
+
   it('round-trips all rule types and sources', () => {
     const types: Rule['type'][] = ['case_code', 'domain', 'compound', 'subject_keyword', 'sender']
     const sources: Rule['source'][] = ['auto_scan', 'ai_confirmed', 'ai_overridden', 'user_manual']

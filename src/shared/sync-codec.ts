@@ -52,12 +52,23 @@ const CODE_TO_SOURCE: readonly RuleSource[] = [
 ]
 
 type DisabledReason = NonNullable<Rule['autoDisabledReason']>
+// RELEASE DISCIPLINE: a new reason code must ship in the SAME release as
+// its first writer. A build that writes code N while another machine's
+// build lacks entry N would silently strip the reason on decode and
+// re-push the rule untagged — for case_closed that would permanently
+// break the Phase-2 purge convergence.
 const REASON_TO_CODE: Record<DisabledReason, number> = {
   stale: 0,
   'high-error-rate': 1,
   legacy_token: 2,
+  case_closed: 3,
 }
-const CODE_TO_REASON: readonly DisabledReason[] = ['stale', 'high-error-rate', 'legacy_token']
+const CODE_TO_REASON: readonly DisabledReason[] = [
+  'stale',
+  'high-error-rate',
+  'legacy_token',
+  'case_closed',
+]
 
 // --- Wire shapes ------------------------------------------------------------
 

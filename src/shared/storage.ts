@@ -120,6 +120,11 @@ function sanitizeSettings(raw: Record<string, unknown>): Settings {
       raw.excludeFolderPrefixes.every((s) => typeof s === 'string')
         ? (raw.excludeFolderPrefixes as string[])
         : DEFAULT_SETTINGS.excludeFolderPrefixes,
+    closedCasePrefixes:
+      Array.isArray(raw.closedCasePrefixes) &&
+      raw.closedCasePrefixes.every((s) => typeof s === 'string')
+        ? (raw.closedCasePrefixes as string[])
+        : DEFAULT_SETTINGS.closedCasePrefixes,
     aiConfidenceThreshold:
       typeof raw.aiConfidenceThreshold === 'number' &&
       Number.isFinite(raw.aiConfidenceThreshold)
@@ -189,6 +194,7 @@ const ALLOWED_SETTINGS_KEYS: ReadonlySet<keyof Settings> = new Set([
   'claudeModel',
   'batchSize',
   'excludeFolderPrefixes',
+  'closedCasePrefixes',
   'aiConfidenceThreshold',
   'skipFlagged',
   'showOwaFab',
