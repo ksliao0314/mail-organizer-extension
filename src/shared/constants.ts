@@ -85,6 +85,26 @@ export const CASE_CLOSED_PURGE_DAYS = 30
 /** Recent-pushes log carried in syncMeta for multi-machine visibility. */
 export const SYNC_RECENT_PUSHES_CAP = 20
 
+// ---- stale sweep ----------------------------------------------------------
+
+/**
+ * Stale-sweep clock (2026-11-05). Rule staleness is measured in ACTIVE days —
+ * UTC days on which a batch was actually executed — not calendar days. A rule
+ * can only "fail to match" on a day the inbox went through the matcher; the
+ * old wall-clock predicate hard-deleted the whole learned library after ~100
+ * days of simply not using the tool (vacation, a busy quarter), and re-deleted
+ * any restored backup on the next wake. Only the most recent ~100 active days
+ * ever matter to the predicate, so this cap is generous headroom.
+ */
+export const ACTIVE_DAYS_CAP = 400
+
+/**
+ * Minimum spacing between non-forced sweeps. The alarm is daily; this gate
+ * stops the module-load sweep from re-running on every SW wake (the SW wakes
+ * on most tab events) and from double-running on the alarm's own wake.
+ */
+export const SWEEP_MIN_INTERVAL_MS = 20 * 60 * 60 * 1000 // 20 h
+
 // ---- storage --------------------------------------------------------------
 
 /** chrome.storage.local default quota. */

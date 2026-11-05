@@ -223,6 +223,16 @@ export type PlanItem = {
    */
   userTouched?: boolean
   /**
+   * True for placeholder rows of mail that was NEVER classified — the Claude
+   * call failed (429 / 529 / network…) or the response omitted this email —
+   * as opposed to an AI or confidence-gate "skip" decision (2026-11-05).
+   * Executing a batch must not record these in skipHistory: that hid mail
+   * that merely hit a transient API error from every batch for 60 days,
+   * labelled 「先前選擇保留」. Unless the user explicitly chose 保留
+   * (userTouched), they come back next batch.
+   */
+  unclassified?: boolean
+  /**
    * Snapshot of what the AI originally decided, captured at classifier time
    * before any user edits. Used after execute to detect "user overrode AI
    * to point X" cases and promote them into ai_overridden rules so the same

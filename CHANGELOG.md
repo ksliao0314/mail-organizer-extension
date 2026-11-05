@@ -4,6 +4,19 @@
 
 ---
 
+## 2026-11-05 — v1.0.7 急救批:規則遺失、API key 外洩、匯入失效
+
+停用約 4 個月後的全面健檢(5 路平行審查 + 覆核)找到約 70 項問題;這批先修會掉資料 / 有安全疑慮 / 擋住復原的 6 項。其餘(同步重構、Outlook 分頁、學習邏輯等)待後續批次。
+
+- **stale 清理改用「使用日」計時**:原本用日曆天,只要 ~100 天沒歸類(放假、忙)回來就把所有自動學到的規則硬刪,還原備份後下次喚醒又刪一次。現在只計算有執行批次的日子(`activeDays` ledger ∪ 從同步規則推導)。另修「每日」清理實際約每 5 分鐘跑一次(每次 SW 喚醒都重設 alarm)。
+- **「立即下載」改 union**:原本 replace 模式會刪掉被同步預算留在雲端外、只存在本機的規則(含停用的手寫規則)。刪除仍由 tombstone 傳遞。
+- **Claude API key 不再進入 Outlook 分頁**:owa-fab 原本在每次載入 Outlook 時把整個 settings(含 key)印到 console,且其 storage 監聽每次 settings 寫入都收到 key。content script 現在完全不讀 chrome.storage。
+- **規則匯入修復**:Options 送 `json`、SW 讀 `payload`,自初版起每次匯入都「缺少 payload」。
+- **設定頁載入資料夾樹**:原本只有編輯抽屜會載入、但編輯鈕要先有樹才能按,新增 / 編輯規則、根資料夾選擇器都不能用。
+- **未分類的信不再被藏 60 天**:Claude 呼叫失敗或漏回的占位項,執行後會被記成「保留」。現在除非使用者明確選保留,下一批會再出現。低信心「自動保留」行為不變。
+
+新增 `tests/stale-active-days`、`tests/ui-sw-contract`(以 UI 實際訊息格式驅動真正的 SW dispatcher)、`tests/options-folder-tree`、`tests/skip-history-unclassified` 與 sync-engine 的 立即下載 regression;共 624 tests,系統時間推到 2030 仍全綠。
+
 ## 2026-06-03 — 全面 bug 掃描(5 agent 平行 + 自驗)13 項修補
 
 並行 5 個 agent 掃過 sync / execute+api / rules / SW+storage / UI,自驗後確認 13 真 1 誤報(`recoverStaleExecuteState` 被指可與 live executor 並發 → 駁回,因 onInstalled/onStartup/module-load 都在全新 SW 跑、舊 executor 已隨更新 tear down)。

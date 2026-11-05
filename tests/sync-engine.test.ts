@@ -166,6 +166,50 @@ describe('Bug #B: first-enable union pull preserves local-only rules', () => {
     expect(signals).toEqual(['y.com'])
   })
 
+  it('立即下載 (manual pull handler) is union: a rule the push budget left out of the cloud survives', async () => {
+    // Regression (2026-11-05 audit P0): the handler used the default
+    // 'replace' mode, so a manual pull deleted every syncable local rule the
+    // byte budget had dropped from the cloud — the only copy, disabled
+    // user_manual rules first (they rank last for the budget).
+    const { handlePullSyncNow } = await import('@/background/handlers/sync')
+    await addRules([rule({ signal: 'local-only.com', source: 'user_manual', enabled: false })])
+    await simulateOtherMachinePush({
+      rules: [rule({ signal: 'cloud.com', source: 'user_manual' })],
+      machineId: 'other',
+    })
+    const r = await handlePullSyncNow()
+    expect(r.ok).toBe(true)
+    expect((r.data as { mergeMode?: string }).mergeMode).toBe('union')
+    const signals = (await listRules()).map((x) => x.signal).sort()
+    expect(signals).toEqual(['cloud.com', 'local-only.com'])
+  })
+
+  it('立即下載 still applies upstream deletions (tombstones) in union mode', async () => {
+    const { handlePullSyncNow } = await import('@/background/handlers/sync')
+    const doomed = rule({ signal: 'deleted-elsewhere.com', source: 'user_manual' })
+    await addRules([doomed])
+    await simulateOtherMachinePush({ rules: [rule({ signal: 'keep.com' })], machineId: 'other' })
+    // Other machine also published a tombstone for the deleted rule.
+    const tomb: RuleTombstone = {
+      type: doomed.type,
+      signalNorm: 'deleted-elsewhere.com',
+      targetFolderPath: doomed.targetFolderPath,
+      deletedAt: Date.now(),
+    }
+    const { chunkTombstones } = await import('@/shared/sync-chunks')
+    const tChunks = chunkTombstones([tomb])
+    const meta = (await chrome.storage.sync.get('syncMeta')).syncMeta as Record<string, unknown>
+    const writes: Record<string, unknown> = {
+      syncMeta: { ...meta, tombstoneCount: 1, tombstoneChunkCount: tChunks.length },
+    }
+    tChunks.forEach((c, i) => (writes[`syncTombstones_${i}`] = c))
+    await chrome.storage.sync.set(writes)
+
+    await handlePullSyncNow()
+    const signals = (await listRules()).map((x) => x.signal).sort()
+    expect(signals).toEqual(['keep.com'])
+  })
+
   it('union mode preserves per-device rules too (auto_scan)', async () => {
     await addRules([
       rule({ signal: 'local-user.com', source: 'user_manual' }),

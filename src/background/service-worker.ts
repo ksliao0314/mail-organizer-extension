@@ -345,6 +345,43 @@ installSyncListener()
 // the popup behaves as normal.
 installActionRouter()
 
+// OWA floating-button visibility (2026-11-05). The owa-fab content script
+// used to read chrome.storage.local['settings'] — which holds the Claude
+// API key — and console.log the whole object on every Outlook page load;
+// its storage.onChanged listener also received the full old+new settings
+// (key included) on every settings write. The content script now never
+// touches extension storage: it asks via 'getOwaFabVisibility' and the SW
+// pushes a one-boolean 'owaFabVisibility' message when the setting flips
+// (any write path: Options toggle, sync pull, backup restore).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.settings) return
+  const before = owaFabShown(changes.settings.oldValue)
+  const after = owaFabShown(changes.settings.newValue)
+  if (before !== after) void broadcastOwaFabVisibility(after)
+})
+
+function owaFabShown(settings: unknown): boolean {
+  // Default ON — first-run users get the FAB without opting in.
+  return (settings as { showOwaFab?: boolean } | undefined)?.showOwaFab !== false
+}
+
+async function broadcastOwaFabVisibility(show: boolean): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({ url: OWA_REST_HOST_PATTERNS })
+    await Promise.all(
+      tabs.map((t) =>
+        t.id == null
+          ? undefined
+          : chrome.tabs.sendMessage(t.id, { type: 'owaFabVisibility', show }).catch(() => {
+              /* tab without our content script (loading / orphaned) */
+            }),
+      ),
+    )
+  } catch (e) {
+    console.warn('[mail-organizer] owa-fab visibility broadcast failed (non-fatal)', e)
+  }
+}
+
 async function recoverStaleStates(reason: string): Promise<void> {
   try {
     await recoverStaleExecuteState()
@@ -450,6 +487,15 @@ async function withClaudeTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
 
 async function handle(msg: AnyRequest): Promise<PopupResponse> {
   switch (msg.type) {
+    // ---- Content-script queries ---------------------------------------------
+
+    case 'getOwaFabVisibility': {
+      // Only the boolean leaves the SW — never the settings object (it holds
+      // claudeApiKey). See the storage.onChanged broadcast near the top.
+      const settings = await getSettings()
+      return { ok: true, data: { show: owaFabShown(settings) } }
+    }
+
     // ---- Production handlers (used by popup #6) ----------------------------
 
     case 'getStatus': {
@@ -1741,6 +1787,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
                 confidence: 0,
                 reason: errReason,
                 source: 'unresolved',
+                unclassified: true,
               })
               for (const m of remaining) {
                 if (already.has(m.Id)) continue
@@ -2455,7 +2502,17 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
     }
 
     case 'importRules': {
-      const payload = typeof msg.payload === 'string' ? msg.payload : ''
+      // `payload` is the contract. `json` is accepted as an alias: the
+      // Options page sent `json` since the initial commit, so every import
+      // failed with 「缺少 payload」 (2026-11-05 audit) — same drift class as
+      // the export "undefined" file bug (75e436e). Covered by a contract test
+      // that drives this dispatcher with the exact UI message shape.
+      const payload =
+        typeof msg.payload === 'string'
+          ? msg.payload
+          : typeof msg.json === 'string'
+            ? msg.json
+            : ''
       const strategy = msg.strategy as ImportStrategy | undefined
       if (!payload) {
         return { ok: false, code: 'BAD_INPUT', message: '缺少 payload' }
@@ -2695,7 +2752,7 @@ async function handle(msg: AnyRequest): Promise<PopupResponse> {
       // as the chrome.alarms-driven path. Returns both the soft-disabled
       // count (legacy_token / high-error-rate) and the stale hard-delete
       // count so the options button can report what actually happened.
-      const { disabledCount, staleDeletedCount } = await runSweep()
+      const { disabledCount, staleDeletedCount } = await runSweep({ force: true })
       return { ok: true, data: { disabledCount, staleDeletedCount } }
     }
 

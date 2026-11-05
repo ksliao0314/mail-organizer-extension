@@ -119,6 +119,8 @@ popup (React)        options (React)         content (outlook.*)
 | `syncLastError` | 上次同步失敗紀錄 | next success 清空 |
 | `remoteWipeNotice` | 收到另一台機器 wipeMarker 後的本地通知 | 用戶 dismiss 清除 |
 | `errorLog` | 中央 SW 錯誤集中 | 200 entries |
+| `activeDays` | 有執行批次的 UTC 日('YYYY-MM-DD'),stale sweep 的時鐘 | 400 |
+| `lastSweepAt` | 上次 stale sweep 時間(ms),啟動補跑的 20h 閘門 | — |
 
 ### `chrome.storage.session`(SW 生命週期)
 
@@ -263,8 +265,8 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 | 階段 | 觸發 | 行為 |
 |---|---|---|
 | **自動生** | 執行成功後 `generateAiConfirmedRules` / `generateAiOverrideRules` | 走 `chooseLearningSignal` 6 層、`applyConfidenceCap`、`addRulesFilteringTombstones` |
-| **自動沉寂** | `stale-sweep.ts:autoDisableStaleRules`(每 6 小時 + 啟動跑一次) | `matchCount ≥ 20` 且 `overrideCount/matchCount ≥ 0.5` → 設 `enabled=false` + `autoDisabledReason: 'high-error-rate'` + `autoDisabledAt: now` |
-| **stale 直接刪** | 同上 sweep | `matchCount === 0` 且 createdAt 超過 100 天 OR `matchCount > 0` 且 lastUsedAt 超過 100 天 → **完全刪除**(不留 tombstone、不寫 audit、不 console)。設計理由:長期沒命中等於不存在,留痕跡只汙染信任 |
+| **自動沉寂** | `stale-sweep.ts:runSweep` → `autoDisableStaleRules`(每日 alarm;SW 啟動時若距上次 ≥ 20h 補跑一次;Options「立即執行」= `force`) | `matchCount ≥ 20` 且 `overrideCount/matchCount ≥ 0.5` → 設 `enabled=false` + `autoDisabledReason: 'high-error-rate'` + `autoDisabledAt: now` |
+| **stale 直接刪** | 同上 sweep | `matchCount === 0` 且 createdAt 之後已過 100 個**使用日**(full_subject 類 45) OR `matchCount > 0` 且 lastUsedAt 之後已過 100 個**使用日** → **完全刪除**(不留 tombstone、不寫 audit、不 console)。**使用日** = 有執行批次的 UTC 日:本機 `activeDays` ledger ∪ 從同步規則的 lastUsedAt / AI 規則 createdAt 推導(`deriveActiveDaysFromRules`)。閒置期間不計 — 2026-11-05 前用日曆天,停用 ~100 天回來整個學習庫被刪光、還原備份後下次喚醒又被刪。設計理由:長期沒命中等於不存在,留痕跡只汙染信任 |
 | **legacy token 清理** | 同上 sweep | 2026-05-27 之前用 tokenize 路徑生的 subject_keyword 規則(`isLegacyTokenSubjectRule`):createdAt < `REDESIGN_CUTOFF_ISO` 的 ai_confirmed / ai_overridden subject_keyword 規則 → 設 `autoDisabledReason: 'legacy_token'` |
 | **自動復活** | `addRulesFilteringTombstones` dedup | 同 type+signal+target 對應到一條 auto-disabled 規則 → 自動 `enabled=true` + 清 `autoDisabledAt` / `autoDisabledReason` |
 | **使用者手動 toggle** | UI 按鈕 | 清掉 auto-disable 痕跡(避免 UI 視覺錯誤) |
@@ -494,6 +496,9 @@ mail-organizer-extension/
 7. **applyConfidenceCap 在所有寫入點** — 不要修補讀路徑、要 enforce 寫路徑
 8. **規則 mutation 永遠走 mutateRules** — 包括 import / sync pull / reconcile / bumpRuleHits / **wipeAllRules(F12:用 `mutateRules(()=>({next:[]}))` 而非 raw `setRules([])`,否則並發 batch 寫入可在 wipe 後復活規則)** / etc. 不要再有 raw `setRules` 散在 handler 裡
 9. **wipeMarker 寫入時不抹除舊 marker** — `doPush` 在 normal push 時保留 `cloudMeta.wipeMarker`、只有 wipe push 才覆蓋(讓第三台機器後加入也能 trip)
+10. **content script 永不碰 chrome.storage**(2026-11-05) — `settings` 含 `claudeApiKey`;owa-fab 曾 `console.log` 整個 settings、且其 `storage.onChanged` 每次 settings 寫入都收到含 key 的新舊值。現在 owa-fab 只透過 `getOwaFabVisibility` 拿布林值、由 SW 推 `owaFabVisibility`。`tests/ui-sw-contract.test.ts` 掃 `src/content/*.ts` 守門
+11. **手動拉取(立即下載)永遠 union**(2026-11-05) — `doPush` 的位元組預算會刻意把低優先規則留在雲端外(只存本機),replace 模式會把這些唯一副本刪掉。`replace` 只留給明確需要「雲端精確狀態」的內部路徑;刪除靠 tombstone 傳遞
+12. **stale sweep 用使用日、不用日曆天** — 見「規則生命週期」;新增任何會「依時間刪規則」的路徑都要問:使用者沒在用時這個時鐘該不該走
 
 ---
 

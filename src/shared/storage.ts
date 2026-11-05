@@ -1,4 +1,5 @@
 import {
+  ACTIVE_DAYS_CAP,
   CONVERSATION_MEMORY_CAP,
   DECAY_AFTER_STABLE,
   FOLDER_ACTIVITY_CAP,
@@ -604,6 +605,58 @@ export async function getLastHarvestAt(): Promise<string | null> {
 
 export async function setLastHarvestAt(iso: string): Promise<void> {
   await chrome.storage.local.set({ [KEY_LAST_HARVEST_AT]: iso })
+}
+
+// ---- Active-day ledger (stale-sweep clock, 2026-11-05) ---------------------
+//
+// UTC days on which this machine executed a batch. The stale sweep counts
+// rule age in these days instead of calendar days (see ACTIVE_DAYS_CAP), so
+// not using the tool for months no longer ages — and hard-deletes — the
+// learned library. Per-device; the sweep unions it with days derived from
+// the synced rules' own lastUsedAt / createdAt, which carries the other
+// machines' activity across.
+
+const KEY_ACTIVE_DAYS = 'activeDays'
+const KEY_LAST_SWEEP_AT = 'lastSweepAt'
+const withActiveDaysLock = createWriteMutex()
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** UTC calendar day ('YYYY-MM-DD') of a timestamp; '' when unparseable. */
+export function utcDay(input: number | string | undefined | null): string {
+  if (input == null || input === '') return ''
+  const ms = typeof input === 'number' ? input : Date.parse(input)
+  // Date#toISOString throws RangeError outside ±8.64e15 ms.
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return ''
+  return new Date(ms).toISOString().slice(0, 10)
+}
+
+export async function getActiveDays(): Promise<string[]> {
+  const r = await chrome.storage.local.get(KEY_ACTIVE_DAYS)
+  const v = r[KEY_ACTIVE_DAYS]
+  if (!Array.isArray(v)) return []
+  return v.filter((d): d is string => typeof d === 'string' && DAY_RE.test(d))
+}
+
+/** Record that a batch was executed on the UTC day of `at`. Idempotent per day. */
+export async function recordActiveDay(at: number = Date.now()): Promise<void> {
+  const day = utcDay(at)
+  if (!day) return
+  await withActiveDaysLock(async () => {
+    const days = await getActiveDays()
+    if (days.includes(day)) return
+    const next = [...new Set([...days, day])].sort().slice(-ACTIVE_DAYS_CAP)
+    await chrome.storage.local.set({ [KEY_ACTIVE_DAYS]: next })
+  })
+}
+
+export async function getLastSweepAt(): Promise<number | null> {
+  const r = await chrome.storage.local.get(KEY_LAST_SWEEP_AT)
+  const v = r[KEY_LAST_SWEEP_AT]
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
+export async function setLastSweepAt(ms: number): Promise<void> {
+  await chrome.storage.local.set({ [KEY_LAST_SWEEP_AT]: ms })
 }
 
 // ---- Rule tombstones -------------------------------------------------------

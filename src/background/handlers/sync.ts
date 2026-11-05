@@ -112,7 +112,14 @@ export async function handlePushSyncNow(): Promise<PopupResponse> {
 }
 
 export async function handlePullSyncNow(): Promise<PopupResponse> {
-  const r = await pullNow('manual')
+  // UNION, never replace (2026-11-05). Replace drops every syncable local
+  // rule that isn't in the cloud — but doPush's byte budget deliberately
+  // leaves the lowest-priority rules OUT of the cloud ("they stay in local
+  // storage"), so 立即下載 (and the pull-error banner's retry, which sends
+  // the same message) permanently deleted exactly the rules whose only copy
+  // was on this machine, disabled user_manual rules included. Upstream
+  // deletions still propagate in union mode via tombstones.
+  const r = await pullNow('manual', { mode: 'union' })
   return { ok: true, data: r }
 }
 

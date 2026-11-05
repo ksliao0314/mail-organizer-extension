@@ -18,6 +18,7 @@ import {
   getRuleTombstones,
 } from '@/shared/storage'
 import type { Rule, RuleTombstone } from '@/shared/types'
+import { dailyActiveDays } from './helpers/active-days'
 
 function rule(over: Partial<Rule> = {}): Rule {
   return newRule({
@@ -499,6 +500,7 @@ describe('autoDisableStaleRules — lastUsedAt stale branch', () => {
     const { disabled, byReason } = await autoDisableStaleRules({
       now,
       staleDays: 100, // 200 > 100 → stale
+      activeDays: dailyActiveDays(now, 300), // batch ran every day
     })
     // Stale rules are HARD-DELETED — not in `disabled` (soft-disable list)
     // and not in storage. byReason.stale still counts (telemetry).
@@ -527,7 +529,7 @@ describe('autoDisableStaleRules — lastUsedAt stale branch', () => {
     await addRules([r])
     const tombsBefore = (await getRuleTombstones()).length
 
-    await autoDisableStaleRules({ now, staleDays: 100 })
+    await autoDisableStaleRules({ now, staleDays: 100, activeDays: dailyActiveDays(now, 300) })
 
     const tombsAfter = (await getRuleTombstones()).length
     expect(tombsAfter).toBe(tombsBefore) // no new tombstone for stale delete
@@ -549,7 +551,7 @@ describe('autoDisableStaleRules — lastUsedAt stale branch', () => {
     r.lastUsedAt = new Date(recently).toISOString()
     await addRules([r])
 
-    await autoDisableStaleRules({ now, staleDays: 100 })
+    await autoDisableStaleRules({ now, staleDays: 100, activeDays: dailyActiveDays(now, 300) })
     const after = (await listRules()).find((rr) => rr.id === r.id)
     expect(after?.enabled).toBe(true)
   })
@@ -570,7 +572,7 @@ describe('autoDisableStaleRules — lastUsedAt stale branch', () => {
     r.lastUsedAt = new Date(longAgo).toISOString()
     await addRules([r])
 
-    await autoDisableStaleRules({ now, staleDays: 100 })
+    await autoDisableStaleRules({ now, staleDays: 100, activeDays: dailyActiveDays(now, 300) })
     const after = (await listRules()).find((rr) => rr.id === r.id)
     expect(after?.enabled).toBe(true) // sacred — never auto-disabled
   })

@@ -16,10 +16,12 @@ import { CASE_CLOSED_PURGE_DAYS } from './constants'
 import {
   addRuleTombstones,
   clearMatchingTombstones,
+  getActiveDays,
   getRuleTombstones,
   getRules,
   recordRuleEvents,
   setRules,
+  utcDay,
 } from './storage'
 import type {
   Email,
@@ -484,6 +486,13 @@ export async function bumpRuleOverrides(overrides: Map<string, number>): Promise
 //   - already-disabled rules: nothing to do.
 //   - orphaned rules: separate concern (folder gone).
 
+// Both cutoffs are in ACTIVE days (UTC days on which a batch was executed),
+// not calendar days (2026-11-05). Wall-clock aging hard-deleted every learned
+// rule once the user simply stopped classifying for ~100 days, and re-deleted
+// restored backups on the next wake because they keep their old lastUsedAt.
+// Counting only days the matcher actually ran keeps the original intent —
+// "100 days of use without a hit = dead" — while freezing the clock whenever
+// the tool sits idle.
 const STALE_AGE_DAYS_DEFAULT = 100
 // Class-differentiated cutoff for never-matched full_subject rules
 // (2026-07-16). 實測: 規則庫 73% 是 full_subject 類、其中 71% 從未命中 —
@@ -492,6 +501,51 @@ const STALE_AGE_DAYS_DEFAULT = 100
 // sender 維持 100 天不變。只影響 matchCount === 0 的分支 — 命中過的
 // full_subject 規則證明過價值，仍走 100 天 last-used 標準。
 const FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT = 45
+
+/**
+ * Active days evidenced by the rule library itself: every lastUsedAt is the
+ * day a batch credited (or overrode) that rule, and AI-learned rules are
+ * minted at execute time. Rules sync, so this carries the OTHER machines'
+ * activity into this machine's sweep (keeping the no-tombstone hard delete
+ * roughly convergent) and backfills history for libraries that predate the
+ * recorded ledger. It can only UNDER-count real activity, which errs on the
+ * side of keeping rules.
+ */
+export function deriveActiveDaysFromRules(rules: readonly Rule[]): string[] {
+  const out = new Set<string>()
+  for (const r of rules) {
+    const used = utcDay(r.lastUsedAt)
+    if (used) out.add(used)
+    if (r.source === 'ai_confirmed' || r.source === 'ai_overridden') {
+      const born = utcDay(r.createdAt)
+      if (born) out.add(born)
+    }
+  }
+  return [...out]
+}
+
+/**
+ * Number of active days strictly AFTER the UTC day of `iso`, counting at most
+ * `enough` (early exit). `daysDesc` must be unique and sorted descending.
+ * Returns null when `iso` is unparseable — the caller must treat that as
+ * "not stale", mirroring the old Number.isFinite guard.
+ */
+export function countActiveDaysAfter(
+  daysDesc: readonly string[],
+  iso: string | undefined,
+  enough: number,
+): number | null {
+  const day = utcDay(iso)
+  if (!day) return null
+  let n = 0
+  for (const d of daysDesc) {
+    if (d <= day) break
+    n++
+    if (n >= enough) break
+  }
+  return n
+}
+
 // High-error-rate auto-disable thresholds. A rule with this many
 // override events out of total matches is clearly mis-routing; let it
 // rest. User can re-enable in the rules UI if the recent overrides
@@ -658,8 +712,10 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
  * Auto-retire rules in three scenarios — two different fates per bucket:
  *
  * 1. **Stale** (HARD DELETE, no trace):
- *    - never matched + older than `staleDays` days, OR
- *    - matchCount > 0 but lastUsedAt older than `staleDays` days
+ *    - never matched + `staleDays` ACTIVE days since createdAt, OR
+ *    - matchCount > 0 but `staleDays` ACTIVE days since lastUsedAt
+ *    (active day = a UTC day on which a batch was executed; see
+ *    deriveActiveDaysFromRules / recordActiveDay — idle periods don't count)
  *    The signal isn't reaching the inbox anymore. Per user request:
  *      "100 天沒用的規則就完全刪除、不留紀錄、不影響將來學習"
  *    Removed from rules array entirely. NO tombstone (AI can re-learn
@@ -685,18 +741,32 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
  *   - `orphaned === true` (handled by reconcile UI)
  */
 export async function autoDisableStaleRules(
-  options: { now?: number; staleDays?: number; fullSubjectNeverMatchedDays?: number } = {},
+  options: {
+    now?: number
+    /** Cutoff in ACTIVE days (default 100). */
+    staleDays?: number
+    /** Never-matched full_subject cutoff in ACTIVE days (default 45). */
+    fullSubjectNeverMatchedDays?: number
+    /** Recorded active days (UTC 'YYYY-MM-DD'); defaults to the stored ledger.
+     *  Always unioned with deriveActiveDaysFromRules(library). */
+    activeDays?: readonly string[]
+  } = {},
 ): Promise<StaleAutoDisableReport> {
   const now = options.now ?? Date.now()
   const staleDays = options.staleDays ?? STALE_AGE_DAYS_DEFAULT
-  const cutoffMs = staleDays * 86_400_000
-  const fullSubjectCutoffMs =
-    (options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT) * 86_400_000
+  const fullSubjectDays =
+    options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT
+  const recordedDays = options.activeDays ?? (await getActiveDays())
   const disabled: Rule[] = []
   const byReason = { stale: 0, highErrorRate: 0, legacyToken: 0 }
   const auditEvents: RuleEvent[] = []
 
   await mutateRules((rules) => {
+    // Computed ONCE from the pre-sweep library so deletions in this pass
+    // can't shift the clock for rules evaluated later in the same pass.
+    const daysDesc = [...new Set([...recordedDays, ...deriveActiveDaysFromRules(rules)])]
+      .sort()
+      .reverse()
     const next: Rule[] = []
     for (const r of rules) {
       // Untouched paths — keep as-is.
@@ -710,13 +780,14 @@ export async function autoDisableStaleRules(
       if (isLegacyTokenSubjectRule(r)) {
         reason = 'legacy_token'
       } else if (r.matchCount === 0) {
-        const createdMs = Date.parse(r.createdAt)
-        // full_subject 類的死規則走 45 天短週期 (見
-        // FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT 的說明)。謂詞只依賴
-        // 同步欄位 (type / signal / matchCount / createdAt) — 每台機器
-        // 的 sweep 各自判定、結果相同，維持無 tombstone 硬刪的收斂性。
-        const cutoff = isFullSubjectRule(r) ? fullSubjectCutoffMs : cutoffMs
-        if (Number.isFinite(createdMs) && now - createdMs >= cutoff) {
+        // full_subject 類的死規則走 45 個使用日短週期 (見
+        // FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT 的說明)。謂詞依賴同步欄位
+        // (type / signal / matchCount / createdAt) + 使用日，使用日大部分
+        // 由同步規則本身推導 → 各機器 sweep 判定大致相同、維持無 tombstone
+        // 硬刪的收斂性。
+        const cutoff = isFullSubjectRule(r) ? fullSubjectDays : staleDays
+        const idle = countActiveDaysAfter(daysDesc, r.createdAt, cutoff)
+        if (idle !== null && idle >= cutoff) {
           reason = 'stale'
         }
       } else if (r.matchCount >= HIGH_ERROR_RATE_MIN_SAMPLES) {
@@ -726,12 +797,11 @@ export async function autoDisableStaleRules(
         }
       }
       // Last-used stale (added 2026-05-27): rule fired in the past but
-      // has not been used for `staleDays` days. Catches "topic ran for
-      // a few weeks then moved on" patterns.
-      if (!reason) {
-        const lastUsedStr = r.lastUsedAt ?? r.createdAt
-        const lastUsedMs = Date.parse(lastUsedStr)
-        if (Number.isFinite(lastUsedMs) && now - lastUsedMs >= cutoffMs && r.matchCount > 0) {
+      // has not been used for `staleDays` ACTIVE days. Catches "topic ran
+      // for a few weeks then moved on" patterns.
+      if (!reason && r.matchCount > 0) {
+        const idle = countActiveDaysAfter(daysDesc, r.lastUsedAt ?? r.createdAt, staleDays)
+        if (idle !== null && idle >= staleDays) {
           reason = 'stale'
         }
       }

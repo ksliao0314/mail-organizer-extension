@@ -48,6 +48,7 @@ import {
   getSubjectMemory,
   getUndoSnapshot,
   markThreadMemoryConflicts,
+  recordActiveDay,
   recordConversationFilings,
   recordFolderActivityFromBatch,
   recordRuleEvents,
@@ -169,6 +170,10 @@ export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; 
   if (recoveredProcessedIds.length > 0) {
     await addToRecentlyProcessed(recoveredProcessedIds).catch((e) =>
       console.warn('[mail-organizer] recovery recentlyProcessed replay failed (non-fatal)', e),
+    )
+    // The killed batch still ran the matcher over real mail → active day.
+    await recordActiveDay(state.startedAt ?? Date.now()).catch((e) =>
+      console.warn('[mail-organizer] recovery recordActiveDay failed (non-fatal)', e),
     )
   }
 
@@ -644,8 +649,15 @@ export async function startExecute(
     // ids are already handled by the 15-min recentlyProcessed ledger.)
     // state.results is index-aligned with plan (initialState maps plan→results
     // in order; the loop writes state.results[i]).
+    // Never-classified placeholders (Claude call failed / omitted the email)
+    // are NOT a keep decision unless the user explicitly chose 保留 on them —
+    // recording them hid transient-error mail for 60 days (2026-11-05).
     const skippedIds = state.results
-      .filter((r, i) => r.status === 'skipped' && plan[i]?.action === 'skip')
+      .filter((r, i) => {
+        const item = plan[i]
+        if (r.status !== 'skipped' || item?.action !== 'skip') return false
+        return !(item.unclassified === true && item.userTouched !== true)
+      })
       .map((r) => r.emailId)
       .filter((id) => id)
     if (skippedIds.length > 0) {
@@ -719,6 +731,15 @@ export async function startExecute(
       foldersCreated: state.summary.foldersCreated,
       errors: state.summary.errors,
     })
+
+    // Stale-sweep clock (2026-11-05): today counts as an ACTIVE day — the
+    // matcher ran over real inbox mail, so rules that didn't fire today have
+    // genuinely aged one day. Idle calendar days never reach this ledger.
+    if (plan.length > 0) {
+      await recordActiveDay().catch((e) =>
+        console.warn('[mail-organizer] recordActiveDay failed (non-fatal)', e),
+      )
+    }
 
     // Per-source stats ledger (優化 2026-07) — the instrument for telling
     // WHICH axis (rule / AI / thread) is erring over time. All derivable

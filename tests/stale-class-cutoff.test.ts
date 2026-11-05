@@ -8,9 +8,12 @@ import { autoDisableStaleRules, encodeCompound, isFullSubjectRule, newRule } fro
 import { listRules } from '@/shared/rules'
 import { setRules } from '@/shared/storage'
 import type { Rule } from '@/shared/types'
+import { dailyActiveDays } from './helpers/active-days'
 
 const NOW = Date.parse('2026-07-16T00:00:00.000Z')
 const daysAgo = (d: number) => new Date(NOW - d * 86_400_000).toISOString()
+// The user ran a batch every day — active days == calendar days here.
+const DAILY = dailyActiveDays(NOW, 300)
 
 function rule(over: Partial<Rule>): Rule {
   return newRule({
@@ -62,7 +65,7 @@ describe('never-matched full_subject 45 天回收', () => {
     const r = fullSubjectCompound()
     r.createdAt = daysAgo(50)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(1)
     expect(await listRules()).toHaveLength(0)
   })
@@ -71,7 +74,7 @@ describe('never-matched full_subject 45 天回收', () => {
     const r = fullSubjectCompound()
     r.createdAt = daysAgo(40)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(0)
     expect(await listRules()).toHaveLength(1)
   })
@@ -80,7 +83,7 @@ describe('never-matched full_subject 45 天回收', () => {
     const r = courtCaseCompound()
     r.createdAt = daysAgo(50)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(0)
     expect(await listRules()).toHaveLength(1)
   })
@@ -89,7 +92,7 @@ describe('never-matched full_subject 45 天回收', () => {
     const r = rule({})
     r.createdAt = daysAgo(50)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(0)
   })
 
@@ -99,7 +102,7 @@ describe('never-matched full_subject 45 天回收', () => {
     r.matchCount = 3
     r.lastUsedAt = daysAgo(50)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(0)
     expect(await listRules()).toHaveLength(1)
   })
@@ -108,7 +111,7 @@ describe('never-matched full_subject 45 天回收', () => {
     const r = fullSubjectCompound({ source: 'user_manual' })
     r.createdAt = daysAgo(200)
     await setRules([r])
-    const report = await autoDisableStaleRules({ now: NOW })
+    const report = await autoDisableStaleRules({ now: NOW, activeDays: DAILY })
     expect(report.byReason.stale).toBe(0)
     expect(await listRules()).toHaveLength(1)
   })

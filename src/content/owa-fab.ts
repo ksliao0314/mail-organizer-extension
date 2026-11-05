@@ -12,8 +12,11 @@
 //     extension:// origin so chrome.* APIs, MSAL token fetch, and all the
 //     existing classify / execute flows work without any change.
 //   - Click outside / Escape collapses the panel. Click the FAB again toggles.
-//   - chrome.storage.onChanged hot-reloads the FAB when the user flips the
-//     "show OWA floating icon" setting in options — no page reload needed.
+//   - Visibility: asks the SW ('getOwaFabVisibility') at init, and the SW
+//     pushes 'owaFabVisibility' when the "show OWA floating icon" setting
+//     flips — no page reload needed. This script must NEVER read
+//     chrome.storage: settings hold the Claude API key, and a storage
+//     listener here would receive it on every settings write (2026-11-05).
 
 const HOST_ID = 'mail-organizer-fab-host'
 const LOG_PREFIX = '[mail-organizer-fab]'
@@ -484,14 +487,15 @@ async function tryDomClickNavigation(
 
 async function shouldShow(): Promise<boolean> {
   try {
-    const r = await chrome.storage.local.get('settings')
-    const s = r.settings as { showOwaFab?: boolean } | undefined
+    const r = (await chrome.runtime.sendMessage({ type: 'getOwaFabVisibility' })) as
+      | { ok?: boolean; data?: { show?: boolean } }
+      | undefined
     // Default ON — first-run users get the FAB without having to opt in.
-    const show = s?.showOwaFab !== false
-    console.log(LOG_PREFIX, 'shouldShow', { settings: s, show })
+    const show = r?.ok === true ? r.data?.show !== false : true
+    console.log(LOG_PREFIX, 'shouldShow', { show })
     return show
   } catch (e) {
-    console.warn(LOG_PREFIX, 'shouldShow read failed, defaulting ON', e)
+    console.warn(LOG_PREFIX, 'shouldShow query failed, defaulting ON', e)
     return true
   }
 }
@@ -1169,14 +1173,13 @@ async function init() {
   if (await shouldShow()) createFab()
 }
 
-// Hot-reload on settings change so the toggle in options takes effect
-// without requiring a page reload.
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes.settings) return
-  const next = changes.settings.newValue as { showOwaFab?: boolean } | undefined
-  const show = next?.showOwaFab !== false
-  if (show && !document.getElementById(HOST_ID)) createFab()
-  if (!show) removeFab()
+// Hot-reload when the SW reports the setting flipped, so the toggle in
+// options takes effect without requiring a page reload.
+chrome.runtime.onMessage.addListener((msg: { type?: string; show?: boolean } | undefined) => {
+  if (msg?.type !== 'owaFabVisibility') return false
+  if (msg.show !== false && !document.getElementById(HOST_ID)) createFab()
+  if (msg.show === false) removeFab()
+  return false
 })
 
 console.log(LOG_PREFIX, 'script loaded')

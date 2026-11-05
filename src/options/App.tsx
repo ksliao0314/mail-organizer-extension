@@ -456,6 +456,17 @@ export default function App() {
     void refreshSkipCount()
   }, [refresh, refreshScan, refreshRules, refreshMetrics, refreshSkipCount])
 
+  // Folder tree on mount (2026-11-05 audit). The only other loadTree() call
+  // is the rule drawer's `editing` effect — but the drawer's 編輯 button is
+  // disabled until a tree exists, so 新增規則 / 編輯 / the root-folder picker
+  // / the 近日活動 filter picker were all dead unless a ?edit= deep link
+  // happened to load the tree first. getFolderTree serves the 24 h folder
+  // cache, so this is cheap. On failure (no Outlook tab, no cache) the tree
+  // stays null and loadTree's identity doesn't change → no retry loop.
+  useEffect(() => {
+    void loadTree()
+  }, [loadTree])
+
   // Scroll the page to the rules section on first mount. Run once (no
   // deps) and after a microtask so the section's DOM exists. We use the
   // browser-native anchor scroll — same path the sidebar TOC uses — so
@@ -3424,7 +3435,7 @@ function RuleLibraryActionsMenu({
       importedTombstones: number
       cappedCount: number
       cappedMaxDelta: number
-    }>({ type: 'importRules', json: text, strategy: 'merge' })
+    }>({ type: 'importRules', payload: text, strategy: 'merge' })
     if (r.ok) {
       await onAfterImport()
       // Surface confidence-cap impact so the user isn't surprised
@@ -5249,7 +5260,7 @@ function ClassificationPrefsCard({
             <Input
               value={rootDraft}
               onChange={(e) => setRootDraft(e.target.value)}
-              placeholder="先到「資料夾快取」按重新偵測、就會出現可選清單"
+              placeholder="資料夾清單尚未載入 — 請先打開並登入 Outlook 網頁版、再重新整理此頁"
               className="font-mono text-xs"
               disabled
             />
@@ -6409,7 +6420,7 @@ function RecentActivityFilterCard({
               />
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                資料夾樹尚未載入 — 先到設定→分類引擎→資料夾快取按重新偵測
+                資料夾樹尚未載入 — 請先打開並登入 Outlook 網頁版、再重新整理此頁
               </p>
             )}
           </div>
@@ -6442,7 +6453,7 @@ function RecentActivityFilterCard({
               />
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                資料夾樹尚未載入 — 先到設定→分類引擎→資料夾快取按重新偵測
+                資料夾樹尚未載入 — 請先打開並登入 Outlook 網頁版、再重新整理此頁
               </p>
             )}
           </div>

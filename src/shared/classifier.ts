@@ -1042,6 +1042,7 @@ export async function classifyBatch(
         confidence: 0,
         reason: 'AI 未回傳此 index 的判斷',
         source: 'unresolved',
+        unclassified: true,
       })
     }
   })

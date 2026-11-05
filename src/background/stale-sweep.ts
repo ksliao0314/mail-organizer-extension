@@ -1,21 +1,22 @@
 // Daily stale-rule sweep.
 //
-// Once a day, walk the rules array and auto-disable rules that:
-//   - have never matched (matchCount === 0)
-//   - were created more than 90 days ago
-//   - are not user_manual (sacred)
-//   - are not already disabled / orphaned
-//
-// Reversible — `enabled` flips to false, `autoDisabledAt` timestamp set.
-// Rule stays in storage; user can re-enable in options.
+// Once a day: dedupe, closed-case retirement/purge, then
+// autoDisableStaleRules (rules.ts) — soft-disables high-error-rate /
+// legacy_token rules and HARD-deletes stale ones. Staleness is counted in
+// ACTIVE days (UTC days a batch was executed), never calendar days, so an
+// idle extension doesn't age its library (2026-11-05). user_manual,
+// disabled and orphaned rules are never touched by the stale branch.
 //
 // SYNC-SAFETY INVARIANT for the HARD-DELETE paths in this sweep (stale
 // deletion, case_closed purge — no tombstone written): a no-tombstone
 // delete is only convergent across machines because (a) the predicate is
-// a pure function of SYNCED rule fields, and (b) this sweep runs on EVERY
-// machine (each SW startup + daily alarm). Each machine deletes the same
-// rules itself, so a union-mode sync pull can resurrect a copy for at
-// most one sweep interval. NEVER hard-delete from an event-triggered,
+// a function of SYNCED rule fields plus the active-day clock — and that
+// clock is mostly derived from the synced rules themselves
+// (deriveActiveDaysFromRules), with each machine's own recorded days on
+// top — and (b) this sweep runs on EVERY machine (daily alarm + startup
+// catch-up). Each machine deletes (nearly) the same rules itself, so a
+// union-mode sync pull can resurrect a copy for at most a sweep interval or
+// two; a machine whose clock lags only ever keeps a rule LONGER. NEVER hard-delete from an event-triggered,
 // single-machine code path (preflight, message handler) without a
 // tombstone — that resurrects forever via the other machine's cloud copy.
 // Event paths must go through a soft-disable that propagates via sync
@@ -24,49 +25,94 @@
 // Background-only: needs chrome.alarms which only the service worker can
 // register. Wires up in service-worker.ts via installStaleSweepListener().
 
+import { SWEEP_MIN_INTERVAL_MS } from '@/shared/constants'
 import {
   applyClosedCaseRetirement,
   autoDisableStaleRules,
   dedupeRulesByKey,
   purgeExpiredClosedCaseRules,
 } from '@/shared/rules'
-import { getSettings } from '@/shared/storage'
+import { getLastSweepAt, getSettings, setLastSweepAt } from '@/shared/storage'
 
 const STALE_SWEEP_ALARM = 'stale-rule-sweep'
 const SWEEP_INTERVAL_MINUTES = 24 * 60 // daily
 
+export type SweepResult = {
+  disabledCount: number
+  staleDeletedCount: number
+  /** True when a non-forced call was skipped because a sweep ran < SWEEP_MIN_INTERVAL_MS ago. */
+  skipped?: boolean
+}
+
 /**
- * Register the daily alarm + handler. Idempotent — safe to call from
- * `runtime.onInstalled` AND `runtime.onStartup` AND on module load
- * (covers SW restart scenarios).
+ * Register the daily alarm + handler. Safe to call on every SW start
+ * (module load).
  *
- * `chrome.alarms.create` with the same name overwrites the previous
- * schedule, so this won't pile up duplicates.
+ * The alarm is created only when it doesn't already exist (2026-11-05).
+ * Previously every SW start re-created it with delayInMinutes:5, and
+ * create() with the same name REPLACES the pending alarm — since the SW
+ * wakes on most tab events, the "daily" sweep actually fired ~every 5 min
+ * (twice per wake: module load + onAlarm). The startup sweep is now gated
+ * by lastSweepAt inside runSweep.
  */
 export function installStaleSweepListener(): void {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== STALE_SWEEP_ALARM) return
     void runSweep()
   })
-  void chrome.alarms.create(STALE_SWEEP_ALARM, {
-    // Run first sweep ~5 min after register so a freshly-installed
-    // extension doesn't sweep immediately (give user time to settle).
-    delayInMinutes: 5,
-    periodInMinutes: SWEEP_INTERVAL_MINUTES,
-  })
-  // Also run an immediate, fire-and-forget sweep on every SW startup —
-  // makes legacy_token / lastUsedAt cleanup visible on extension reload
-  // instead of waiting for the 5-minute alarm. The sweep is idempotent
-  // (already-disabled rules are skipped), so running on every wake is
-  // cheap.
+  void ensureSweepAlarm()
+  // Catch-up sweep on SW startup (e.g. browser was closed when the alarm was
+  // due). Gated: a no-op unless the last sweep is ≥ SWEEP_MIN_INTERVAL_MS old.
   void runSweep()
 }
 
+async function ensureSweepAlarm(): Promise<void> {
+  try {
+    if (await chrome.alarms.get(STALE_SWEEP_ALARM)) return
+    await chrome.alarms.create(STALE_SWEEP_ALARM, {
+      // First sweep ~5 min after (re)registration so a freshly-installed
+      // extension doesn't sweep immediately (give the user time to settle).
+      delayInMinutes: 5,
+      periodInMinutes: SWEEP_INTERVAL_MINUTES,
+    })
+  } catch (e) {
+    console.warn('[mail-organizer] stale sweep alarm setup failed (non-fatal)', e)
+  }
+}
+
+// Coalesces overlapping calls (module-load sweep + the alarm's own wake fire
+// together). Assigned synchronously before any await — TOCTOU invariant.
+let sweepInFlight: Promise<SweepResult> | null = null
+
 /**
- * Public entry for manual invocation (e.g. "run sweep now" button in
- * options page). Same operation as the alarm-triggered path.
+ * Entry for the alarm, SW startup, and the options "run sweep now" button
+ * (`force: true`, which bypasses the interval gate).
  */
-export async function runSweep(): Promise<{ disabledCount: number; staleDeletedCount: number }> {
+export function runSweep(opts: { force?: boolean } = {}): Promise<SweepResult> {
+  if (sweepInFlight) return sweepInFlight
+  sweepInFlight = runSweepGated(opts.force === true).finally(() => {
+    sweepInFlight = null
+  })
+  return sweepInFlight
+}
+
+async function runSweepGated(force: boolean): Promise<SweepResult> {
+  if (!force) {
+    try {
+      const last = await getLastSweepAt()
+      if (last !== null && Date.now() - last < SWEEP_MIN_INTERVAL_MS) {
+        return { disabledCount: 0, staleDeletedCount: 0, skipped: true }
+      }
+    } catch {
+      /* unreadable stamp → just sweep */
+    }
+  }
+  const result = await sweepOnce()
+  await setLastSweepAt(Date.now()).catch(() => {})
+  return result
+}
+
+async function sweepOnce(): Promise<SweepResult> {
   try {
     // Dedupe first — collapsing same-triplet duplicates before the stale
     // check lets stats (matchCount etc.) on the kept rule reflect the
