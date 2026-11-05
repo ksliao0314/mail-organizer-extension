@@ -1,5 +1,14 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { PopupRequest } from '@/shared/messages'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { LayoutContext, useLayout } from './layout-context'
+import { readWebStorage, writeWebStorage } from './web-storage'
+import {
+  isImeComposing,
+  isTextEntryTarget,
+  overlayLayerOpen,
+  ownsActivationKeys,
+  ownsNavigationKeys,
+} from './keyboard'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -20,7 +29,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
-import { PlanRow } from './components/PlanRow'
+import { DELETE_DESTINATION_LABEL, PlanRow } from './components/PlanRow'
 import { FolderPicker } from './components/FolderPicker'
 import { cn } from '@/lib/utils'
 import { flattenFolderTree, joinFolderPath } from '@/shared/outlook-api'
@@ -41,7 +50,9 @@ import type {
 
 type Ok<T> = { ok: true; data?: T }
 type Err = { ok: false; code: string; message: string }
-async function send<T>(req: unknown): Promise<Ok<T> | Err> {
+// Typed against the SW's MessageType union (2026-11-05): an unknown message
+// type is now a compile error, not a silent UNKNOWN_TYPE at runtime.
+async function send<T>(req: PopupRequest): Promise<Ok<T> | Err> {
   return chrome.runtime.sendMessage(req)
 }
 
@@ -62,6 +73,31 @@ type StatusData = {
   internalDomains: string[]
   /** Primary case-tracking root. Drives onboarding banner when empty. */
   primaryRootPath: string
+  /**
+   * Why the last OWA token fetch failed (2026-11-05; wired by the SW). Lets
+   * the token-issue banner say what to actually do instead of a generic
+   * 「稍等幾秒」. Optional: older SWs don't send it.
+   */
+  tokenError?: { code: string; message: string } | null
+}
+
+// Stable fallback so a not-yet-loaded status doesn't hand every memoized
+// PlanRow a fresh `[]` on each render (2026-11-05). Also replaces the old
+// hard-coded firm folder name here — exclusions come from settings only.
+const NO_EXCLUDE_PREFIXES: string[] = []
+
+/**
+ * User-facing text for "OWA tab found but no token" (2026-11-05). Uses the
+ * SW's tokenError when present so the user is told the real fix.
+ */
+function tokenIssueText(status: StatusData): string {
+  const err = status.tokenError
+  if (err?.code === 'MULTIPLE_ACCOUNTS' && err.message) return err.message
+  if (err?.code === 'NOT_ON_OWA' || err?.code === 'TAB_UNREACHABLE') {
+    return '請重新整理 Outlook 分頁（擴充功能更新後需要）'
+  }
+  if (err?.code === 'NO_TOKEN' && err.message) return err.message
+  return '無法讀取 Outlook 登入資訊、稍等幾秒再試'
 }
 
 type ClassifyUsage = { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }
@@ -112,6 +148,8 @@ type WeeklyDigestSummary = {
 }
 
 type PreflightData = {
+  /** The classify run this preflight started (2026-11-05); pass to classifyAi / cancelClassify. */
+  runId: string
   rulePlan: PlanItem[]
   unmatchedPreview: PreviewEmail[]
   folderTree: MailFolderNode[]
@@ -124,19 +162,51 @@ type PreflightData = {
   requestedBatchSize: number
 }
 
-type AiProgress = {
+// getAiClassifyProgress views (2026-11-05). The SW only ever returns the
+// CURRENT run's progress, with mail already submitted to execute filtered
+// out. 'meta' = counts only; 'poll' = counts + AI items appended since the
+// `aiFrom` cursor (no tree, no rule plan); 'full' = everything, once, for
+// resume / consume.
+type AiProgressMeta = {
+  runId: string
   totalEmails: number
   completedEmails: number
   chunks: number
   completedChunks: number
-  rulePlan: PlanItem[]
-  folderTree: MailFolderNode[]
-  aiPlan: PlanItem[]
+  /** Rule / AI items still on offer (executed ones excluded). */
+  ruleCount: number
+  aiCount: number
+  aiUnresolvedCount: number
+  /** Never-classified placeholders among aiCount (failed / refused chunks). */
+  aiUnclassifiedCount: number
+  /** Poll cursor: pass back as `aiFrom` to get only newer AI items. */
+  aiCursor: number
   skippedByUser?: number
   usage?: ClassifyUsage
   aiError?: { code: string; message: string } | null
   startedAt: number
   done: boolean
+}
+type AiProgressPoll = AiProgressMeta & { aiPlan: PlanItem[] }
+type AiProgress = AiProgressPoll & { rulePlan: PlanItem[]; folderTree: MailFolderNode[] }
+
+/**
+ * A run worth showing: still classifying, or has unexecuted items left that
+ * are more than failure placeholders (those re-classify better from a fresh
+ * fetch than re-shown as stale 「AI 分類失敗」 rows).
+ */
+function hasOfferableItems(p: AiProgressMeta): boolean {
+  return !p.done || p.ruleCount + p.aiCount - (p.aiUnclassifiedCount ?? 0) > 0
+}
+
+function aiErrorBanner(err: { code: string; message: string }): { code: string; message: string } {
+  return {
+    code: err.code,
+    message:
+      err.code === 'TRUNCATED' || err.code === 'CONFIDENCE_GATED'
+        ? err.message
+        : `AI 分類失敗：${err.message}。規則命中與已完成部分仍可執行。`,
+  }
 }
 
 // ---- State machine --------------------------------------------------------
@@ -211,7 +281,7 @@ function HealthDot({
   const issues: string[] = []
   if (status) {
     if (!status.owaConnected) issues.push('Outlook 未連線')
-    else if (!status.tokenValid) issues.push('Outlook 登入過期')
+    else if (!status.tokenValid) issues.push(status.tokenError ? tokenIssueText(status) : 'Outlook 登入過期')
     if (!status.apiKeyConfigured) issues.push('Claude API key 未設定')
   }
   const healthy = !!status && !loading && issues.length === 0
@@ -233,6 +303,21 @@ function HealthDot({
       )}
     />
   )
+}
+
+/**
+ * A callback whose identity never changes but which always runs the latest
+ * render's `fn` (2026-11-05). Lets PlanScreen hand memoized PlanRows
+ * handlers that close over fresh `items` / selection without breaking
+ * React.memo. The ref is refreshed in a layout effect, before any user
+ * event can fire.
+ */
+function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn)
+  useLayoutEffect(() => {
+    ref.current = fn
+  })
+  return useCallback((...args: A) => ref.current(...args), [])
 }
 
 function planSummary(items: PlanItem[]) {
@@ -347,18 +432,25 @@ export default function App() {
 
   // ESC closes the FAB panel when the popup is loaded inside the iframe.
   // Same cross-frame trick as options: keyboard events can't bubble out
-  // of an iframe, so we postMessage the parent. Skip INPUT/TEXTAREA so
+  // of an iframe, so we postMessage the parent. Skip typing surfaces so
   // ESC inside a FolderPicker or rule editor still acts on the field
   // instead of nuking the whole panel.
   // No-op when running as the standalone Chrome toolbar popup
   // (window.parent === window) — Chrome handles popup close itself.
+  //
+  // Innermost-first (2026-11-05): this listener registers at mount, BEFORE
+  // any overlay's own Esc handler, and document listeners run in
+  // registration order — so with the ? shortcuts dialog open, Esc used to
+  // close the whole OWA panel instead of just the dialog. Any open layer
+  // (dialog / menu / open listbox) owns Esc; so does an inner widget that
+  // already handled it (defaultPrevented) or an IME composition cancel.
   useEffect(() => {
     if (window.parent === window) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      const t = e.target as HTMLElement | null
-      const tag = t?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      if (e.defaultPrevented || isImeComposing(e)) return
+      if (isTextEntryTarget(e.target)) return
+      if (overlayLayerOpen()) return
       postToParent({ type: 'mail-organizer/close-panel' })
     }
     document.addEventListener('keydown', onKey)
@@ -389,15 +481,41 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKey)
   }, [showShortcuts])
 
-  const refreshStatus = useCallback(async () => {
-    setStatusLoading(true)
+  // `silent` (2026-11-05): background re-polls (the token wait below) must
+  // not flash the 「檢查連線中」 pill / spinner dot once a second.
+  const refreshStatus = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setStatusLoading(true)
     const r = await send<StatusData>({ type: 'getStatus' })
-    setStatusLoading(false)
+    if (!opts?.silent) setStatusLoading(false)
     if (r.ok && r.data) {
       setStatus(r.data)
       if (r.data.batchSize) setBatchSize(r.data.batchSize)
     }
   }, [])
+
+  // Toolbar icon with no Outlook tab open → take the user to Outlook
+  // (2026-11-05). The SW used to swap chrome.action.setPopup('') from
+  // browser-wide tab listeners so such a click opened Outlook instead of this
+  // popup — waking the SW on nearly every navigation. The popup is now always
+  // wired; when the TOOLBAR popup finds owaConnected=false it asks the SW to
+  // open / focus Outlook and closes itself. Never in the in-OWA iframe panel
+  // (window.top !== window — it is by definition already inside Outlook), and
+  // only in a real toolbar-popup view (not the page opened in a tab), so a
+  // false positive can't close a page the user meant to look at.
+  const openOwaSentRef = useRef(false)
+  useEffect(() => {
+    if (openOwaSentRef.current || !status || status.owaConnected) return
+    if (window.top !== window) return
+    let isToolbarPopup = true
+    try {
+      isToolbarPopup = chrome.extension?.getViews?.({ type: 'popup' }).includes(window) ?? true
+    } catch {
+      /* getViews unavailable → fall back to the top-level check above */
+    }
+    if (!isToolbarPopup) return
+    openOwaSentRef.current = true
+    void send({ type: 'openOwa' }).finally(() => window.close())
+  }, [status])
 
   const refreshFolderActivity = useCallback(async () => {
     // SW now applies the include-prefixes / leaf-names filter (configurable
@@ -538,6 +656,14 @@ export default function App() {
   // for a finished prefetch first and skips the slow fetch+classify chain.
   // Each DoneScreen visit triggers at most once via `prefetchStartedRef`.
   const prefetchStartedRef = useRef<string | null>(null)
+  // Classify-run bookkeeping (2026-11-05). The run whose progress this popup
+  // displays — every getAiClassifyProgress answer for another run is ignored
+  // — and the poll cursor into that run's AI output.
+  const classifyRunIdRef = useRef<string | null>(null)
+  const aiCursorRef = useRef(0)
+  // Synchronous re-entry guard for 繼續歸檔下一批 (item 3): a double click used
+  // to run two consume-or-classify chains (two preflights, two AI runs).
+  const continueInFlightRef = useRef(false)
   useEffect(() => {
     if (phase.kind !== 'done') {
       prefetchStartedRef.current = null
@@ -550,9 +676,6 @@ export default function App() {
     const phaseKey = String(phase.state.startedAt)
     if (prefetchStartedRef.current === phaseKey) return
     prefetchStartedRef.current = phaseKey
-    // Capture the just-finished execute's start time while phase is narrowed
-    // to 'done' — the freshness watermark for the staleness check below.
-    const execStartedAt = phase.state.startedAt
 
     void (async () => {
       // Cancellation (audit P2): the ref is reset to null the moment phase
@@ -561,33 +684,23 @@ export default function App() {
       // Without this, a quick 繼續歸檔下一批 raced the still-in-flight prefetch
       // chain into a SECOND classifyPreflight+classifyAi (double Anthropic
       // spend, interleaved progress writes); 回主畫面 similarly let the chain
-      // resurrect AI progress that finishAndReset had just cleared.
+      // resurrect AI progress that finishAndReset had just cleared. (The SW's
+      // run ids now refuse a superseded run's classifyAi as well.)
       const cancelled = () => prefetchStartedRef.current !== phaseKey
-      // Audit: the just-executed batch leaves ITS OWN (older) AI classify
-      // progress in session storage — nothing clears it between classify-done
-      // and DoneScreen mount. The old guard bailed on ANY progress, so it
-      // mistook that stale residue for a live prefetch and never started one
-      // → pipeline mode was a silent no-op on every AI batch. Only bail when
-      // the progress is strictly NEWER than the execute we just finished (a
-      // genuine in-flight/done prefetch); otherwise clear the residue and
-      // proceed. Mirrors continueToNextBatch's startedAt staleness guard.
-      const existing = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
+      // Decide by run, not by timestamps (2026-11-05). The SW returns only the
+      // current run's progress with already-executed mail filtered out:
+      //   - still classifying, or has items left → it IS the next batch (e.g.
+      //     AI finished DURING a partial 「先執行」) — leave it for 繼續歸檔,
+      //     never re-classify the same mail (that paid twice);
+      //   - finished with nothing left → residue of the batch just executed.
+      const existing = await send<AiProgressMeta | null>({
+        type: 'getAiClassifyProgress',
+        view: 'meta',
+      })
       if (cancelled()) return
-      if (
-        existing.ok &&
-        existing.data &&
-        (existing.data.done === false ||
-          (typeof existing.data.startedAt === 'number' &&
-            existing.data.startedAt > execStartedAt))
-      ) {
-        // 活的 classify（進行中，可能是部分執行留下的）或真正的
-        // prefetch — 都不要動它。殘渣必然 done:true 且早於 execute。
-        return
-      }
       if (existing.ok && existing.data) {
-        // Stale residue from the batch we just executed — clear it so the
-        // resume path can't promote it and so our prefetch starts clean.
-        await send({ type: 'clearAiClassifyProgress' })
+        if (hasOfferableItems(existing.data)) return
+        await send({ type: 'cancelClassify', runId: existing.data.runId })
         if (cancelled()) return
       }
       // Headless preflight + classifyAi. Same SW handlers the foreground
@@ -600,7 +713,7 @@ export default function App() {
       if (cancelled()) return
       if (!pf.ok || !pf.data) return
       if (pf.data.unmatchedPreview.length === 0) return // nothing for AI to do
-      await send({ type: 'classifyAi', excludeIds: [] })
+      await send({ type: 'classifyAi', runId: pf.data.runId, excludeIds: [] })
     })().catch((e) => console.warn('[mail-organizer] prefetch failed (non-fatal)', e))
   }, [phase, status, batchSize])
 
@@ -648,13 +761,29 @@ export default function App() {
             summary: { ruleHits: number; aiHandled: number }
             banner: { code: string; message: string } | null
             aiPendingFlag?: boolean
+            runId?: string | null
           }
         } | null>({ type: 'getPopupState' }),
-        send<AiProgress | null>({ type: 'getAiClassifyProgress' }),
+        send<AiProgress | null>({ type: 'getAiClassifyProgress', view: 'full' }),
       ])
 
       const saved = stateResp.ok ? stateResp.data : null
-      const aiProg = aiResp.ok ? aiResp.data : null
+      let aiProg = aiResp.ok ? aiResp.data : null
+      // A finished run with nothing left on offer (everything executed) is
+      // residue, not a plan — don't reopen onto an empty plan (2026-11-05).
+      if (aiProg && !hasOfferableItems(aiProg)) aiProg = null
+      // Never graft another run's AI items onto this snapshot's plan (a run
+      // started from the other popup surface supersedes ours).
+      if (
+        saved?.phase === 'plan' &&
+        saved.plan?.runId &&
+        aiProg &&
+        aiProg.runId !== saved.plan.runId
+      ) {
+        aiProg = null
+      }
+      classifyRunIdRef.current = aiProg?.runId ?? saved?.plan?.runId ?? null
+      aiCursorRef.current = aiProg?.aiCursor ?? 0
 
       // Preview is no longer a phase. Legacy snapshots from prior versions
       // can still arrive — drop them silently so we fall through to idle.
@@ -708,21 +837,11 @@ export default function App() {
             // in-popup poll's done-branch below.
             usage = aiProg.usage ?? usage
             summary = {
-              ruleHits: aiProg.rulePlan.length,
+              ruleHits: aiProg.ruleCount,
               aiHandled:
-                aiProg.aiPlan.length -
-                (aiProg.skippedByUser ?? 0) -
-                aiProg.aiPlan.filter((x) => x.source === 'unresolved').length,
+                aiProg.aiCount - (aiProg.skippedByUser ?? 0) - aiProg.aiUnresolvedCount,
             }
-            if (aiProg.aiError) {
-              banner = {
-                code: aiProg.aiError.code,
-                message:
-                  aiProg.aiError.code === 'TRUNCATED' || aiProg.aiError.code === 'CONFIDENCE_GATED'
-                    ? aiProg.aiError.message
-                    : `AI 分類失敗：${aiProg.aiError.message}。規則命中與已完成部分仍可執行。`,
-              }
-            }
+            if (aiProg.aiError) banner = aiErrorBanner(aiProg.aiError)
           }
         }
       } else if (aiProg) {
@@ -730,12 +849,10 @@ export default function App() {
         folderTree = aiProg.folderTree
         usage = aiProg.usage ?? null
         summary = {
-          ruleHits: aiProg.rulePlan.length,
-          aiHandled: aiProg.aiPlan.length - (aiProg.skippedByUser ?? 0),
+          ruleHits: aiProg.ruleCount,
+          aiHandled: aiProg.aiCount - (aiProg.skippedByUser ?? 0),
         }
-        banner = aiProg.aiError
-          ? { code: aiProg.aiError.code, message: aiProg.aiError.message }
-          : undefined
+        banner = aiProg.aiError ? aiErrorBanner(aiProg.aiError) : undefined
       } else {
         return
       }
@@ -777,21 +894,30 @@ export default function App() {
   // refreshes land in the first 2-3 ticks; longer waits typically
   // mean MSAL itself is doing a silent token rotation and we won't
   // help by hammering the SW.
+  //
+  // 2026-11-05: an interval, not a one-shot timeout. The old effect keyed
+  // on the two booleans — which a still-waiting poll result doesn't change
+  // — so it fired exactly once and never re-armed. tokenPollStartRef keeps
+  // the 10 s ceiling across re-renders; it resets when waiting ends, so a
+  // later expiry gets a fresh window.
+  const tokenWaiting = !!status?.owaConnected && !status.tokenValid
   useEffect(() => {
-    const waiting = !!status?.owaConnected && !status.tokenValid
-    if (!waiting) {
+    if (!tokenWaiting) {
       tokenPollStartRef.current = null
       return
     }
-    if (tokenPollStartRef.current === null) {
-      tokenPollStartRef.current = Date.now()
-    }
-    if (Date.now() - tokenPollStartRef.current > 10_000) return
-    const id = window.setTimeout(() => {
-      void refreshStatus()
+    if (tokenPollStartRef.current === null) tokenPollStartRef.current = Date.now()
+    const startedAt = tokenPollStartRef.current
+    if (Date.now() - startedAt >= 10_000) return
+    const id = window.setInterval(() => {
+      if (Date.now() - startedAt >= 10_000) {
+        window.clearInterval(id)
+        return
+      }
+      void refreshStatus({ silent: true })
     }, 1000)
-    return () => clearTimeout(id)
-  }, [status?.owaConnected, status?.tokenValid, refreshStatus])
+    return () => window.clearInterval(id)
+  }, [tokenWaiting, refreshStatus])
 
   // Refresh status when the popup regains visibility / focus. Mainly
   // helps the OWA FAB iframe case where the popup persists across tab
@@ -849,6 +975,9 @@ export default function App() {
           // aiPending hint only — actual progress numbers come from
           // aiClassifyProgress on resume.
           aiPendingFlag: !!phase.aiPending,
+          // Which run these items came from — resume only merges that run's
+          // AI progress into them (2026-11-05).
+          runId: classifyRunIdRef.current,
         },
       }
       void send({ type: 'savePopupState', state: snapshot })
@@ -860,9 +989,37 @@ export default function App() {
   useEffect(() => {
     if (phase.kind !== 'plan' || !phase.aiPending) return
     const id = setInterval(async () => {
-      const r = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
-      if (!r.ok || !r.data) return
-      const prog = r.data
+      // Slim poll (2026-11-05): counts + only the AI items appended since our
+      // cursor — no folder tree, no rule plan (those came once, up front).
+      const r = await send<AiProgressPoll | null>({
+        type: 'getAiClassifyProgress',
+        view: 'poll',
+        aiFrom: aiCursorRef.current,
+      })
+      if (!r.ok) return
+      const prog = r.data ?? null
+      const myRunId = classifyRunIdRef.current
+      if (!prog || (myRunId != null && prog.runId !== myRunId)) {
+        // Our run is gone — cancelled or superseded (another popup surface
+        // started a new classify). Its progress will never arrive: stop
+        // waiting instead of polling forever, and never adopt the other
+        // run's items into this plan.
+        setPhase((p) =>
+          p.kind === 'plan' && p.aiPending
+            ? {
+                ...p,
+                aiPending: undefined,
+                banner: {
+                  code: 'CLASSIFIER_RUN_ENDED',
+                  message:
+                    'AI 分類已中止（已取消，或另一個視窗開始了新的分類）。已完成部分仍可執行，其餘郵件下一批會重新分類。',
+                },
+              }
+            : p,
+        )
+        return
+      }
+      aiCursorRef.current = Math.max(aiCursorRef.current, prog.aiCursor)
       setPhase((p) => {
         if (p.kind !== 'plan' || !p.aiPending) return p
 
@@ -882,22 +1039,12 @@ export default function App() {
             items,
             usage: prog.usage ?? null,
             summary: {
-              ruleHits: prog.rulePlan.length,
+              ruleHits: prog.ruleCount,
               aiHandled:
-                prog.aiPlan.length -
-                (prog.skippedByUser ?? 0) -
-                prog.aiPlan.filter((x) => x.source === 'unresolved').length,
+                prog.aiCount - (prog.skippedByUser ?? 0) - prog.aiUnresolvedCount,
             },
             aiPending: undefined,
-            banner: prog.aiError
-              ? {
-                  code: prog.aiError.code,
-                  message:
-                    prog.aiError.code === 'TRUNCATED' || prog.aiError.code === 'CONFIDENCE_GATED'
-                      ? prog.aiError.message
-                      : `AI 分類失敗：${prog.aiError.message}。規則命中與已完成部分仍可執行。`,
-                }
-              : p.banner,
+            banner: prog.aiError ? aiErrorBanner(prog.aiError) : p.banner,
           }
         }
         // Nothing changed this tick (the common case — chunks complete every
@@ -933,114 +1080,72 @@ export default function App() {
   // of starting a fresh classify. Saves the 30-60s the user would
   // otherwise wait. Falls back to the normal flow if no prefetch exists.
   async function continueToNextBatch() {
-    // Capture the just-finished execute's start time BEFORE clearing its
-    // state — this is the freshness watermark for the staleness guard
-    // below. We're called from the DoneScreen so phase is 'done'.
-    const executeStartedAt =
-      phase.kind === 'done' ? phase.state.startedAt : null
+    // Item 3: a double-submitted click must not start a second chain. The ref
+    // flips before the first await; once a plan / classify phase is set the
+    // DoneScreen (and its button) is gone.
+    if (continueInFlightRef.current) return
+    continueInFlightRef.current = true
+    try {
+      // Read the run BEFORE dropping the execute state (2026-11-05).
+      const aiResp = await send<AiProgress | null>({ type: 'getAiClassifyProgress', view: 'full' })
+      const run = aiResp.ok ? aiResp.data : null
 
-    // Don't clear AI progress yet — we might need to consume a prefetched
-    // result. Clear other per-batch state safely.
-    void send({ type: 'clearPopupState' })
-    void send({ type: 'clearExecuteState' })
-    void send({ type: 'dismissUndo' })
+      void send({ type: 'clearPopupState' })
+      await send({ type: 'clearExecuteState' })
+      void send({ type: 'dismissUndo' })
 
-    const aiResp = await send<AiProgress | null>({ type: 'getAiClassifyProgress' })
-    const prefetched = aiResp.ok ? aiResp.data : null
-
-    // STALENESS GUARD (2026-06-03 — root cause of「已歸檔的信混進下一批」).
-    // Session storage still holds the AI progress of the batch we JUST
-    // executed: nothing clears it between classify-done and here
-    // (confirmExecute only clears popupState; preflight only clears it
-    // when the NEXT classify starts). Without this check, prefetch-
-    // disabled users (the default) get that residue promoted as the
-    // "next batch" — the exact same plan whose ids are all dead after
-    // the move, so every row 404s「訊息已不在原位置」. The earlier
-    // recentlyProcessed-ledger fix never fires on this path because no
-    // inbox fetch happens at all.
-    //
-    // Discriminator: the 執行 button is disabled while aiPending, so the
-    // executed cycle's classify ALWAYS finished (last progress write
-    // included) before execute began → its startedAt < execute's
-    // startedAt. A genuine DoneScreen prefetch only starts after the
-    // execute finished → its startedAt > execute's startedAt. Strictly
-    // newer ⇔ genuine prefetch; anything else gets discarded and we
-    // re-classify from a fresh inbox fetch (where the ledger filter
-    // handles Outlook's listing lag).
-    // 刀3 (2026-07)：done === false 的 progress 一律視為「活的」。殘渣
-    // 必然是 done:true（見上面的推導）— 但部分執行（AI 分類中先執行規則
-    // 命中）打破了「執行前 classify 必已完成」的前提：執行後 classify
-    // 仍在跑、其 startedAt 早於 execute，卻是貨真價實的進行中工作，
-    // 不能被當殘渣清掉。
-    const isFreshPrefetch =
-      prefetched != null &&
-      (prefetched.done === false ||
-        (executeStartedAt != null &&
-          typeof prefetched.startedAt === 'number' &&
-          prefetched.startedAt > executeStartedAt))
-    if (!prefetched || !isFreshPrefetch) {
-      // No prefetch available (or stale residue) — clean start.
-      await send({ type: 'clearAiClassifyProgress' })
-      void startClassify(false)
-      return
+      // CONSUME BY RUN (2026-11-05 — replaces the startedAt staleness guard
+      // that fixed「已歸檔的信混進下一批」on 2026-06-03). The SW only returns
+      // the current run's progress, and has already removed every email
+      // submitted to execute while that run was current, so whatever it
+      // still offers is genuinely unprocessed: a DoneScreen prefetch, or the
+      // rest of a run that was partially executed (「先執行 N 個」) — whether
+      // it is still classifying or finished DURING the execute. The old
+      // heuristic ("strictly newer than the execute ⇔ prefetch") discarded
+      // that second case and re-classified the same mail, paying twice.
+      // Nothing left to offer → residue of the batch just executed: clean
+      // start from a fresh inbox fetch.
+      if (!run || !hasOfferableItems(run)) {
+        if (run) await send({ type: 'cancelClassify', runId: run.runId })
+        // Awaited so the re-entry guard spans the whole preflight + classifyAi.
+        await startClassify(false)
+        return
+      }
+      classifyRunIdRef.current = run.runId
+      aiCursorRef.current = run.aiCursor
+      // Promote the run into a plan phase. If AI is still running we land in
+      // plan with aiPending so progress keeps polling.
+      setPhase({
+        kind: 'plan',
+        items: [...run.rulePlan, ...run.aiPlan],
+        folderTree: run.folderTree,
+        usage: run.usage ?? null,
+        summary: {
+          ruleHits: run.ruleCount,
+          aiHandled: run.aiCount - (run.skippedByUser ?? 0),
+        },
+        banner: run.aiError ? aiErrorBanner(run.aiError) : undefined,
+        aiPending: run.done
+          ? undefined
+          : {
+              startedAt: run.startedAt ?? Date.now(),
+              totalEmails: run.totalEmails,
+              completedEmails: run.completedEmails,
+              chunks: run.chunks,
+              completedChunks: run.completedChunks,
+            },
+      })
+      void refreshStatus()
+    } finally {
+      continueInFlightRef.current = false
     }
-    // Promote the prefetched result into a plan phase. If AI is still
-    // running we land in plan with aiPending so progress keeps polling.
-    //
-    // 刀3：部分執行後，progress 裡仍留著「剛剛已執行那批」的 plan 項 —
-    // 把已終局處理（移動/刪除/建夾/保留）的 email 濾掉，只讓「還沒處理
-    // 的」進入新 plan。error/cancelled 保留 — 那些信還在收件匣，該給
-    // 使用者重試的機會。
-    const executedIds = new Set(
-      phase.kind === 'done'
-        ? phase.state.results
-            .filter(
-              (r) =>
-                r.status === 'moved' ||
-                r.status === 'deleted' ||
-                r.status === 'folder_created' ||
-                r.status === 'skipped',
-            )
-            .map((r) => r.emailId)
-        : [],
-    )
-    const items: PlanItem[] = [...prefetched.rulePlan, ...prefetched.aiPlan].filter(
-      (i) => !executedIds.has(i.emailId),
-    )
-    if (items.length === 0 && prefetched.done) {
-      // Edge case: prefetch completed but inbox was empty — fall through.
-      await send({ type: 'clearAiClassifyProgress' })
-      void startClassify(false)
-      return
-    }
-    setPhase({
-      kind: 'plan',
-      items,
-      folderTree: prefetched.folderTree,
-      usage: prefetched.usage ?? null,
-      summary: {
-        ruleHits: prefetched.rulePlan.length,
-        aiHandled: prefetched.aiPlan.length - (prefetched.skippedByUser ?? 0),
-      },
-      banner: prefetched.aiError
-        ? { code: prefetched.aiError.code, message: prefetched.aiError.message }
-        : undefined,
-      aiPending: prefetched.done
-        ? undefined
-        : {
-            startedAt: prefetched.startedAt ?? Date.now(),
-            totalEmails: prefetched.totalEmails,
-            completedEmails: prefetched.aiPlan.length,
-            chunks: prefetched.chunks,
-            completedChunks: prefetched.completedChunks,
-          },
-    })
-    void refreshStatus()
   }
 
   async function startClassify(forceFresh = false) {
     // Fresh classify replaces any stale popup state from a prior session.
     void send({ type: 'clearPopupState' })
+    classifyRunIdRef.current = null
+    aiCursorRef.current = 0
     setPhase({ kind: 'classifying', startedAt: Date.now() })
     const r = await send<PreflightData>({ type: 'classifyPreflight', batchSize, forceFresh })
     if (!r.ok) {
@@ -1052,6 +1157,8 @@ export default function App() {
       return
     }
     const data = r.data
+    // The preflight started this run; everything from here on is about it.
+    classifyRunIdRef.current = data.runId
 
     // Build a banner describing what got pre-filtered, if anything.
     const parts: string[] = []
@@ -1084,6 +1191,7 @@ export default function App() {
     // rule hits so the user can review while AI works in background.
     const aiResp = await send<{ started: boolean; chunks: number; totalEmails: number }>({
       type: 'classifyAi',
+      runId: data.runId,
       excludeIds: [],
     })
     if (!aiResp.ok) {
@@ -1162,9 +1270,28 @@ export default function App() {
     await send({ type: 'cancelExecute' })
   }
 
+  // In-flight guard for 重試 (2026-11-05) — same failure mode confirmExecute
+  // guards against: a double-click sent retryFailed twice, the second reply
+  // was ALREADY_RUNNING (the first retry had just started), and the user
+  // landed on ErrorScreen while the retry ran unseen. The ref flips before
+  // the first await so click #2 is a no-op; `retrying` greys the button.
+  const retrySubmittingRef = useRef(false)
+  const [retrying, setRetrying] = useState(false)
   async function retryFailed() {
-    const r = await send<{ started: number }>({ type: 'retryFailed' })
-    if (!r.ok) {
+    if (retrySubmittingRef.current) return
+    retrySubmittingRef.current = true
+    setRetrying(true)
+    let r: Awaited<ReturnType<typeof send<{ started: number }>>>
+    try {
+      r = await send<{ started: number }>({ type: 'retryFailed' })
+    } finally {
+      retrySubmittingRef.current = false
+      setRetrying(false)
+    }
+    // ALREADY_RUNNING = a batch (our retry via another surface, or a fresh
+    // execute) is running right now — show it rather than an error; the
+    // getExecuteState poll adopts the real state.
+    if (!r.ok && r.code !== 'ALREADY_RUNNING') {
       setPhase({ kind: 'error', code: r.code, message: r.message })
       return
     }
@@ -1175,7 +1302,7 @@ export default function App() {
         inProgress: true,
         cancelRequested: false,
         startedAt: Date.now(),
-        total: r.data?.started ?? 0,
+        total: r.ok ? (r.data?.started ?? 0) : 0,
         current: 0,
         results: [],
         summary: { moved: 0, deleted: 0, foldersCreated: 0, skipped: 0, cancelled: 0, errors: 0 },
@@ -1185,17 +1312,30 @@ export default function App() {
   }
 
   async function finishAndReset() {
+    // 完成 ends the session's classify work too (2026-11-05): cancelClassify
+    // stops a still-running run (e.g. after 「先執行 N 個」) instead of only
+    // deleting its progress key while the loop kept calling Claude and wrote
+    // the key back — with already-executed rule hits in it.
     await Promise.all([
       send({ type: 'clearExecuteState' }),
       send({ type: 'clearPopupState' }),
-      send({ type: 'clearAiClassifyProgress' }),
+      send({ type: 'cancelClassify' }),
     ])
+    classifyRunIdRef.current = null
+    aiCursorRef.current = 0
     setPhase({ kind: 'idle' })
     void refreshStatus()
   }
 
   function backToIdle() {
     void send({ type: 'clearPopupState' })
+    // 取消 abandons this plan's run (item 1): its loop stops before the next
+    // Claude call. Only OUR run — a newer one from the other popup surface
+    // isn't ours to cancel.
+    const runId = classifyRunIdRef.current
+    if (runId) void send({ type: 'cancelClassify', runId })
+    classifyRunIdRef.current = null
+    aiCursorRef.current = 0
     setPhase({ kind: 'idle' })
   }
 
@@ -1223,18 +1363,48 @@ export default function App() {
     // content script can overlay a big options iframe on top of OWA.
     // Detected via `window.parent !== window` which is true only when we're
     // embedded; the regular toolbar popup is a top-level browser popup.
-    if (window.parent !== window) {
-      postToParent({ type: 'mail-organizer/open-options' })
-    } else {
-      chrome.runtime.openOptionsPage()
+    // No live bridge yet / any more (2026-11-05: e.g. the FAB content
+    // script is a pre-update orphan that never completes the port
+    // handshake) → open options in a tab rather than a dead click.
+    if (window.parent !== window && postToParent({ type: 'mail-organizer/open-options' }, { queue: false })) {
+      return
     }
+    chrome.runtime.openOptionsPage()
   }
+
+  // Stable identity (2026-11-05) so the memoized PlanRow isn't re-rendered
+  // by every App render. Throw on Err so PlanRow's catch can roll back the
+  // optimistic localDisabled flag. send() resolves both Ok and Err — without
+  // this gate, an Err response would silently leave the UI displaying
+  // "已停用" while the rule is still firing. NOT_FOUND (rule deleted
+  // elsewhere) is tagged so the row can say so instead of "請再試一次".
+  const toggleRuleFromPlan = useCallback(async (ruleId: string, enabled: boolean) => {
+    const r = await send({ type: 'toggleRule', ruleId, enabled })
+    if (!r.ok) {
+      throw Object.assign(new Error(r.message || 'toggle failed'), { code: r.code })
+    }
+  }, [])
+
+  // Memoized provider value (2026-11-05): an inline `{ isWide }` object is a
+  // new context value on every App render, which re-renders every context
+  // consumer — i.e. every PlanRow — regardless of React.memo.
+  const layoutValue = useMemo(() => ({ isWide }), [isWide])
+
+  // Content-stable exclude list (2026-11-05): every getStatus mints a new
+  // array, which would re-render every memoized PlanRow on each status
+  // refresh even though nothing changed.
+  const excludeKey = (status?.excludePrefixes ?? NO_EXCLUDE_PREFIXES).join('\u0000')
+  const excludePrefixes = useMemo(
+    () => status?.excludePrefixes ?? NO_EXCLUDE_PREFIXES,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content
+    [excludeKey],
+  )
 
   const canStart =
     status?.owaConnected && status?.tokenValid && status?.apiKeyConfigured && phase.kind === 'idle'
 
   return (
-    <LayoutContext.Provider value={{ isWide }}>
+    <LayoutContext.Provider value={layoutValue}>
     <main
       ref={rootRef}
       className="w-full min-w-[540px] max-w-[1600px] min-h-[520px] max-h-[100vh] overflow-y-auto bg-background text-foreground font-sans"
@@ -1283,7 +1453,11 @@ export default function App() {
                 <StatusPill ok={false} label="未連線 Outlook" tooltip="請打開 Outlook 網頁分頁並登入" />
               )}
               {tokenIssue && (
-                <StatusPill ok={false} label="Outlook 登入過期" tooltip="OWA 可能剛開、稍等幾秒再試" />
+                <StatusPill
+                  ok={false}
+                  label="Outlook 登入過期"
+                  tooltip={status.tokenError ? tokenIssueText(status) : 'OWA 可能剛開、稍等幾秒再試'}
+                />
               )}
               {keyIssue && (
                 <StatusPill ok={false} label="缺 Claude API key" tooltip="請到設定頁設定 API key" />
@@ -1328,7 +1502,7 @@ export default function App() {
           <PlanScreen
             items={phase.items}
             tree={phase.folderTree}
-            excludePrefixes={status?.excludePrefixes ?? ['05已完成案件']}
+            excludePrefixes={excludePrefixes}
             usage={phase.usage}
             model={status?.model}
             summary={phase.summary}
@@ -1341,14 +1515,7 @@ export default function App() {
             onDismissBanner={() =>
               setPhase((p) => (p.kind === 'plan' ? { ...p, banner: undefined } : p))
             }
-            onToggleRule={async (ruleId, enabled) => {
-              // Throw on Err so PlanRow's catch can roll back the optimistic
-              // localDisabled flag. send() resolves both Ok and Err — without
-              // this gate, an Err response would silently leave the UI
-              // displaying "已停用" while the rule is still firing.
-              const r = await send({ type: 'toggleRule', ruleId, enabled })
-              if (!r.ok) throw new Error(r.message || 'toggle failed')
-            }}
+            onToggleRule={toggleRuleFromPlan}
           />
         )}
 
@@ -1362,6 +1529,7 @@ export default function App() {
             batchSize={batchSize}
             onReset={finishAndReset}
             onRetry={retryFailed}
+            retrying={retrying}
             onContinue={() => void continueToNextBatch()}
           />
         )}
@@ -1438,6 +1606,8 @@ function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             onClick={onClose}
             className="text-muted-foreground hover:text-foreground"
             aria-label="關閉"
+            // Land keyboard focus inside the dialog (a11y convention, 2026-11-05).
+            autoFocus
           >
             <XCircle className="size-4" />
           </button>
@@ -1447,12 +1617,13 @@ function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             { keys: ['j', 'k'], desc: '上下移動焦點' },
             { keys: ['x', 'Space'], desc: '勾選 / 取消勾選此項' },
             { keys: ['Enter'], desc: '展開 / 收起此項' },
-            { keys: ['d'], desc: '把這封改為「刪除」' },
+            // Delete = MOVE to Deleted Items (recoverable), 2026-11-05.
+            { keys: ['d'], desc: `把這封改為「刪除」（${DELETE_DESTINATION_LABEL}、可回復）` },
             { keys: ['s'], desc: '把這封改為「保留」' },
             { keys: ['/'], desc: '過濾清單 — 主旨 / 寄件人 / 路徑' },
             { keys: ['u'], desc: '完成畫面 — 撤回剛剛的批次' },
             { keys: ['?'], desc: '顯示這個說明' },
-            { keys: ['Esc'], desc: '關閉面板 / 收起選單' },
+            { keys: ['Esc'], desc: '由內而外收起：選單 / 說明視窗 → 面板' },
           ].map((row) => (
             <Fragment key={row.desc}>
               <dt className="flex items-center gap-1 font-mono">
@@ -1506,7 +1677,7 @@ function IdleScreen({
     if (!status.owaConnected)
       issues.push({ label: '請先打開並登入 Outlook 網頁版分頁、再重開此 popup' })
     if (status.owaConnected && !status.tokenValid)
-      issues.push({ label: '無法讀取 Outlook 登入資訊、稍等幾秒再試' })
+      issues.push({ label: tokenIssueText(status) })
     if (!status.apiKeyConfigured)
       issues.push({
         label: '尚未設定 Claude API key',
@@ -1826,25 +1997,32 @@ function RecentActivityPanel({
   }
 
   async function handleClick(row: FolderActivityRow) {
-    if (window.parent !== window) {
-      // FAB iframe mode: ask the content script in OWA to do an in-page
-      // navigation (click the folder's treeitem → OWA's SPA navigates
-      // without reloading). This is the no-flash path. The folder name is
-      // the leaf segment of folderPath — OWA's treeitem uses data-folder-name
-      // which matches displayName.
-      const folderName = row.folderPath.split('/').filter(Boolean).pop() || ''
-      postToParent({
-        type: 'mail-organizer/navigate-folder',
-        folderName,
-        folderPath: row.folderPath,
-        folderId: row.folderId,
-      })
+    const folderName = row.folderPath.split('/').filter(Boolean).pop() || ''
+    // FAB iframe mode: ask the content script in OWA to do an in-page
+    // navigation (click the folder's treeitem → OWA's SPA navigates
+    // without reloading). This is the no-flash path. The folder name is
+    // the leaf segment of folderPath — OWA's treeitem uses data-folder-name
+    // which matches displayName. Not queued (2026-11-05): without a live
+    // bridge, fall through to the tab-based navigation below instead.
+    if (
+      window.parent !== window &&
+      postToParent(
+        {
+          type: 'mail-organizer/navigate-folder',
+          folderName,
+          folderPath: row.folderPath,
+          folderId: row.folderId,
+        },
+        { queue: false },
+      )
+    ) {
       // Close the panel so the user sees the navigation result.
       postToParent({ type: 'mail-organizer/close-panel' })
     } else {
-      // Toolbar popup mode: no embedded OWA window to message; ask SW to
-      // switch / open the OWA tab via chrome.tabs (full reload, but
-      // unavoidable in this mode — Chrome popup closes on focus loss anyway).
+      // Toolbar popup mode (or no live FAB bridge): no embedded OWA window
+      // to message; ask SW to switch / open the OWA tab via chrome.tabs
+      // (full reload, but unavoidable in this mode — Chrome popup closes on
+      // focus loss anyway).
       await send({ type: 'navigateToFolder', folderId: row.folderId })
     }
   }
@@ -2109,7 +2287,7 @@ function targetGroupKey(item: PlanItem): string {
       ? `${joinFolderPath(item.suggestedParentPath, item.suggestedFolderName)}（新建）`
       : '（新建・未完成）'
   }
-  if (item.action === 'delete') return '（刪除）'
+  if (item.action === 'delete') return `（刪除・${DELETE_DESTINATION_LABEL}）`
   return '（保留）'
 }
 
@@ -2378,14 +2556,16 @@ function PlanScreen({
     if (changed) setSelectedIds(filtered)
   }, [items, selectedIds])
 
-  function toggleSelect(id: string) {
+  // Stable (2026-11-05): only touches the state setter, so the memoized
+  // PlanRow can receive it directly.
+  const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
   // ---- Keyboard navigation ------------------------------------------------
   // Focused index drives j/k navigation, x toggles select, Enter expands the
@@ -2398,16 +2578,16 @@ function PlanScreen({
   // 持久化（UI/UX 檢討 2026-07）：舊版是 component-local state，每次開
   // popup 提示都重生 — 每天用的人被迫反覆關同一條提示。localStorage 在
   // extension popup 內跨 session 存活；? overlay 仍可隨時查快捷鍵。
+  // 2026-11-05: guarded read — in the OWA iframe with third-party storage
+  // blocked, the localStorage getter itself throws and this initializer
+  // used to crash the whole plan screen.
   const [shortcutsHintDismissed, setShortcutsHintDismissed] = useState(
-    () => localStorage.getItem('mo.shortcutsHintDismissed') === '1',
+    () => readWebStorage('local', 'mo.shortcutsHintDismissed') === '1',
   )
   const dismissShortcutsHint = useCallback(() => {
     setShortcutsHintDismissed(true)
-    try {
-      localStorage.setItem('mo.shortcutsHintDismissed', '1')
-    } catch {
-      // quota / private mode — session-only dismissal is still fine
-    }
+    // quota / private mode / blocked — session-only dismissal is still fine
+    writeWebStorage('local', 'mo.shortcutsHintDismissed', '1')
   }, [])
 
   // Auto-clear focus when items disappear (defensive — same scenario as
@@ -2430,14 +2610,30 @@ function PlanScreen({
     setFocusedIndex(null)
   }, [filterChips, sortMode])
 
+  // Stable row handlers for the memoized PlanRow (2026-11-05). PlanRow used
+  // to get fresh inline arrows on every render, so each filter keystroke or
+  // j/k re-rendered all ~100 rows (5-15 ms each). These keep one identity
+  // for the screen's lifetime and always call the latest closure.
+  // (handleItemChange / propagateFrom are function declarations — hoisted.)
+  const onRowChange = useStableCallback(handleItemChange)
+  const onRowPropagate = useStableCallback(propagateFrom)
+  const onRowActivate = useCallback((index: number) => setFocusedIndex(index), [])
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      // Don't hijack typing in inputs/textareas/contenteditable elements
-      const t = e.target as HTMLElement | null
-      const tag = t?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      // Don't hijack typing in inputs/textareas/selects/contenteditable or
+      // composite widgets (listbox / menu / …) — they own every key.
+      if (ownsNavigationKeys(e.target)) return
       // Don't compete with browser/system shortcuts
       if (e.metaKey || e.ctrlKey || e.altKey) return
+      // An open layer (? dialog, menu) owns the keyboard — don't drive the
+      // list underneath it.
+      if (overlayLayerOpen()) return
+      // Enter / Space on a focused button / link / summary is that
+      // element's native activation (2026-11-05). Clicking a row sets the
+      // keyboard cursor, so Enter on 執行 used to toggle the cursor row
+      // instead of executing. j/k/x/d/s still work from a focused button.
+      if ((e.key === 'Enter' || e.key === ' ') && ownsActivationKeys(e.target)) return
 
       // `/` opens the filter input. Available even during AI classify so
       // the user can pre-narrow the rule-hit portion of the plan while
@@ -2496,7 +2692,7 @@ function PlanScreen({
           e.preventDefault()
           const item = displayItems[focusedIndex]
           if (item && item.action !== 'delete') {
-            handleItemChange({
+            onRowChange({
               ...item,
               action: 'delete',
               targetFolderId: undefined,
@@ -2515,7 +2711,7 @@ function PlanScreen({
           e.preventDefault()
           const item = displayItems[focusedIndex]
           if (item && item.action !== 'skip') {
-            handleItemChange({
+            onRowChange({
               ...item,
               action: 'skip',
               targetFolderId: undefined,
@@ -2535,7 +2731,7 @@ function PlanScreen({
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [displayItems, focusedIndex, aiPending, onChange])
+  }, [displayItems, focusedIndex, onRowChange, toggleSelect])
 
   // Subject groups for "💡 N items share same subject" hints
   const subjectGroups = useMemo(() => {
@@ -2974,6 +3170,7 @@ function PlanScreen({
                 variant="outline"
                 className="border-red-300 text-red-700 hover:bg-red-50"
                 onClick={applyDelete}
+                title="把勾選的郵件改為移到 Outlook「已刪除的郵件」（可回復）"
               >
                 全部刪除
               </Button>
@@ -3088,6 +3285,7 @@ function PlanScreen({
                 <li className="contents">
                 <PlanRow
                   item={it}
+                  index={idx}
                   tree={augmentedTree}
                   validPaths={validPaths}
                   excludePrefixes={excludePrefixes}
@@ -3102,11 +3300,11 @@ function PlanScreen({
                   toggleExpandToken={
                     focusedIndex === idx ? toggleExpandToken : undefined
                   }
-                  onChange={handleItemChange}
-                  onToggleSelect={() => toggleSelect(it.emailId)}
-                  onPropagate={() => propagateFrom(it)}
+                  onChange={onRowChange}
+                  onToggleSelect={toggleSelect}
+                  onPropagate={onRowPropagate}
                   onToggleRule={onToggleRule}
-                  onActivate={() => setFocusedIndex(idx)}
+                  onActivate={onRowActivate}
                 />
                 {/* Conversation cluster hint: shown directly under the
                     rep when this group has siblings. Collapsed = "+ N
@@ -3179,12 +3377,15 @@ function PlanScreen({
         )}
         <div className="flex items-center justify-between gap-2">
           <Button variant="ghost" onClick={onBack}>取消</Button>
+          {/* Delete = MOVE to Deleted Items (2026-11-05): one consistent
+              story — recoverable from that folder, and undoable from the
+              done screen like any other move. */}
           {counts.delete > 0 && (
             <span
               className="text-[10px] text-amber-800 text-right flex-1"
-              title="刪除的郵件可從 Outlook「已刪除的郵件」資料夾回復"
+              title="「刪除」會把郵件移到 Outlook「已刪除的郵件」資料夾 — 可在完成畫面撤回，或之後從該資料夾還原"
             >
-              含 {counts.delete} 件刪除・可回復
+              含 {counts.delete} 件{DELETE_DESTINATION_LABEL}・可回復
             </span>
           )}
           {/* 刀3：AI 分類中不再鎖死執行 — 已完成的（規則命中＋已分類的
@@ -3325,12 +3526,15 @@ function DoneScreen({
   batchSize,
   onReset,
   onRetry,
+  retrying = false,
   onContinue,
 }: {
   state: ExecuteState
   batchSize: number
   onReset: () => void
   onRetry: () => void
+  /** 重試 request in flight — the button greys out (2026-11-05). */
+  retrying?: boolean
   onContinue: () => void
 }) {
   const elapsedSec = state.finishedAt ? Math.round((state.finishedAt - state.startedAt) / 1000) : 0
@@ -3502,7 +3706,11 @@ function DoneScreen({
             className="underline underline-offset-2 hover:text-foreground transition-colors"
             title="鍵盤捷徑:u"
           >
-            撤回 {undoSnap!.moves.length} 件搬移
+            {/* Deletes are moves into 已刪除的郵件 now (2026-11-05) and undoable too. */}
+            撤回 {undoSnap!.moves.length} 件
+            {undoSnap!.moves.some((m) => m.deleted)
+              ? `(含 ${undoSnap!.moves.filter((m) => m.deleted).length} 件刪除)`
+              : '搬移'}
           </button>
           <span className="font-mono tabular-nums">({Math.ceil(remainingMs / 1000)}s)</span>
           <button
@@ -3567,8 +3775,8 @@ function DoneScreen({
       )}
 
       {errored.length > 0 && (
-        <Button onClick={onRetry} className="w-full" variant="default">
-          <RotateCcw /> 重試 {errored.length} 個錯誤
+        <Button onClick={onRetry} className="w-full" variant="default" disabled={retrying}>
+          {retrying ? <Loader2 className="animate-spin" /> : <RotateCcw />} 重試 {errored.length} 個錯誤
         </Button>
       )}
       {/*

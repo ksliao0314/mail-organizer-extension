@@ -8,7 +8,7 @@
 // We deliberately don't include "suspected missing rules" — that needs an
 // execute-history feed which the codebase doesn't yet maintain.
 
-import { findConflicts, isGenericProviderDomain } from './rules'
+import { findConflicts, isGenericProviderDomain, ruleFires } from './rules'
 import type { Rule } from './types'
 
 export type RuleHealthOptions = {
@@ -104,10 +104,13 @@ export function computeRuleHealth(
       // bucket frames a different "what to do about it" action.
     }
 
-    // Sleeping detection
+    // Sleeping detection. "Never used" means never FIRED (2026-11-05):
+    // overrides don't bump matchCount, so a rule the user keeps correcting
+    // used to read as asleep — it is awake and wrong, which is the
+    // error-rate retirement's job, not this bucket's.
     const createdMs = Date.parse(r.createdAt)
     const lastUsedMs = r.lastUsedAt ? Date.parse(r.lastUsedAt) : null
-    if (r.matchCount === 0 && Number.isFinite(createdMs)) {
+    if (ruleFires(r) === 0 && Number.isFinite(createdMs)) {
       const ageDays = (now - createdMs) / DAY_MS
       if (ageDays >= neverUsedAgeDays) {
         sleeping.push(r)

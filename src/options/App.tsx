@@ -1,3 +1,4 @@
+import type { PopupRequest } from '@/shared/messages'
 import { Fragment, memo, type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -7,14 +8,21 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { FolderPicker } from '@/popup/components/FolderPicker'
 import { AlertTriangle, BarChart3, CheckCircle2, ChevronDown, ChevronRight, Download, KeyRound, LayoutGrid, List, ListChecks, Loader2, Mail, Pencil, Play, Plus, Power, PowerOff, Radar, RotateCcw, Search, Settings as SettingsIcon, ShieldAlert, SlidersHorizontal, Trash2, Upload, User, X } from 'lucide-react'
 import {
+  applyConfidenceCap,
   decodeCompound,
   encodeCompound,
   extractCaseCodes,
   extractCourtCaseNumbers,
+  ruleErrorRate,
+  ruleFires,
   type CompoundCondition,
 } from '@/shared/rules'
 import { computeRuleHealth } from '@/shared/rule-health'
+import { CLAUDE_MODELS } from '@/shared/claude-models'
 import { initParentBridge, postToParent } from '@/shared/parent-bridge'
+import { readWebStorage, writeWebStorage } from '@/popup/web-storage'
+import { isImeComposing, isTextEntryTarget, overlayLayerOpen } from '@/popup/keyboard'
+import { countOf, isUnknownHandler, reconcileRuleList } from './rule-list'
 import {
   browserLabel,
   detectBrowser,
@@ -81,24 +89,35 @@ const PRESET_CHIP_LABEL: Record<RulePresetChip, string> = {
  */
 const editReturn: { returnToHash: string | null } = { returnToHash: null }
 
-/** sessionStorage 讀寫小工具 — 篩選狀態跨 sub-view 導航保留用。 */
+/**
+ * sessionStorage 讀寫小工具 — 篩選狀態跨 sub-view 導航保留用。
+ * 2026-11-05: the old `typeof sessionStorage` check ran OUTSIDE the try and
+ * itself evaluates the getter — which throws SecurityError in the OWA
+ * iframe when third-party storage is blocked. Delegates to the fully
+ * guarded helpers.
+ */
 function readSessionValue(key: string): string | null {
-  if (typeof sessionStorage === 'undefined') return null
-  try {
-    return sessionStorage.getItem(key)
-  } catch {
-    return null
-  }
+  return readWebStorage('session', key)
 }
 function writeSessionValue(key: string, value: string) {
-  if (typeof sessionStorage === 'undefined') return
-  try {
-    sessionStorage.setItem(key, value)
-  } catch {
-    /* ignore quota / disabled storage */
-  }
+  writeWebStorage('session', key, value)
 }
-async function send<T>(req: unknown): Promise<Ok<T> | Err> {
+
+/**
+ * Per-type confidence ceiling the SW enforces on every non-user_manual
+ * write (2026-11-05). Derived from the real applyConfidenceCap so the
+ * slider can't drift from the backend invariant.
+ */
+function confidenceCeiling(type: RuleType, source: RuleSource): number {
+  if (source === 'user_manual') return 1
+  return applyConfidenceCap({ type, source, confidence: 1 } as Rule).confidence
+}
+
+/** Stable empty fallback for prefix lists (keeps memoized children quiet). */
+const NO_PREFIXES: string[] = []
+// Typed against the SW's MessageType union (2026-11-05): an unknown message
+// type is now a compile error, not a silent UNKNOWN_TYPE at runtime.
+async function send<T>(req: PopupRequest): Promise<Ok<T> | Err> {
   return chrome.runtime.sendMessage(req)
 }
 
@@ -155,11 +174,10 @@ type ScanState = {
   }
 }
 
-const MODEL_OPTIONS = [
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6（精準、推薦）' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5（快、便宜）' },
-  { id: 'claude-opus-4-7', label: 'Opus 4.7（最強、最貴）' },
-]
+// Derived from the known-model table (2026-11-05) so the picker, settings
+// validation and the per-model request params can't drift apart. Current
+// 5.5 models first; 4.x ids stay selectable, labelled 舊版.
+const MODEL_OPTIONS = CLAUDE_MODELS.map((m) => ({ id: m.id, label: m.label }))
 
 /**
  * Collapsible wrapper for advanced / diagnostic sections — uses native
@@ -203,26 +221,47 @@ function formatRelativeTime(iso: string | undefined): string {
  * errors. A lawyer doesn't need to know what schemaVersion is — they
  * need to know what to DO. This mapping covers the common failure modes:
  *
- *   - schema downgrade refused → upgrade extension on this device
- *   - quota exceeded          → clean up sleeping / orphaned rules
- *   - quota write/min hit     → just wait, retry
- *   - schemaVersion mismatch  → upgrade extension
+ *   - write-rate limit hit    → wait; the engine retries on its own (checked
+ *                               FIRST: Chrome's text "MAX_WRITE_OPERATIONS_PER_
+ *                               MINUTE quota exceeded" also contains "quota"
+ *                               and used to tell rate-limited users to delete
+ *                               rules — 2026-11-05)
+ *   - cloud schema newer      → upgrade extension on this device
+ *   - byte quota exceeded     → clean up sleeping / orphaned rules
+ *   - cloud mid-upload (torn) → wait; retried automatically
+ *   - backup write failed     → local storage nearly full; sync continued
  *   - network / fetch fail    → retry now
  *   - generic 'in flight'     → friendly "already running" message
  *   - fallthrough             → echo the raw reason
  */
-function describeSyncError(
+export function describeSyncError(
   reason: string,
   source: 'push' | 'pull' | 'pull-remote',
 ): { hint: string; cta?: { label: string; action: 'upgrade' | 'cleanup' | 'retry' } } {
   const r = reason.toLowerCase()
+  if (r.includes('write_operations')) {
+    return {
+      hint: r.includes('per_hour')
+        ? '這一小時內同步寫入次數已達瀏覽器上限、被暫時限速。系統會自動延後重試、不需要刪除任何規則。'
+        : '同步寫入太頻繁、被瀏覽器暫時限速。約一分鐘後會自動重試、不需要刪除任何規則。',
+      cta: { label: '立即重試', action: 'retry' },
+    }
+  }
   if (r.includes('schemaversion')) {
+    // Older clouds are read and upgraded automatically since v1.0.8, so a
+    // schema error always means the cloud was written by a NEWER build.
     return {
       hint:
         source === 'push'
           ? '雲端規則的版本比這台機器新、無法覆蓋。請先把此瀏覽器的擴充功能升級到最新版本、然後再試一次。'
-          : '雲端規則的版本格式跟這台機器不符。請把這台機器的擴充功能升級到最新版本。',
+          : '雲端規則是由較新版本的擴充功能寫入的、這台機器讀不懂。請把這台機器的擴充功能升級到最新版本。',
       cta: { label: '到擴充功能管理頁檢查版本', action: 'upgrade' },
+    }
+  }
+  if (r.includes('unrecognized cloud data')) {
+    return {
+      hint: '雲端的同步資料格式無法辨識。可以在這台機器按「立即上傳」以本機規則重建雲端資料。',
+      cta: { label: '立即重試', action: 'retry' },
     }
   }
   if (r.includes('quota_bytes') || (r.includes('quota') && r.includes('exceed'))) {
@@ -232,10 +271,15 @@ function describeSyncError(
       cta: { label: '到規則庫清理', action: 'cleanup' },
     }
   }
-  if (r.includes('max_write_operations') || r.includes('write_operations_per')) {
+  if (r.includes('incomplete') || r.includes('kept changing')) {
     return {
-      hint: '同步寫入太頻繁、被瀏覽器暫時限速。稍等一分鐘後會自動恢復。',
+      hint: '另一台機器剛上傳的雲端資料還沒完整送達、這次先跳過。資料到齊後會自動重新同步。',
       cta: { label: '立即重試', action: 'retry' },
+    }
+  }
+  if (r.includes('backup failed')) {
+    return {
+      hint: '同步前的本機快照寫入失敗(本機儲存空間可能不足)、同步本身仍已完成。可清理略過紀錄或舊規則以釋出空間。',
     }
   }
   if (r.includes('network') || r.includes('failed to fetch') || r.includes('offline')) {
@@ -293,19 +337,23 @@ export default function App() {
     if (window.parent === window) return // standalone tab
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
+      // An inner widget already consumed this Esc (e.g. a FolderPicker
+      // closing its dropdown), or it's an IME composition cancel.
+      if (e.defaultPrevented || isImeComposing(e)) return
       // Don't intercept ESC while the user is mid-edit in an input/textarea
       // — that breaks "ESC to clear value" expectations on form fields.
-      const t = e.target as HTMLElement | null
-      const tag = t?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      if (isTextEntryTarget(e.target)) return
       // If a layered overlay (rule-detail drawer, confirm dialog, actions
-      // menu) is open, Esc belongs to IT — bail and let its own handler
-      // close just that layer. Their stopImmediatePropagation can't save us
-      // here: this App-level listener registers at mount, BEFORE any
-      // overlay's listener, and document keydown listeners fire in
-      // registration order — so we'd close the whole options iframe first
-      // and the drawer's handler would fire into a dead UI.
-      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]')) return
+      // menu, filter popover, enable-sync modal, open listbox) is open, Esc
+      // belongs to IT — bail and let its own handler close just that layer.
+      // Their stopImmediatePropagation can't save us here: this App-level
+      // listener registers at mount, BEFORE any overlay's listener, and
+      // document keydown listeners fire in registration order — so we'd
+      // close the whole options iframe first and the drawer's handler would
+      // fire into a dead UI. (2026-11-05: the filter popover and the
+      // enable-sync modal carried no role, so Esc on them closed the whole
+      // options modal — both are role="dialog" now.)
+      if (overlayLayerOpen()) return
       postToParent({ type: 'mail-organizer/close-options' })
     }
     document.addEventListener('keydown', onKey)
@@ -333,6 +381,15 @@ export default function App() {
   // once status loads. New users who haven't completed onboarding see the
   // input empty + a hint pointing them at the firm settings card.
   const [scanRootPath, setScanRootPath] = useState('')
+  // True once the user has typed in the scan-root input (2026-11-05).
+  // Status now refreshes on focus / external writes; the old "seed while the
+  // field is empty" rule would refill a field the user had just cleared to
+  // type a one-off path. Until touched, the field follows the setting.
+  const scanRootTouchedRef = useRef(false)
+  const editScanRootPath = useCallback((s: string) => {
+    scanRootTouchedRef.current = true
+    setScanRootPath(s)
+  }, [])
   const [scanError, setScanError] = useState<string | null>(null)
   const [rules, setRules] = useState<Rule[]>([])
   const [conflicts, setConflicts] = useState<Array<{ type: string; signal: string; ruleIds: string[]; targets: string[] }>>([])
@@ -406,10 +463,10 @@ export default function App() {
     const r = await send<StatusData>({ type: 'getStatus' })
     if (r.ok && r.data) {
       setStatus(r.data)
-      // Seed the scan root input from settings ON FIRST LOAD only — the
-      // user may type a one-off override after that; we don't want to
-      // clobber their edits on every status refresh.
-      setScanRootPath((prev) => (prev.length > 0 ? prev : r.data!.primaryRootPath))
+      // Seed the scan root input from settings until the user types in it —
+      // they may type a one-off override; we don't want to clobber their
+      // edits on every status refresh (see scanRootTouchedRef).
+      if (!scanRootTouchedRef.current) setScanRootPath(r.data.primaryRootPath)
     }
   }, [])
 
@@ -423,8 +480,15 @@ export default function App() {
       { type: 'getRules' },
     )
     if (r.ok && r.data) {
-      setRules(r.data.rules)
-      setConflicts(r.data.conflicts)
+      const { rules: nextRules, conflicts: nextConflicts } = r.data
+      // Structural sharing (2026-11-05): unchanged rules keep their object
+      // identity so the memoized RuleRow skips them — a refresh used to
+      // re-render the whole table, and the page now refreshes on every
+      // external 'rules' write too.
+      setRules((prev) => reconcileRuleList(prev, nextRules))
+      setConflicts((prev) =>
+        JSON.stringify(prev) === JSON.stringify(nextConflicts) ? prev : nextConflicts,
+      )
     }
   }, [])
 
@@ -466,6 +530,57 @@ export default function App() {
   useEffect(() => {
     void loadTree()
   }, [loadTree])
+
+  // Stay in step with writes made ELSEWHERE (2026-11-05): a sync pull from
+  // another machine, the popup's 停用此規則, the daily sweep, an execute
+  // batch learning rules. Before this the page kept its mount-time snapshot
+  // forever — so a card's read-modify-write could silently revert settings
+  // that had just arrived via sync, and a drawer save could act on a rule
+  // that no longer existed. Options is a trusted extension page, so it may
+  // listen to chrome.storage directly; it only uses the change as a "go
+  // re-fetch" signal (through the SW, like every other read here) and never
+  // touches the values. Debounced so a burst of writes (bulk ops, a pull)
+  // costs one round trip. Window focus / tab-visible refreshes too — the
+  // user may have changed something in the popup meanwhile.
+  useEffect(() => {
+    let timer: number | null = null
+    let wantStatus = false
+    let wantRules = false
+    const flush = () => {
+      timer = null
+      if (wantStatus) void refresh()
+      if (wantRules) void refreshRules()
+      wantStatus = false
+      wantRules = false
+    }
+    const schedule = (status: boolean, rulesToo: boolean) => {
+      wantStatus ||= status
+      wantRules ||= rulesToo
+      if (timer === null) timer = window.setTimeout(flush, 250)
+    }
+    const onStorage = (
+      changes: { [key: string]: chrome.storage.StorageChange },
+      area: chrome.storage.AreaName,
+    ) => {
+      if (area !== 'local') return
+      const rulesChanged = 'rules' in changes
+      // rulesCount on the status payload follows the rules too.
+      if ('settings' in changes || rulesChanged) schedule(true, rulesChanged)
+    }
+    const onFocus = () => schedule(true, true)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') schedule(true, true)
+    }
+    chrome.storage?.onChanged?.addListener(onStorage)
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+      chrome.storage?.onChanged?.removeListener(onStorage)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [refresh, refreshRules])
 
   // Scroll the page to the rules section on first mount. Run once (no
   // deps) and after a microtask so the section's DOM exists. We use the
@@ -549,12 +664,15 @@ export default function App() {
     return () => clearInterval(id)
   }, [scanState?.inProgress, refreshScan])
 
-  // When scan finishes, also refresh status (rule count changed)
+  // When scan finishes, refresh status (rule count changed) AND the rule
+  // list itself (2026-11-05) — the scan's new auto_scan rules used to stay
+  // invisible in the library until the page was reopened.
   useEffect(() => {
     if (scanState && !scanState.inProgress && scanState.finishedAt) {
       void refresh()
+      void refreshRules()
     }
-  }, [scanState?.inProgress, scanState?.finishedAt, refresh])
+  }, [scanState?.inProgress, scanState?.finishedAt, refresh, refreshRules])
 
   // Scroll-spy: highlight the TOC entry whose section is currently dominating
   // the upper-middle of the viewport. rootMargin biases toward the entry the
@@ -622,9 +740,79 @@ export default function App() {
     const r = await send({ type: 'toggleRule', ruleId: rule.id, enabled })
     void refreshRules()
     if (!r.ok) {
+      // NOT_FOUND (2026-11-05): deleted elsewhere — another machine's sync,
+      // the sweep. Nothing left to toggle; say so instead of "失敗" and let
+      // the refresh above drop the row. Counts as done for bulk selection.
+      if (r.code === 'NOT_FOUND') {
+        setRuleToast({
+          kind: 'warn',
+          msg: '規則已不存在 — 可能已在另一台機器或自動清理中刪除',
+          key: Date.now(),
+        })
+        return true
+      }
       setRuleToast({ kind: 'err', msg: `操作失敗:${r.message || r.code}`, key: Date.now() })
     }
     return r.ok
+  }
+
+  // Bulk enable / disable / delete in ONE SW call (2026-11-05). The old
+  // path did, per rule, a full storage read+write, a full getRules round
+  // trip (~1.3 MB at 2000 rules) and a full table re-render — 200 selected
+  // rules meant hundreds of MB serialized. Returns the ids that failed
+  // (stay selected for retry). Falls back to per-rule calls — still with a
+  // single refresh at the end — when the SW predates bulkRuleAction.
+  async function runBulkRuleAction(
+    op: 'enable' | 'disable' | 'delete',
+    ids: string[],
+  ): Promise<{ failed: string[] }> {
+    if (ids.length === 0) return { failed: [] }
+    const label = op === 'enable' ? '啟用' : op === 'disable' ? '停用' : '刪除'
+    const r = await send<{ changed: unknown; missing: unknown }>({ type: 'bulkRuleAction', op, ids })
+    if (r.ok) {
+      await refreshRules()
+      const changed = countOf(r.data?.changed)
+      const missing = countOf(r.data?.missing)
+      setRuleToast({
+        kind: changed > 0 || missing === 0 ? 'ok' : 'warn',
+        msg:
+          `已${label} ${changed} 條規則` +
+          (missing > 0 ? `・${missing} 條已不存在(可能已在別處刪除)` : ''),
+        key: Date.now(),
+      })
+      return { failed: [] }
+    }
+    if (!isUnknownHandler(r.code)) {
+      await refreshRules()
+      setRuleToast({ kind: 'err', msg: `批次${label}失敗:${r.message || r.code}`, key: Date.now() })
+      return { failed: ids }
+    }
+    // Fallback: older SW. Per-rule messages, but NO per-rule refresh.
+    const failed: string[] = []
+    let changed = 0
+    for (const id of ids) {
+      try {
+        const res =
+          op === 'delete'
+            ? await send<{ deleted: boolean }>({ type: 'deleteRule', ruleId: id })
+            : await send({ type: 'toggleRule', ruleId: id, enabled: op === 'enable' })
+        if (res.ok || res.code === 'NOT_FOUND') changed++
+        else failed.push(id)
+      } catch (e) {
+        console.warn('[mail-organizer] bulk action item failed', id, e)
+        failed.push(id)
+      }
+    }
+    await refreshRules()
+    setRuleToast({
+      kind: failed.length === 0 ? 'ok' : 'err',
+      msg:
+        failed.length === 0
+          ? `已${label} ${changed} 條規則`
+          : `已${label} ${changed} 條、${failed.length} 條失敗(仍保持勾選、可重試)`,
+      key: Date.now(),
+    })
+    return { failed }
   }
 
   // Returns true when the rule is gone (deleted now, or already absent), false
@@ -670,6 +858,7 @@ export default function App() {
     ])
     const created = await send<{ rule: Rule }>({
       type: 'createRule',
+      mode: 'create', // explicit create intent, as in createRule() below (2026-11-05)
       input: {
         type: 'compound',
         signal: compoundSignal,
@@ -727,15 +916,34 @@ export default function App() {
   }) {
     const r = await send<{ rule: Rule }>({
       type: 'createRule',
+      // mode (2026-11-05): explicit intent alongside the drawer's
+      // mode:'edit' — this path only ever creates. createRule stays the
+      // transport because the SW mints the id / createdAt.
+      mode: 'create',
       input: { ...input, source: 'user_manual' as RuleSource },
     })
     if (r.ok) void refreshRules()
     return r
   }
 
+  // Drawer save (2026-11-05). `mode: 'edit'` tells the SW to MERGE the
+  // editable fields into the stored rule — the old call shipped the
+  // drawer's whole `{ ...rule, ...form }` snapshot and the SW replaced the
+  // stored object with it, wiping counters that moved since the page loaded
+  // and resurrecting a rule deleted elsewhere. NOT_FOUND = it WAS deleted
+  // elsewhere: say so, refresh, and let the caller close the drawer.
   async function upsertRule(rule: Rule) {
-    const r = await send<{ rule: Rule }>({ type: 'upsertRule', rule })
-    if (r.ok) void refreshRules()
+    const r = await send<{ rule: Rule }>({ type: 'upsertRule', rule, mode: 'edit' })
+    if (r.ok) {
+      void refreshRules()
+    } else if (r.code === 'NOT_FOUND') {
+      setRuleToast({
+        kind: 'warn',
+        msg: '這條規則已不存在(可能已在另一台機器或自動清理中刪除),修改沒有儲存',
+        key: Date.now(),
+      })
+      void refreshRules()
+    }
     return r
   }
 
@@ -931,7 +1139,7 @@ export default function App() {
           status={status}
           scanState={scanState}
           scanRootPath={scanRootPath}
-          setScanRootPath={setScanRootPath}
+          setScanRootPath={editScanRootPath}
           scanError={scanError}
           startScan={startScan}
           cancelScan={cancelScan}
@@ -940,6 +1148,9 @@ export default function App() {
           onEditConsumed={() => setRequestedEditRuleId(null)}
           onToggle={toggleRuleEnabled}
           onDelete={deleteRule}
+          onBulk={runBulkRuleAction}
+          onNotify={(kind, msg) => setRuleToast({ kind, msg, key: Date.now() })}
+          excludePrefixes={status?.excludePrefixes ?? NO_PREFIXES}
           onCreate={createRule}
           onUpsert={upsertRule}
           onResolveConflict={resolveConflict}
@@ -1103,7 +1314,7 @@ export default function App() {
           <CardHeader>
             <CardTitle className="text-sm">分類模型</CardTitle>
             <CardDescription>
-              影響分類品質與成本。Sonnet 4.6 是平衡選擇；Haiku 4.5 便宜 5×；Opus 4.7 是 ceiling。
+              影響分類品質與成本。Sonnet 5.5 是平衡選擇；Haiku 5.5 最快最便宜；Opus 5.5 最強。舊版 4.x 仍可選用。
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
@@ -1381,6 +1592,10 @@ export default function App() {
           }}
         />
 
+        {/* Local storage usage (2026-11-05) — renders nothing when the SW
+            has no getStorageUsage handler. */}
+        <StorageUsageCard />
+
         <div className="pt-4">
           <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase border-b border-border pb-1.5">統計與紀錄</h2>
         </div>
@@ -1475,11 +1690,25 @@ export default function App() {
                         checked={checked}
                         disabled={closedPrefixBusy}
                         onChange={async (e) => {
+                          const want = e.target.checked
                           setClosedPrefixBusy(true)
                           try {
-                            const next = e.target.checked
-                              ? [...stored, norm(p)]
-                              : stored.filter((x) => x !== norm(p))
+                            // Read-modify-write from FRESH settings
+                            // (2026-11-05): `stored` is this render's status
+                            // snapshot, which can predate a list another
+                            // machine just synced in — building `next` from
+                            // it silently reverted that change.
+                            const fresh = await send<StatusData>({ type: 'getStatus' })
+                            const base =
+                              fresh.ok && fresh.data
+                                ? (fresh.data.closedCasePrefixes ?? [])
+                                : stored
+                            const key = norm(p)
+                            const next = want
+                              ? base.includes(key)
+                                ? base
+                                : [...base, key]
+                              : base.filter((x) => x !== key)
                             await send({ type: 'setSettings', patch: { closedCasePrefixes: next } })
                             await refresh()
                           } finally {
@@ -1633,7 +1862,9 @@ function RuleLibrarySummaryCard({
     const enabled = rules.filter((r) => r.enabled).length
     const totalHits = rules.reduce((sum, r) => sum + r.matchCount, 0)
     const totalOverrides = rules.reduce((sum, r) => sum + (r.overrideCount ?? 0), 0)
-    const accuracy = totalHits > 0 ? (totalHits - totalOverrides) / totalHits : 1
+    // Accepted / all fires (2026-11-05): overrides aren't part of matchCount.
+    const totalFires = totalHits + totalOverrides
+    const accuracy = totalFires > 0 ? totalHits / totalFires : 1
     return { total: rules.length, enabled, totalHits, accuracy }
   }, [rules])
 
@@ -1874,6 +2105,12 @@ type RuleLibraryViewProps = {
   onEditConsumed: () => void
   onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
   onDelete: (ruleId: string) => Promise<boolean>
+  /** One-call bulk enable / disable / delete; resolves the ids that failed. */
+  onBulk: (op: 'enable' | 'disable' | 'delete', ids: string[]) => Promise<{ failed: string[] }>
+  /** Page-level toast (rule vanished while its drawer was open, …). */
+  onNotify: (kind: 'ok' | 'warn' | 'err', msg: string) => void
+  /** settings.excludeFolderPrefixes — folders the rule form won't offer. */
+  excludePrefixes: string[]
   onCreate: (input: { type: RuleType; signal: string; targetFolderId: string; targetFolderPath: string; confidence: number }) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onResolveConflict: (
@@ -2031,6 +2268,9 @@ function RuleLibraryViewBody(
     onEditConsumed,
     onToggle,
     onDelete,
+    onBulk,
+    onNotify,
+    excludePrefixes,
     onCreate,
     onUpsert,
     onResolveConflict,
@@ -2054,6 +2294,9 @@ function RuleLibraryViewBody(
         loadTree={loadTree}
         onToggle={onToggle}
         onDelete={onDelete}
+        onBulk={onBulk}
+        onNotify={onNotify}
+        excludePrefixes={excludePrefixes}
         onCreate={onCreate}
         onUpsert={onUpsert}
         onAfterImport={onAfterImport}
@@ -2092,6 +2335,8 @@ function RuleLibraryViewBody(
     return (
       <RuleHealthSection
         rules={rules}
+        // 立即執行自動清除 changes the library — refresh it (2026-11-05).
+        onAfterSweep={onAfterImport}
         onOpenChip={(chip) => {
           // 健康度分類點下去 = 跳到全部 view + 套用對應 chip。
           // 清單只有一份(在全部 view),健康度只負責分流。
@@ -2235,6 +2480,11 @@ function DormantRulesView({
     if (reason === 'high-error-rate') return '高錯誤率'
     if (reason === 'stale') return '長期未命中'
     if (reason === 'case_closed') return '已結案退場(資料夾在結案歸檔區;搬出即自動復職)'
+    // 2026-11-05: written by execute (one-strike structural disable after a
+    // user re-target) and by learning (broad rule silenced by a narrower one).
+    // Both auto-revive when learning re-derives the same routing.
+    if (reason === 'override') return '你曾把它命中的信改歸別處(再學到同樣歸法會自動復職)'
+    if (reason === 'superseded') return '已被更精準的規則取代'
     return '未知'
   }
 
@@ -2383,6 +2633,9 @@ type RuleAllViewProps = {
   // as a silent success).
   onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
   onDelete: (ruleId: string) => Promise<boolean>
+  onBulk: (op: 'enable' | 'disable' | 'delete', ids: string[]) => Promise<{ failed: string[] }>
+  onNotify: (kind: 'ok' | 'warn' | 'err', msg: string) => void
+  excludePrefixes: string[]
   onCreate: (input: { type: RuleType; signal: string; targetFolderId: string; targetFolderPath: string; confidence: number }) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   onAfterImport: () => void | Promise<void>
@@ -2417,6 +2670,9 @@ function RuleAllView({
   loadTree,
   onToggle,
   onDelete,
+  onBulk,
+  onNotify,
+  excludePrefixes,
   onCreate,
   onUpsert,
   onAfterImport,
@@ -2457,17 +2713,15 @@ function RuleAllView({
   // lawyer's "see all rules for this case at once" mental model) or
   // flat sorted list. sessionStorage so a quick reload preserves it,
   // not localStorage (a deliberate fresh-start reload resets it).
+  // 2026-11-05: through the guarded helpers — raw sessionStorage threw
+  // SecurityError in the OWA iframe (third-party storage blocked) and took
+  // the whole rule library down.
   const [viewMode, setViewMode] = useState<'grouped' | 'flat'>(() => {
-    if (typeof sessionStorage !== 'undefined') {
-      const stored = sessionStorage.getItem('mo-rule-view-mode')
-      if (stored === 'flat' || stored === 'grouped') return stored
-    }
-    return 'grouped'
+    const stored = readSessionValue('mo-rule-view-mode')
+    return stored === 'flat' || stored === 'grouped' ? stored : 'grouped'
   })
   useEffect(() => {
-    if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem('mo-rule-view-mode', viewMode)
-    }
+    writeSessionValue('mo-rule-view-mode', viewMode)
   }, [viewMode])
   // Per-folder collapse state for grouped view. Same sessionStorage policy.
   // useMemo(而不是直接寫在 useState initializer)是為了留住「這個
@@ -2489,9 +2743,7 @@ function RuleAllView({
   }, [])
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(initialCollapsed ?? []))
   useEffect(() => {
-    if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem('mo-rule-collapsed-folders', JSON.stringify([...collapsed]))
-    }
+    writeSessionValue('mo-rule-collapsed-folders', JSON.stringify([...collapsed]))
   }, [collapsed])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [detailId, setDetailId] = useState<string | null>(null)
@@ -2549,15 +2801,21 @@ function RuleAllView({
       // 229). That Esc means "drop the composition", NOT "close the
       // drawer" — swallowing it here closed the drawer and discarded the
       // user's whole in-progress edit.
-      if (e.isComposing || e.keyCode === 229) return
+      if (isImeComposing(e)) return
       if (e.key === 'Escape' && detailId) {
-        // If a nested ConfirmDialog (role="alertdialog") is open on top of
-        // the drawer, let *it* consume Esc (cancel the dialog) — don't tear
+        // Innermost-first (2026-11-05): an inner widget that already
+        // handled this Esc (FolderPicker closing its dropdown calls
+        // preventDefault) or a focused text field owns it. Without this
+        // input guard, Esc meant for the folder dropdown closed the whole
+        // drawer and threw away the in-progress edit.
+        if (e.defaultPrevented || isTextEntryTarget(e.target)) return
+        // If a nested ConfirmDialog (role="alertdialog") or an open listbox
+        // is on top of the drawer, let *it* consume Esc — don't tear
         // down the whole drawer underneath it. This effect's listener is
         // registered before the dialog's (the drawer mounts first), so
         // without this guard our stopImmediatePropagation would fire first
         // and close the drawer, unmounting the dialog mid-confirm.
-        if (document.querySelector('[role="alertdialog"]')) return
+        if (document.querySelector('[role="alertdialog"], [role="listbox"]')) return
         // Stop the event before any outer (iframe-FAB-mode) listener
         // closes the entire Options window — Esc on a drawer should
         // dismiss the drawer, not the whole UI. See the document-level
@@ -2689,65 +2947,28 @@ function RuleAllView({
     [onToggle],
   )
 
-  // Bulk action helper — survives partial failures (network blip on
-  // rule 3 of 10 shouldn't lose the work on rules 1–2 or stop rules
-  // 4–10). Each item runs inside its own try/catch; remaining items
-  // are removed from selection (the operation was attempted), failed
-  // items stay selected so the user can retry.
-  // The op resolves to `false` when the backend reported failure (send →
-  // {ok:false} without throwing) — audit fix: that must count as a failure
-  // and keep the item selected, not be silently swallowed as success. `void`
-  // / `undefined` returns still count as success (no signal = no failure).
-  async function runBulk(
-    ids: string[],
-    op: (id: string) => Promise<boolean | void>,
-  ): Promise<{ ok: number; failed: string[] }> {
-    let ok = 0
-    const failed: string[] = []
-    for (const id of ids) {
-      try {
-        const res = await op(id)
-        if (res === false) failed.push(id)
-        else ok++
-      } catch (e) {
-        console.warn('[mail-organizer] bulk action item failed', id, e)
-        failed.push(id)
-      }
-    }
-    return { ok, failed }
-  }
-
-  async function bulkDisable() {
+  // Bulk actions (2026-11-05) — ONE SW call for the whole selection via
+  // onBulk (bulkRuleAction, with a per-rule fallback inside App for older
+  // SWs) and ONE refresh, instead of a toggle + full getRules + full table
+  // re-render per rule. Contract kept from the per-rule version: rules
+  // already in the target state (or gone) are no-ops, survivors leave the
+  // selection, failed ids stay selected so the user can retry.
+  async function bulkToggle(enabled: boolean) {
     setBulkBusy(true)
     try {
-      const ids = Array.from(selected)
-      const { failed } = await runBulk(ids, async (id) => {
+      const ids = Array.from(selected).filter((id) => {
         const r = rules.find((x) => x.id === id)
-        // No-op (already disabled / not found) is success; otherwise the
-        // backend result decides.
-        if (!r || !r.enabled) return true
-        return await onToggle(r, false)
+        return !!r && r.enabled !== enabled
       })
+      const { failed } = await onBulk(enabled ? 'enable' : 'disable', ids)
       // Clear the survivors from selection; keep failed for retry.
       setSelected(new Set(failed))
     } finally {
       setBulkBusy(false)
     }
   }
-  async function bulkEnable() {
-    setBulkBusy(true)
-    try {
-      const ids = Array.from(selected)
-      const { failed } = await runBulk(ids, async (id) => {
-        const r = rules.find((x) => x.id === id)
-        if (!r || r.enabled) return true
-        return await onToggle(r, true)
-      })
-      setSelected(new Set(failed))
-    } finally {
-      setBulkBusy(false)
-    }
-  }
+  const bulkDisable = () => bulkToggle(false)
+  const bulkEnable = () => bulkToggle(true)
   // 批次刪除本體 — 由 ConfirmDialog 的 onConfirm 呼叫(B4:chip →
   // 全選 → 批次刪除 → 一個 ConfirmDialog;原本的 native confirm 換掉)。
   async function bulkDelete() {
@@ -2761,12 +2982,13 @@ function RuleAllView({
       // but editing state would linger). 靜默關閉、不走 closeDrawer
       // 的往返導航 — 批次刪除中途被跳頁很突兀。
       if (detailId && ids.includes(detailId)) {
+        selfRemovedRef.current = detailId
         setDetailId(null)
         setEditingId(null)
         openedViaRequestRef.current = false
         editReturn.returnToHash = null
       }
-      const { failed } = await runBulk(ids, (id) => onDelete(id))
+      const { failed } = await onBulk('delete', ids)
       setSelected(new Set(failed))
     } finally {
       setBulkBusy(false)
@@ -2777,6 +2999,34 @@ function RuleAllView({
     () => (detailId ? rules.find((r) => r.id === detailId) ?? null : null),
     [detailId, rules],
   )
+
+  // The open rule vanished from a live refresh (2026-11-05: the page now
+  // re-fetches on external writes — another machine's sync, the sweep).
+  // The drawer would just disappear, silently dropping any in-progress
+  // edit; close it explicitly and say why. Only once the rule HAS been
+  // seen, so a ?edit= deep link that opens before the first getRules
+  // resolves isn't mistaken for a deletion.
+  const detailSeenRef = useRef<string | null>(null)
+  // Set when THIS view removed the open rule (drawer delete, NOT_FOUND on
+  // save) — that disappearance is expected, not news.
+  const selfRemovedRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!detailId) {
+      detailSeenRef.current = null
+      return
+    }
+    if (detailRule) {
+      detailSeenRef.current = detailId
+      return
+    }
+    if (detailSeenRef.current === detailId) {
+      detailSeenRef.current = null
+      closeDrawer()
+      if (selfRemovedRef.current !== detailId) {
+        onNotify('warn', '這條規則已在別處被刪除(另一台機器同步或自動清理),抽屜已關閉')
+      }
+    }
+  }, [detailId, detailRule, closeDrawer, onNotify])
 
   return (
     <div className="space-y-4">
@@ -2929,6 +3179,7 @@ function RuleAllView({
             <RuleForm
               tree={tree}
               rules={rules}
+              excludePrefixes={excludePrefixes}
               onCancel={() => setAdding(false)}
               onSubmit={async (values) => {
                 const r = await onCreate(values)
@@ -2983,6 +3234,7 @@ function RuleAllView({
           onSelect={toggleOne}
           onOpenDetail={openDetail}
           onToggle={onToggle}
+          onBulkDisable={(ids) => void onBulk('disable', ids)}
         />
       ) : (
         <div className="rounded-md border border-border overflow-hidden bg-background">
@@ -3106,18 +3358,26 @@ function RuleAllView({
           rule={detailRule}
           tree={tree}
           rules={rules}
+          excludePrefixes={excludePrefixes}
           editing={editingId === detailRule.id}
           onStartEdit={() => setEditingId(detailRule.id)}
           onCancelEdit={() => setEditingId(null)}
           onClose={closeDrawer}
           onToggle={onToggle}
           onDelete={async (id) => {
+            selfRemovedRef.current = id
             await onDelete(id)
             closeDrawer()
           }}
           onUpsert={async (rule) => {
             const r = await onUpsert(rule)
             if (r.ok) setEditingId(null)
+            else if (r.code === 'NOT_FOUND') {
+              // Deleted elsewhere while being edited — App already said so
+              // and is refreshing; close the drawer on the dead rule.
+              selfRemovedRef.current = rule.id
+              closeDrawer()
+            }
             return r
           }}
           loadTree={loadTree}
@@ -3210,6 +3470,10 @@ function RuleFilterPopover({
       </Button>
       {open && (
         <div
+          // role="dialog" (2026-11-05): a non-modal popover of form
+          // controls. Also how the App-level Esc handler knows a layer is
+          // open — without a role, Esc here closed the whole options modal.
+          role="dialog"
           className="absolute left-0 top-full mt-1 z-20 min-w-[200px] rounded-md border border-border bg-background shadow-md p-3 space-y-2.5 text-xs"
           aria-label="篩選條件"
         >
@@ -3668,6 +3932,7 @@ function RuleDetailDrawer({
   rule,
   tree,
   rules,
+  excludePrefixes,
   editing,
   onStartEdit,
   onCancelEdit,
@@ -3680,6 +3945,7 @@ function RuleDetailDrawer({
   rule: Rule
   tree: MailFolderNode[] | null
   rules: Rule[]
+  excludePrefixes: string[]
   editing: boolean
   onStartEdit: () => void
   onCancelEdit: () => void
@@ -3689,10 +3955,11 @@ function RuleDetailDrawer({
   onUpsert: (rule: Rule) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
   loadTree: () => Promise<MailFolderNode[] | null>
 }) {
+  // Accuracy over ALL fires (2026-11-05): overrides are no longer counted
+  // inside matchCount, so the old (match − override) / match went negative /
+  // over-optimistic. Same formula the retirement logic uses (rules.ts).
   const accuracyPct =
-    rule.matchCount > 0
-      ? Math.round(((rule.matchCount - (rule.overrideCount ?? 0)) / rule.matchCount) * 100)
-      : null
+    ruleFires(rule) > 0 ? Math.round((1 - ruleErrorRate(rule)) * 100) : null
   const [confirmDelete, setConfirmDelete] = useState(false)
 
   // Load tree on open if not loaded (so edit form can show folder picker).
@@ -3824,8 +4091,12 @@ function RuleDetailDrawer({
               tree={tree}
               initial={rule}
               rules={rules.filter((r) => r.id !== rule.id)}
+              excludePrefixes={excludePrefixes}
               onCancel={onCancelEdit}
               onSubmit={async (values) => {
+                // The full record still rides along (an older SW replaces
+                // with it), but onUpsert sends mode:'edit' so the current SW
+                // merges only the editable fields (2026-11-05).
                 const updated: Rule = { ...rule, ...values }
                 return onUpsert(updated)
               }}
@@ -4035,10 +4306,11 @@ const RuleRow = memo(function RuleRow({
 }) {
   const typeLabel = refinedTypeLabel(rule.type, rule.signal)
   const openDetail = () => onOpenDetail(rule.id)
+  // Accuracy over ALL fires (2026-11-05): overrides are no longer counted
+  // inside matchCount, so the old (match − override) / match went negative /
+  // over-optimistic. Same formula the retirement logic uses (rules.ts).
   const accuracyPct =
-    rule.matchCount > 0
-      ? Math.round(((rule.matchCount - (rule.overrideCount ?? 0)) / rule.matchCount) * 100)
-      : null
+    ruleFires(rule) > 0 ? Math.round((1 - ruleErrorRate(rule)) * 100) : null
   const accuracyClass =
     accuracyPct === null
       ? 'text-muted-foreground'
@@ -4182,6 +4454,7 @@ function RuleGroupedTable({
   onSelect,
   onOpenDetail,
   onToggle,
+  onBulkDisable,
 }: {
   rules: Rule[]
   allRules: Rule[]
@@ -4196,6 +4469,8 @@ function RuleGroupedTable({
   onSelect: (id: string) => void
   onOpenDetail: (id: string) => void
   onToggle: (rule: Rule, enabled: boolean) => Promise<boolean>
+  /** Folder header 「全部停用」 — one bulk call (2026-11-05). */
+  onBulkDisable: (ids: string[]) => void
 }) {
   void allRules // currently unused; reserved for future "this folder also has N hidden rules" hint
   // Stable wrapper so the memoized RuleRow's onToggle prop keeps identity
@@ -4370,21 +4645,9 @@ function RuleGroupedTable({
                             type="button"
                             onClick={() => {
                               if (!confirm(`停用「${g.path}」底下 ${g.enabledCount} 條啟用中的規則?`)) return
-                              void (async () => {
-                                for (const r of g.rules) {
-                                  if (r.enabled) {
-                                    try {
-                                      await onToggle(r, false)
-                                    } catch (err) {
-                                      console.warn(
-                                        '[mail-organizer] folder bulk-disable item failed',
-                                        r.id,
-                                        err,
-                                      )
-                                    }
-                                  }
-                                }
-                              })()
+                              // One bulk call + one refresh (2026-11-05), not
+                              // a toggle + full getRules per rule.
+                              onBulkDisable(g.rules.filter((r) => r.enabled).map((r) => r.id))
                             }}
                             className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-[10px] px-2 py-0.5 rounded border border-border bg-background hover:bg-accent shrink-0"
                             title="停用此資料夾的所有啟用規則"
@@ -4736,11 +4999,16 @@ type RuleFormProps = {
   /** Existing rules for proactive conflict detection. Optional — if not
    *  provided, the form skips conflict checking. */
   rules?: Rule[]
+  /**
+   * settings.excludeFolderPrefixes — never offered as rule targets
+   * (2026-11-05: replaces a hard-coded firm folder name; 通用化承諾).
+   */
+  excludePrefixes?: string[]
   onCancel: () => void
   onSubmit: (values: RuleFormValues) => Promise<{ ok: true; data?: unknown } | { ok: false; code: string; message: string }>
 }
 
-function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
+function RuleForm({ tree, initial, rules, excludePrefixes, onCancel, onSubmit }: RuleFormProps) {
   const [type, setType] = useState<RuleType>(initial?.type ?? 'domain')
   const [signal, setSignal] = useState(initial?.signal ?? '')
   const [target, setTarget] = useState<{ id: string; path: string } | null>(
@@ -4749,6 +5017,14 @@ function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
   const [confidence, setConfidence] = useState(initial?.confidence ?? 0.85)
   const [enabled, setEnabled] = useState(initial?.enabled ?? true)
   const [error, setError] = useState<string | null>(null)
+
+  // Confidence ceiling (2026-11-05). The SW caps every non-user_manual write
+  // per type (applyConfidenceCap), so the slider used to let an AI-learned
+  // domain rule reach 0.95 and the save then silently came back at 0.70.
+  // New rules from this form are user_manual (uncapped); edits keep the
+  // rule's own source.
+  const ceiling = confidenceCeiling(type, initial?.source ?? 'user_manual')
+  const shownConfidence = Math.min(confidence, ceiling)
 
   // ---- State-sync on rule switch ------------------------------------------
   //
@@ -4866,7 +5142,7 @@ function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
       signal: type === 'compound' ? signal : signal.trim(),
       targetFolderId: target.id,
       targetFolderPath: target.path,
-      confidence,
+      confidence: shownConfidence,
       enabled,
     })
     if (!r.ok) setError(r.message)
@@ -4917,7 +5193,7 @@ function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
           tree={tree}
           value={target?.path}
           onSelect={(n) => setTarget({ id: n.id, path: n.path })}
-          excludePrefixes={['05已完成案件']}
+          excludePrefixes={excludePrefixes ?? NO_PREFIXES}
         />
       </div>
 
@@ -4926,14 +5202,20 @@ function RuleForm({ tree, initial, rules, onCancel, onSubmit }: RuleFormProps) {
         <input
           type="range"
           min={0.5}
-          max={1}
+          max={ceiling}
           step={0.05}
-          value={confidence}
-          onChange={(e) => setConfidence(Number(e.target.value))}
+          value={shownConfidence}
+          onChange={(e) => setConfidence(Math.min(Number(e.target.value), ceiling))}
           className="flex-1 accent-foreground"
+          aria-label="信心"
         />
-        <span className="font-mono tabular-nums w-10 text-right">{confidence.toFixed(2)}</span>
+        <span className="font-mono tabular-nums w-10 text-right">{shownConfidence.toFixed(2)}</span>
       </div>
+      {ceiling < 1 && (
+        <p className="text-[10px] text-muted-foreground -mt-2">
+          系統學習的{TYPE_LABEL[type]}規則信心上限 {ceiling.toFixed(2)}(避免廣泛規則蓋過更精準的規則)
+        </p>
+      )}
 
       {initial && (
         <label className="flex items-center gap-2">
@@ -5149,19 +5431,6 @@ function ClassificationPrefsCard({
   // probably don't need.
   const [internalOpen, setInternalOpen] = useState(false)
 
-  // Re-seed drafts when status arrives / changes.
-  useEffect(() => {
-    setDomainsDraft(initialDomains)
-    setRootDraft(initialRoot)
-    setCatDraft(initialCategories)
-    // Open the internal-rules zone whenever there's existing content
-    // to edit. Won't toggle back closed during the same session if the
-    // user opens it manually with no content.
-    if (initialDomains.trim() || initialCategories.trim()) {
-      setInternalOpen(true)
-    }
-  }, [initialDomains, initialRoot, initialCategories])
-
   const parseDomains = (s: string): string[] => {
     const lines = s
       .split(/[\r\n,,]+/)
@@ -5176,23 +5445,48 @@ function ClassificationPrefsCard({
       .filter((l) => l.length > 0)
     return Array.from(new Set(items))
   }
+  const sameDomains = (a: string, b: string) => parseDomains(a).join('\n') === parseDomains(b).join('\n')
+  const sameCategories = (a: string, b: string) =>
+    parseCategories(a).join('、') === parseCategories(b).join('、')
 
-  const dirty =
-    parseDomains(domainsDraft).join('\n') !==
-      parseDomains(initialDomains).join('\n') ||
-    rootDraft.trim() !== initialRoot ||
-    parseCategories(catDraft).join('、') !==
-      parseCategories(initialCategories).join('、')
+  // Re-seed drafts when status arrives / changes — PER FIELD, and only
+  // where the user has no unsaved edit (2026-11-05). The page now
+  // refreshes on external writes (sync pulls), so a blanket re-seed would
+  // wipe a half-typed root path the moment another machine pushed.
+  const seededRef = useRef({ domains: initialDomains, root: initialRoot, cats: initialCategories })
+  useEffect(() => {
+    const seeded = seededRef.current
+    setDomainsDraft((d) => (sameDomains(d, seeded.domains) ? initialDomains : d))
+    setRootDraft((d) => (d.trim() === seeded.root ? initialRoot : d))
+    setCatDraft((d) => (sameCategories(d, seeded.cats) ? initialCategories : d))
+    seededRef.current = { domains: initialDomains, root: initialRoot, cats: initialCategories }
+    // Open the internal-rules zone whenever there's existing content
+    // to edit. Won't toggle back closed during the same session if the
+    // user opens it manually with no content.
+    if (initialDomains.trim() || initialCategories.trim()) {
+      setInternalOpen(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- parse helpers are pure
+  }, [initialDomains, initialRoot, initialCategories])
+
+  const domainsDirty = !sameDomains(domainsDraft, initialDomains)
+  const rootDirty = rootDraft.trim() !== initialRoot
+  const catsDirty = !sameCategories(catDraft, initialCategories)
+  const dirty = domainsDirty || rootDirty || catsDirty
 
   async function save() {
     setSaveError(null)
+    // Minimal patch (2026-11-05): only the fields the user actually edited.
+    // Writing all three from this card's snapshot reverted whichever one
+    // had changed elsewhere (e.g. synced in from another machine).
+    const patch: Record<string, unknown> = {}
+    if (domainsDirty) patch.internalDomains = parseDomains(domainsDraft)
+    if (rootDirty) patch.primaryRootPath = rootDraft.trim()
+    if (catsDirty) patch.internalSubjectCategories = parseCategories(catDraft)
+    if (Object.keys(patch).length === 0) return
     const r = await send({
       type: 'setSettings',
-      patch: {
-        internalDomains: parseDomains(domainsDraft),
-        primaryRootPath: rootDraft.trim(),
-        internalSubjectCategories: parseCategories(catDraft),
-      },
+      patch,
     })
     if (r.ok) {
       setSavedAt(Date.now())
@@ -5746,6 +6040,20 @@ function CrossMachineSyncCard({
     setTimeout(() => setOk(null), 3000)
   }
 
+  // Enable-sync modal: Esc cancels it (2026-11-05). It had no role and no
+  // key handling, so Esc fell through to the App-level handler and closed
+  // the whole options modal (FAB iframe) instead of just this dialog.
+  useEffect(() => {
+    if (!showEnableModal) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || busy || isImeComposing(e)) return
+      e.preventDefault()
+      setShowEnableModal(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [showEnableModal, busy])
+
   const enabled = syncStatus?.enabled ?? false
   const quotaPct =
     syncStatus && syncStatus.bytesQuota > 0
@@ -5895,11 +6203,14 @@ function CrossMachineSyncCard({
                               setOk('已複製 chrome://extensions — 貼到網址列檢查擴充版本')
                               setTimeout(() => setOk(null), 4000)
                             } else if (action.cta!.action === 'cleanup') {
-                              // Scroll to rules section so user can clean
-                              // up sleeping / stale rules.
-                              const el =
-                                document.getElementById('rules')
-                              el?.scrollIntoView({ behavior: 'smooth' })
+                              // Open the rule library's health view
+                              // (2026-11-05): this card lives on the 資料 tab,
+                              // where #rules isn't rendered — the old
+                              // scrollIntoView found nothing and the button
+                              // did nothing. 長期未命中 / 已停用 / 立即執行
+                              // 自動清除 are all one click from there.
+                              window.location.hash = 'rules-library/health'
+                              window.scrollTo({ top: 0 })
                             }
                           }}
                           className="text-[10px] bg-red-700 hover:bg-red-800 text-white rounded px-2 py-1"
@@ -6061,9 +6372,14 @@ function CrossMachineSyncCard({
       </CardContent>
 
       {showEnableModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="enable-sync-title"
+        >
           <div className="bg-card rounded-md border border-border p-4 max-w-md space-y-3 text-xs">
-            <h3 className="text-sm font-medium">啟用跨機器同步</h3>
+            <h3 id="enable-sync-title" className="text-sm font-medium">啟用跨機器同步</h3>
             <div className="space-y-1 text-[11px]">
               <div>啟用前請確認:</div>
               <ul className="list-disc list-inside space-y-0.5 text-muted-foreground pl-1">
@@ -6083,7 +6399,13 @@ function CrossMachineSyncCard({
               </p>
             )}
             <div className="flex justify-end gap-2 pt-1">
-              <Button size="sm" variant="ghost" onClick={() => setShowEnableModal(false)} disabled={busy}>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setShowEnableModal(false)}
+                disabled={busy}
+                autoFocus
+              >
                 取消
               </Button>
               <Button size="sm" onClick={() => void enable()} disabled={busy}>
@@ -6093,6 +6415,145 @@ function CrossMachineSyncCard({
           </div>
         </div>
       )}
+    </Card>
+  )
+}
+
+// ---- Local storage usage (2026-11-05) -------------------------------------
+//
+// How much of chrome.storage.local the extension uses, and its biggest keys
+// — so a user who hits "quota exceeded" or a sluggish options page can see
+// what to clean (the rule edit log and the folder cache are the usual
+// suspects). Fed by the SW's getStorageUsage; renders nothing when the
+// handler isn't there.
+
+const STORAGE_KEY_LABEL: Record<string, string> = {
+  rules: '規則',
+  ruleHistory: '規則編輯紀錄',
+  ruleTombstones: '規則刪除紀錄',
+  folderCache: '資料夾快取',
+  folderActivity: '近日活動',
+  skipHistory: '保留歷史',
+  conversationMemory: '對話記憶',
+  subjectMemory: '主旨記憶',
+  syncBackups: '同步前備份',
+  errorLog: '錯誤紀錄',
+  metrics: '統計',
+  settings: '設定',
+  undoSnapshot: '撤回快照',
+  weeklyDigest: '週報',
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '—'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 2 : 1)} MB`
+}
+
+function StorageUsageCard() {
+  type Usage = {
+    bytesInUse: number
+    quotaBytes: number | null
+    topKeys: Array<{ key: string; bytes: number }>
+  }
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [available, setAvailable] = useState(true)
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await send<Usage>({ type: 'getStorageUsage' })
+      if (r.ok && r.data && typeof r.data.bytesInUse === 'number') {
+        setUsage(r.data)
+        setAvailable(true)
+      } else {
+        setAvailable(false)
+      }
+    } catch {
+      setAvailable(false)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  if (!available || !usage) return null
+  const quota =
+    typeof usage.quotaBytes === 'number' && usage.quotaBytes > 0 ? usage.quotaBytes : null
+  const pct = quota ? Math.min(100, Math.round((usage.bytesInUse / quota) * 100)) : null
+  const topKeys = (Array.isArray(usage.topKeys) ? usage.topKeys : [])
+    .filter((k) => k && typeof k.key === 'string' && typeof k.bytes === 'number')
+    .slice(0, 6)
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">本機儲存空間</CardTitle>
+        <CardDescription className="text-[11px]">
+          這台機器上擴充功能存放的資料量(不含雲端同步)。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2 text-xs">
+        <div className="flex items-baseline justify-between gap-2">
+          <span>
+            已使用 <span className="font-mono tabular-nums">{formatBytes(usage.bytesInUse)}</span>
+            {quota ? (
+              <>
+                {' / '}
+                <span className="font-mono tabular-nums">{formatBytes(quota)}</span>
+                {pct !== null && <span className="text-muted-foreground"> ({pct}%)</span>}
+              </>
+            ) : (
+              <span className="text-muted-foreground">(無固定上限)</span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:opacity-50"
+          >
+            {loading ? '更新中…' : '重新整理'}
+          </button>
+        </div>
+        {pct !== null && (
+          <div
+            className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+            role="meter"
+            aria-label="本機儲存空間使用率"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct}
+          >
+            <div
+              className={cn('h-full', pct >= 80 ? 'bg-amber-500' : 'bg-foreground')}
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        )}
+        {topKeys.length > 0 && (
+          <ul className="space-y-0.5">
+            {topKeys.map((k) => (
+              <li key={k.key} className="flex items-baseline gap-2 text-[11px]">
+                <span className="truncate flex-1">
+                  {STORAGE_KEY_LABEL[k.key] ?? k.key}
+                  {STORAGE_KEY_LABEL[k.key] && (
+                    <span className="ml-1 font-mono text-[10px] text-muted-foreground">{k.key}</span>
+                  )}
+                </span>
+                <span className="font-mono tabular-nums text-muted-foreground shrink-0">
+                  {formatBytes(k.bytes)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
     </Card>
   )
 }
@@ -6269,7 +6730,12 @@ function RecentActivityFilterCard({
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  async function commit(nextPrefixes: string[], nextLeaves: string[]) {
+  async function commit(
+    compute: (current: { prefixes: string[]; leaves: string[] }) => {
+      prefixes?: string[]
+      leaves?: string[]
+    },
+  ) {
     // In-flight guard (audit: stale-read race). `prefixes`/`leaves` come from
     // the `status` prop, which only refreshes after send()+onSaved() finish —
     // two async round-trips. A second add/remove fired before that refresh
@@ -6281,12 +6747,26 @@ function RecentActivityFilterCard({
     setSaving(true)
     setSaveError(null)
     try {
+      // Read-modify-write from FRESH settings (2026-11-05): the status prop
+      // is a snapshot that can predate a list another machine synced in;
+      // building the next list from it silently reverted that change. And
+      // only the list being edited goes into the patch.
+      const fresh = await send<StatusData>({ type: 'getStatus' })
+      const current =
+        fresh.ok && fresh.data
+          ? {
+              prefixes: fresh.data.recentActivityIncludePrefixes ?? [],
+              leaves: fresh.data.recentActivityIncludeLeafNames ?? [],
+            }
+          : { prefixes, leaves }
+      const next = compute(current)
+      const patch: Record<string, unknown> = {}
+      if (next.prefixes) patch.recentActivityIncludePrefixes = Array.from(new Set(next.prefixes))
+      if (next.leaves) patch.recentActivityIncludeLeafNames = Array.from(new Set(next.leaves))
+      if (Object.keys(patch).length === 0) return
       const r = await send({
         type: 'setSettings',
-        patch: {
-          recentActivityIncludePrefixes: Array.from(new Set(nextPrefixes)),
-          recentActivityIncludeLeafNames: Array.from(new Set(nextLeaves)),
-        },
+        patch,
       })
       if (r.ok) {
         setSavedAt(Date.now())
@@ -6305,7 +6785,9 @@ function RecentActivityFilterCard({
       setAdding(null)
       return
     }
-    await commit([...prefixes, node.path], leaves)
+    await commit((cur) =>
+      cur.prefixes.includes(node.path) ? {} : { prefixes: [...cur.prefixes, node.path] },
+    )
     setAdding(null)
   }
   async function addLeaf(node: MailFolderNode) {
@@ -6313,14 +6795,16 @@ function RecentActivityFilterCard({
       setAdding(null)
       return
     }
-    await commit(prefixes, [...leaves, node.displayName])
+    await commit((cur) =>
+      cur.leaves.includes(node.displayName) ? {} : { leaves: [...cur.leaves, node.displayName] },
+    )
     setAdding(null)
   }
   async function removePrefix(value: string) {
-    await commit(prefixes.filter((p) => p !== value), leaves)
+    await commit((cur) => ({ prefixes: cur.prefixes.filter((p) => p !== value) }))
   }
   async function removeLeaf(value: string) {
-    await commit(prefixes, leaves.filter((l) => l !== value))
+    await commit((cur) => ({ leaves: cur.leaves.filter((l) => l !== value) }))
   }
 
   return (
@@ -6522,6 +7006,10 @@ function RecentActivityFilterCard({
  * an escape hatch for power users. Kept inside RecentActivityFilterCard
  * so it can't accidentally be reused elsewhere with the wrong intent.
  */
+function parseLineList(s: string): string[] {
+  return Array.from(new Set(s.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)))
+}
+
 function AdvancedManualEditor({
   prefixes,
   leaves,
@@ -6530,38 +7018,57 @@ function AdvancedManualEditor({
 }: {
   prefixes: string[]
   leaves: string[]
-  onCommit: (nextPrefixes: string[], nextLeaves: string[]) => Promise<void>
+  /** Receives a calculator; returns only the list(s) the user edited. */
+  onCommit: (
+    compute: (current: { prefixes: string[]; leaves: string[] }) => {
+      prefixes?: string[]
+      leaves?: string[]
+    },
+  ) => Promise<void>
   /** Parent card's in-flight commit flag. commit() drops re-entrant calls
    *  silently (the stale-read-race guard), so this button must also be
    *  disabled while a pill commit is in flight — otherwise a click here
    *  would no-op with a green-looking spinner flash and no error. */
   parentSaving: boolean
 }) {
-  const [prefixDraft, setPrefixDraft] = useState(prefixes.join('\n'))
-  const [leafDraft, setLeafDraft] = useState(leaves.join('\n'))
+  const prefixesText = prefixes.join('\n')
+  const leavesText = leaves.join('\n')
+  const [prefixDraft, setPrefixDraft] = useState(prefixesText)
+  const [leafDraft, setLeafDraft] = useState(leavesText)
   const [saving, setSaving] = useState(false)
 
-  // Re-seed drafts when parent state changes from the picker UI above.
+  // Re-seed drafts when parent state changes from the picker UI above —
+  // keyed on the TEXT (2026-11-05: the arrays are fresh objects on every
+  // status refresh, and the page now refreshes on focus / external writes,
+  // so an array-keyed effect wiped half-typed edits) and only for a draft
+  // the user hasn't touched.
+  const seededRef = useRef({ p: prefixesText, l: leavesText })
   useEffect(() => {
-    setPrefixDraft(prefixes.join('\n'))
-  }, [prefixes])
-  useEffect(() => {
-    setLeafDraft(leaves.join('\n'))
-  }, [leaves])
-
-  const parseList = (s: string): string[] =>
-    Array.from(
-      new Set(s.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)),
+    const seeded = seededRef.current
+    setPrefixDraft((d) =>
+      parseLineList(d).join('\n') === parseLineList(seeded.p).join('\n') ? prefixesText : d,
     )
+    setLeafDraft((d) =>
+      parseLineList(d).join('\n') === parseLineList(seeded.l).join('\n') ? leavesText : d,
+    )
+    seededRef.current = { p: prefixesText, l: leavesText }
+  }, [prefixesText, leavesText])
 
-  const dirty =
-    parseList(prefixDraft).join('\n') !== prefixes.join('\n') ||
-    parseList(leafDraft).join('\n') !== leaves.join('\n')
+  const prefixDirty = parseLineList(prefixDraft).join('\n') !== prefixesText
+  const leafDirty = parseLineList(leafDraft).join('\n') !== leavesText
+  const dirty = prefixDirty || leafDirty
 
   async function save() {
     setSaving(true)
     try {
-      await onCommit(parseList(prefixDraft), parseList(leafDraft))
+      // Only the textarea(s) the user edited replace their list
+      // (2026-11-05) — the untouched one isn't rewritten from a snapshot.
+      const nextPrefixes = parseLineList(prefixDraft)
+      const nextLeaves = parseLineList(leafDraft)
+      await onCommit(() => ({
+        ...(prefixDirty ? { prefixes: nextPrefixes } : {}),
+        ...(leafDirty ? { leaves: nextLeaves } : {}),
+      }))
     } finally {
       setSaving(false)
     }
@@ -6613,7 +7120,7 @@ function AdvancedManualEditor({
  * auto-disabled. Useful right after adopting subject-feature learning
  * to clean up old rules that never matched.
  */
-function StaleSweepActionRow() {
+function StaleSweepActionRow({ onDone }: { onDone?: () => void | Promise<void> }) {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<string | null>(null)
 
@@ -6633,7 +7140,11 @@ function StaleSweepActionRow() {
       if (deleted > 0) parts.push(`已自動清除 ${deleted} 條長期未命中規則`)
       if (disabled > 0) parts.push(`已自動停用 ${disabled} 條規則`)
       setResult(parts.length > 0 ? parts.join('、') : '沒有符合條件的規則需要清理')
-      window.setTimeout(() => setResult(null), 4000)
+      // The sweep rewrote the library — refresh it so the counts above and
+      // the 全部規則 table reflect what was just removed (2026-11-05; it
+      // used to refresh nothing until the page was reopened).
+      if (disabled > 0 || deleted > 0) await onDone?.()
+      window.setTimeout(() => setResult(null), 8000)
     } else if (!r.ok) {
       setResult(`失敗:${r.message ?? r.code}`)
     }
@@ -6650,17 +7161,24 @@ function StaleSweepActionRow() {
       >
         {running ? '清除中…' : '立即執行自動清除'}
       </button>
-      {result && <span className="text-emerald-700">{result}</span>}
+      {result && (
+        <span className="text-emerald-700" role="status">
+          {result}
+        </span>
+      )}
     </div>
   )
 }
 
 function RuleHealthSection({
   rules,
+  onAfterSweep,
   onOpenChip,
   onOpenConflicts,
 }: {
   rules: Rule[]
+  /** Refresh the rule list after 立即執行自動清除 changed it. */
+  onAfterSweep?: () => void | Promise<void>
   /** 跳到「全部規則」view 並套用對應的預設分類 chip。 */
   onOpenChip: (chip: 'sleeping' | 'hotVague' | 'orphaned' | 'overBroad') => void
   /** 跳到衝突 view — ConflictsView 是衝突處理的唯一介面。 */
@@ -6695,7 +7213,7 @@ function RuleHealthSection({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2 text-xs">
-        <StaleSweepActionRow />
+        <StaleSweepActionRow onDone={onAfterSweep} />
         {/* 分類列是跳轉入口(2026-07 UX 重整):點了帶到「全部規則」
             view + 套用同名 chip,在完整表格裡處理(全選 / 批次刪除都
             在那邊)— 這裡不再內嵌各分類的規則清單。說明文字收進

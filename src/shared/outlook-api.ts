@@ -8,9 +8,10 @@
 //   - 429 / 5xx / network: exponential backoff (3^attempt sec), 3x max
 //   - other 4xx: surface as OutlookError immediately
 //
-// Rate limiting via module-level TokenBucket (10 burst / 1 per sec).
+// Rate limiting via module-level TokenBucket (10 burst / 1 per sec, FIFO
+// reservations) + a module-level Semaphore capping requests in flight at 4.
 
-import { TokenBucket, abortableSleep } from './throttle'
+import { Semaphore, TokenBucket, abortableSleep } from './throttle'
 import type { Email, MailFolder, MailFolderNode } from './types'
 
 function isAbortError(e: unknown): boolean {
@@ -18,7 +19,46 @@ function isAbortError(e: unknown): boolean {
 }
 
 const DEFAULT_BASE = 'https://outlook.office.com/api/v2.0'
-const bucket = new TokenBucket(10, 1)
+const defaultBucket = new TokenBucket(10, 1)
+
+// Exchange throttles concurrent requests PER MAILBOX at ~4 (2026-11-05).
+// Module-level so every OutlookApi instance shares one budget — the limit is
+// the mailbox's, not the instance's.
+export const MAX_CONCURRENT_REQUESTS = 4
+const defaultInflight = new Semaphore(MAX_CONCURRENT_REQUESTS)
+
+// Hosts allowed to receive our bearer token when following an absolute
+// `@odata.nextLink` (2026-11-05). A paging URL comes from a response body;
+// never send the token anywhere that isn't an Outlook REST endpoint.
+const KNOWN_REST_ORIGINS = new Set([
+  'https://outlook.office.com',
+  'https://outlook.office365.com',
+  'https://outlook.cloud.microsoft',
+])
+
+// Folder listings follow @odata.nextLink (2026-11-05). The cap only exists to
+// stop a buggy/looping server; 50 pages × 200 children is far beyond any real
+// mailbox, so hitting it is treated as an error rather than a silent
+// truncation (a truncated listing is exactly what orphaned rules before).
+const FOLDER_LIST_MAX_PAGES = 50
+
+/**
+ * Well-known folders whose subtrees are NOT filing targets (2026-11-05).
+ * Deleting case folder 案件/甲 in OWA moves it to 刪除的郵件/甲 with the SAME
+ * id; while the tree still listed Deleted Items, reconcile just rewrote the
+ * rule's path and kept routing new mail into the trash. Names are Outlook
+ * REST distinguished folder names (GET /me/MailFolders/{name}).
+ */
+export const EXCLUDED_WELL_KNOWN_FOLDERS = [
+  'deleteditems',
+  'junkemail',
+  'drafts',
+  'outbox',
+  'sentitems',
+] as const
+// Distinguished-folder ids never change for a mailbox, but the signed-in
+// account can (OWA account switch), so the memo is short-lived.
+const WELL_KNOWN_TTL_MS = 10 * 60_000
 
 // F6 (2026-06-03): upper bound on how long a single Retry-After can park
 // the batch. Outlook normally returns small values, but a misbehaving
@@ -95,11 +135,40 @@ export class OutlookError extends Error {
      * blip or 404 (already moved).
      */
     public readonly uncertain: boolean = false,
+    /**
+     * Set when the caller's AbortSignal fired while a non-idempotent request
+     * was already on the wire (or its 2xx body was being read) (2026-11-05).
+     * Always paired with `uncertain` — the server may have committed the
+     * move — so execute renders a soft "may have completed" row instead of
+     * a plain 'cancelled' that lies when the move went through.
+     */
+    public readonly aborted: boolean = false,
   ) {
     super(message)
     this.name = 'OutlookError'
   }
 }
+
+/** Response shape of a move (the moved message; Outlook assigns a new Id). */
+export type MovedMessage = { Id: string; ParentFolderId?: string }
+
+/** Mailbox-wide message row used by the manual-filing harvester. */
+export type ModifiedMessage = Pick<Email, 'Id' | 'Subject' | 'From' | 'ConversationId' | 'ParentFolderId'> & {
+  LastModifiedDateTime?: string
+}
+
+type Paged<T> = { value?: T[]; '@odata.nextLink'?: string }
+
+type AttemptResult<T> =
+  | { kind: 'ok'; value: T }
+  | { kind: 'network'; error: unknown }
+  | {
+      kind: 'http'
+      status: number
+      statusText: string
+      retryAfter: string | null
+      text: string
+    }
 
 /**
  * RFC 9110 idempotent methods — safe to retry on network errors / 5xx
@@ -124,10 +193,51 @@ function isIdempotentMethod(method: string): boolean {
   return m === 'GET' || m === 'HEAD' || m === 'PUT' || m === 'OPTIONS'
 }
 
+/**
+ * What to throw when the caller's signal aborts mid-request (2026-11-05).
+ * For idempotent methods an abort is a plain cancel. For POST/DELETE/PATCH
+ * the request was already on the wire, so the server may have committed it —
+ * surfacing a bare AbortError made execute mark a row 'cancelled' even when
+ * the move had gone through. (Aborts BEFORE the fetch starts — token bucket,
+ * semaphore wait, backoff sleep — still surface as AbortError: nothing was
+ * sent.)
+ */
+function abortedInFlight(e: unknown, method: string, idempotent: boolean): unknown {
+  if (idempotent) return e
+  return new OutlookError(
+    0,
+    `Cancelled while ${method} was in flight — the operation may have completed server-side`,
+    undefined,
+    true,
+    true,
+  )
+}
+
+/**
+ * Exchange rejects `$orderby` properties that are not also the LEADING
+ * properties of `$filter` (InefficientFilter, 2026-11-05). True when the
+ * filter's first comparison is on ReceivedDateTime, i.e. when the default
+ * `ReceivedDateTime desc` sort may be combined with it.
+ */
+export function filterLeadsWithReceivedDateTime(filter: string): boolean {
+  return /^\s*\(*\s*ReceivedDateTime\b/i.test(filter)
+}
+
 export type TokenProvider = (opts?: { force?: boolean }) => Promise<string>
 export type BaseUrlProvider = () => Promise<string> | string
 
+export type OutlookApiOptions = {
+  /** Injected for tests; production shares the module-level bucket. */
+  bucket?: TokenBucket
+  /** Injected for tests; production shares the module-level semaphore. */
+  inflight?: Semaphore
+}
+
 export class OutlookApi {
+  private readonly bucket: TokenBucket
+  private readonly inflight: Semaphore
+  private wellKnownMemo: { at: number; ids: Map<string, string> } | null = null
+
   constructor(
     private readonly getToken: TokenProvider,
     // Optional base-URL provider — lets the service-worker resolve the
@@ -135,7 +245,11 @@ export class OutlookApi {
     // cloud.microsoft etc.) so token audience matches the call host.
     // Defaults to DEFAULT_BASE (outlook.office.com) when omitted.
     private readonly getBaseUrl?: BaseUrlProvider,
-  ) {}
+    opts: OutlookApiOptions = {},
+  ) {
+    this.bucket = opts.bucket ?? defaultBucket
+    this.inflight = opts.inflight ?? defaultInflight
+  }
 
   private async resolveBase(): Promise<string> {
     if (this.getBaseUrl) {
@@ -148,33 +262,53 @@ export class OutlookApi {
     return DEFAULT_BASE
   }
 
-  private async request<T>(
+  /**
+   * `path` is normally relative to the REST base; an absolute URL is an
+   * `@odata.nextLink` (2026-11-05) and is only followed when it points at an
+   * Outlook REST host — the bearer token must never leave for another origin.
+   */
+  private async resolveUrl(path: string): Promise<string> {
+    const base = await this.resolveBase()
+    if (!/^https?:\/\//i.test(path)) return `${base}${path}`
+    let u: URL
+    try {
+      u = new URL(path)
+    } catch {
+      throw new OutlookError(0, `Refusing to follow a malformed nextLink: ${path.slice(0, 120)}`)
+    }
+    let baseOrigin = ''
+    try {
+      baseOrigin = new URL(base).origin
+    } catch {
+      /* ignore */
+    }
+    const allowedHost = u.origin === baseOrigin || KNOWN_REST_ORIGINS.has(u.origin)
+    if (u.protocol !== 'https:' || !allowedHost || !u.pathname.toLowerCase().startsWith('/api/v2.0/')) {
+      throw new OutlookError(0, `Refusing to follow a nextLink to an unexpected endpoint: ${u.origin}`)
+    }
+    return u.toString()
+  }
+
+  /**
+   * One network round trip, holding a concurrency slot ONLY while the
+   * request + response body are on the wire (2026-11-05) — never while we
+   * sleep for backoff or wait for a token, so a parked retry can't starve the
+   * other three slots.
+   */
+  private async attempt<T>(
     method: string,
-    path: string,
-    body?: unknown,
-    signal?: AbortSignal,
-    extraHeaders?: Record<string, string>,
-  ): Promise<T> {
-    let forceToken = false
-    let triedRefresh = false
-    let backoffAttempt = 0
-
-    while (true) {
-      await bucket.take(1, signal)
-
-      let token: string
-      try {
-        token = await this.getToken({ force: forceToken })
-      } catch (e) {
-        throw new OutlookError(401, `Token unavailable: ${e instanceof Error ? e.message : String(e)}`)
-      }
-      forceToken = false
-
-      const base = await this.resolveBase()
-      const idempotent = isIdempotentMethod(method)
+    url: string,
+    token: string,
+    body: unknown,
+    signal: AbortSignal | undefined,
+    extraHeaders: Record<string, string> | undefined,
+    idempotent: boolean,
+  ): Promise<AttemptResult<T>> {
+    const release = await this.inflight.acquire(signal)
+    try {
       let resp: Response
       try {
-        resp = await fetch(`${base}${path}`, {
+        resp = await fetch(url, {
           method,
           headers: {
             Authorization: `Bearer ${token}`,
@@ -186,7 +320,62 @@ export class OutlookApi {
           signal,
         })
       } catch (e) {
-        if (isAbortError(e)) throw e // never retry on abort
+        if (isAbortError(e)) throw abortedInFlight(e, method, idempotent)
+        return { kind: 'network', error: e }
+      }
+      if (resp.ok) {
+        if (resp.status === 204) return { kind: 'ok', value: undefined as T }
+        try {
+          return { kind: 'ok', value: (await resp.json()) as T }
+        } catch (e) {
+          // 2xx already arrived: a non-idempotent op DID commit, we just lost
+          // its body (e.g. the new message Id) — uncertain, not cancelled.
+          if (isAbortError(e)) throw abortedInFlight(e, method, idempotent)
+          throw e
+        }
+      }
+      const text = await resp.text().catch(() => '')
+      return {
+        kind: 'http',
+        status: resp.status,
+        statusText: resp.statusText,
+        retryAfter: resp.headers.get('Retry-After'),
+        text,
+      }
+    } finally {
+      release()
+    }
+  }
+
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    signal?: AbortSignal,
+    extraHeaders?: Record<string, string>,
+  ): Promise<T> {
+    let forceToken = false
+    let triedRefresh = false
+    let backoffAttempt = 0
+    const idempotent = isIdempotentMethod(method)
+
+    while (true) {
+      await this.bucket.take(1, signal)
+
+      let token: string
+      try {
+        token = await this.getToken({ force: forceToken })
+      } catch (e) {
+        throw new OutlookError(401, `Token unavailable: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      forceToken = false
+
+      const url = await this.resolveUrl(path)
+      const r = await this.attempt<T>(method, url, token, body, signal, extraHeaders, idempotent)
+      if (r.kind === 'ok') return r.value
+
+      if (r.kind === 'network') {
+        const e = r.error
         if (idempotent && backoffAttempt < 3) {
           // Safe to retry — re-running a GET/HEAD/PUT has no
           // additional server effect.
@@ -206,12 +395,7 @@ export class OutlookApi {
         throw new OutlookError(0, msg, undefined, !idempotent)
       }
 
-      if (resp.ok) {
-        if (resp.status === 204) return undefined as T
-        return (await resp.json()) as T
-      }
-
-      if (resp.status === 401 && !triedRefresh) {
+      if (r.status === 401 && !triedRefresh) {
         triedRefresh = true
         forceToken = true
         continue
@@ -219,8 +403,8 @@ export class OutlookApi {
 
       // 429 — server explicitly said "didn't process, try again later".
       // Safe to retry for ALL methods.
-      if (resp.status === 429 && backoffAttempt < 3) {
-        const waitMs = computeRetryWaitMs(resp.headers.get('Retry-After'), backoffAttempt)
+      if (r.status === 429 && backoffAttempt < 3) {
+        const waitMs = computeRetryWaitMs(r.retryAfter, backoffAttempt)
         await abortableSleep(waitMs, signal)
         backoffAttempt++
         continue
@@ -231,53 +415,165 @@ export class OutlookApi {
       // server-side before the crash (Outlook is not transactional
       // about response delivery), so retrying could hit 404 on a
       // now-stale id. Bail with uncertain=true.
-      if (resp.status >= 500 && backoffAttempt < 3 && idempotent) {
-        const waitMs = computeRetryWaitMs(resp.headers.get('Retry-After'), backoffAttempt)
+      if (r.status >= 500 && backoffAttempt < 3 && idempotent) {
+        const waitMs = computeRetryWaitMs(r.retryAfter, backoffAttempt)
         await abortableSleep(waitMs, signal)
         backoffAttempt++
         continue
       }
 
-      const errText = await resp.text().catch(() => '')
-      const uncertain = !idempotent && resp.status >= 500
+      const uncertain = !idempotent && r.status >= 500
+      const shownPath = /^https?:\/\//i.test(path) ? `${new URL(url).pathname}…` : path
       throw new OutlookError(
-        resp.status,
-        `Outlook REST ${method} ${path} → ${resp.status} ${resp.statusText} ${errText.slice(0, 300)}`,
+        r.status,
+        `Outlook REST ${method} ${shownPath} → ${r.status} ${r.statusText} ${r.text.slice(0, 300)}`,
         undefined,
         uncertain,
       )
     }
   }
 
-  // ---- Folders --------------------------------------------------------------
-
-  async listTopFolders(): Promise<MailFolder[]> {
-    const r = await this.request<{ value: MailFolder[] }>(
-      'GET',
-      '/me/MailFolders?$top=100',
-    )
-    return r.value
+  /**
+   * GET a collection and follow `@odata.nextLink` (2026-11-05). `complete`
+   * is false when the page cap stopped us (or a looping nextLink was
+   * detected) — the caller decides whether a partial listing is acceptable.
+   */
+  private async collectPages<T>(
+    firstPath: string,
+    opts: { maxPages: number; signal?: AbortSignal },
+  ): Promise<{ items: T[]; complete: boolean; pages: number }> {
+    const items: T[] = []
+    const seen = new Set<string>()
+    let next: string | undefined = firstPath
+    let pages = 0
+    while (next !== undefined && pages < opts.maxPages) {
+      if (seen.has(next)) break // server echoed a nextLink we already fetched
+      seen.add(next)
+      const current: string = next
+      const page: Paged<T> = await this.request<Paged<T>>('GET', current, undefined, opts.signal)
+      pages++
+      if (Array.isArray(page?.value)) items.push(...page.value)
+      const link = page?.['@odata.nextLink']
+      if (typeof link !== 'string' || link.length === 0) {
+        next = undefined
+      } else if (/^https?:\/\//i.test(link)) {
+        next = link
+      } else {
+        // OData nextLinks are absolute; resolve a relative one defensively
+        // against the page it came from (resolveUrl still vets the host).
+        next = new URL(link, await this.resolveUrl(current)).toString()
+      }
+    }
+    return { items, complete: next === undefined, pages }
   }
 
-  async listChildFolders(parentId: string): Promise<MailFolder[]> {
-    const r = await this.request<{ value: MailFolder[] }>(
+  private async listAllFolders(firstPath: string, what: string, signal?: AbortSignal): Promise<MailFolder[]> {
+    const r = await this.collectPages<MailFolder>(firstPath, {
+      maxPages: FOLDER_LIST_MAX_PAGES,
+      signal,
+    })
+    if (!r.complete) {
+      // Never hand back a silently truncated folder list — that is the
+      // orphaned-rules / failed-409-recovery bug this paging exists to fix.
+      throw new OutlookError(0, `資料夾清單分頁未完成(${what},已讀 ${r.pages} 頁)`)
+    }
+    return r.items
+  }
+
+  // ---- Folders --------------------------------------------------------------
+
+  /** All top-level folders (follows nextLink — 2026-11-05). */
+  async listTopFolders(signal?: AbortSignal): Promise<MailFolder[]> {
+    return this.listAllFolders('/me/MailFolders?$top=100', 'top-level', signal)
+  }
+
+  /**
+   * All child folders of `parentId` (follows nextLink — 2026-11-05). The old
+   * single `$top=200` page dropped case folders 201+ under a busy parent:
+   * their rules got orphaned, the AI never saw them, and new_folder's 409
+   * recovery could never find the existing folder.
+   */
+  async listChildFolders(parentId: string, signal?: AbortSignal): Promise<MailFolder[]> {
+    return this.listAllFolders(`/me/MailFolders/${parentId}/childFolders?$top=200`, parentId, signal)
+  }
+
+  /** One folder's identity + parent (used to verify move destinations). */
+  async getFolder(folderId: string, signal?: AbortSignal): Promise<MailFolder> {
+    return this.request<MailFolder>(
       'GET',
-      `/me/MailFolders/${parentId}/childFolders?$top=200`,
+      `/me/MailFolders/${folderId}?$select=Id,DisplayName,ParentFolderId,ChildFolderCount`,
+      undefined,
+      signal,
     )
-    return r.value
+  }
+
+  /**
+   * Resolve the ids of EXCLUDED_WELL_KNOWN_FOLDERS (name → id). Defensive by
+   * design: a lookup that fails is simply absent from the map — callers must
+   * treat a missing name as "unknown", never as an error. Memoized briefly,
+   * and only when every lookup produced a definitive answer.
+   */
+  async getWellKnownFolderIds(): Promise<Map<string, string>> {
+    const memo = this.wellKnownMemo
+    if (memo && Date.now() - memo.at < WELL_KNOWN_TTL_MS) return new Map(memo.ids)
+    const ids = new Map<string, string>()
+    let definitive = true
+    await Promise.all(
+      EXCLUDED_WELL_KNOWN_FOLDERS.map(async (name) => {
+        try {
+          const f = await this.request<{ Id?: string }>('GET', `/me/MailFolders/${name}?$select=Id`)
+          if (typeof f?.Id === 'string' && f.Id) ids.set(name, f.Id)
+        } catch (e) {
+          // A 4xx (e.g. this mailbox has no such folder / name unsupported)
+          // is a stable answer; network / 5xx / token trouble is not.
+          const transient =
+            !(e instanceof OutlookError) ||
+            e.status === 0 ||
+            e.status === 401 ||
+            e.status === 429 ||
+            e.status >= 500
+          if (transient) definitive = false
+        }
+      }),
+    )
+    if (definitive) this.wellKnownMemo = { at: Date.now(), ids }
+    return new Map(ids)
   }
 
   /**
    * Recursively walks the folder tree.
-   * Sibling folders fetch in parallel; the global TokenBucket serializes
-   * actual network calls so this won't violate the rate limit.
+   * Sibling folders fetch in parallel; the shared TokenBucket spaces the
+   * requests and the Semaphore caps how many are in flight.
    */
   async fetchFolderTree(): Promise<MailFolderNode[]> {
-    const top = await this.listTopFolders()
-    return Promise.all(top.map((f) => this.buildNode(f, '')))
+    return (await this.fetchFolderTreeWithMeta()).tree
   }
 
-  private async buildNode(folder: MailFolder, parentPath: string): Promise<MailFolderNode> {
+  /**
+   * Like fetchFolderTree, plus the well-known folder ids whose subtrees were
+   * left out (2026-11-05) — persisted with the folder cache so execute can
+   * refuse moves into them without re-resolving.
+   */
+  async fetchFolderTreeWithMeta(): Promise<{ tree: MailFolderNode[]; excludedFolderIds: string[] }> {
+    let excluded = new Set<string>()
+    try {
+      excluded = new Set((await this.getWellKnownFolderIds()).values())
+    } catch (e) {
+      // Must never break the tree: worst case we list those subtrees as before.
+      console.warn('[mail-organizer] well-known folder lookup failed (non-fatal)', e)
+    }
+    const top = await this.listTopFolders()
+    const tree = await Promise.all(
+      top.filter((f) => !excluded.has(f.Id)).map((f) => this.buildNode(f, '', excluded)),
+    )
+    return { tree, excludedFolderIds: [...excluded] }
+  }
+
+  private async buildNode(
+    folder: MailFolder,
+    parentPath: string,
+    excluded: ReadonlySet<string>,
+  ): Promise<MailFolderNode> {
     const path = joinFolderPath(parentPath || undefined, folder.DisplayName)
     const node: MailFolderNode = {
       id: folder.Id,
@@ -287,8 +583,8 @@ export class OutlookApi {
       children: [],
     }
     if ((folder.ChildFolderCount ?? 0) > 0) {
-      const children = await this.listChildFolders(folder.Id)
-      node.children = await Promise.all(children.map((c) => this.buildNode(c, path)))
+      const children = (await this.listChildFolders(folder.Id)).filter((c) => !excluded.has(c.Id))
+      node.children = await Promise.all(children.map((c) => this.buildNode(c, path, excluded)))
     }
     return node
   }
@@ -333,12 +629,14 @@ export class OutlookApi {
        */
       filter?: string
       /**
-       * Optional OData $orderby. Defaults to `ReceivedDateTime desc` (unchanged
-       * for every existing caller). The harvester passes `LastModifiedDateTime
-       * desc`: a manually-filed email keeps its old ReceivedDateTime, so it is
-       * never the ReceivedDateTime-newest message in the folder and is invisible
-       * to the default sort — but a move rewrites LastModifiedDateTime to ~the
-       * time it entered the folder, surfacing it.
+       * Optional OData $orderby. Without a filter it defaults to
+       * `ReceivedDateTime desc` (unchanged for the inbox / folder scans). With
+       * a filter, the default is added ONLY when the filter leads with
+       * ReceivedDateTime (2026-11-05): Exchange answers 400 InefficientFilter
+       * when an orderby property isn't also the filter's leading property, so
+       * the old always-on default made every `From/EmailAddress/Address`
+       * server filter (autoUpgradeConflictRules) fail and fall back to the
+       * client-side scan.
        */
       orderby?: string
       signal?: AbortSignal
@@ -347,12 +645,11 @@ export class OutlookApi {
     const top = opts.top ?? 50
     const skip = opts.skip ?? 0
     const select = opts.select ?? MESSAGE_SELECT_DEFAULT
-    const parts = [
-      `$top=${top}`,
-      `$skip=${skip}`,
-      `$select=${select}`,
-      `$orderby=${encodeURIComponent(opts.orderby ?? 'ReceivedDateTime desc')}`,
-    ]
+    const parts = [`$top=${top}`, `$skip=${skip}`, `$select=${select}`]
+    const orderby =
+      opts.orderby ??
+      (!opts.filter || filterLeadsWithReceivedDateTime(opts.filter) ? 'ReceivedDateTime desc' : undefined)
+    if (orderby) parts.push(`$orderby=${encodeURIComponent(orderby)}`)
     if (opts.filter) {
       parts.push(`$filter=${encodeURIComponent(opts.filter)}`)
     }
@@ -388,8 +685,34 @@ export class OutlookApi {
     return text.length > 4000 ? text.slice(0, 4000) : text
   }
 
-  async moveMessage(messageId: string, destinationFolderId: string, signal?: AbortSignal): Promise<{ Id: string }> {
-    return this.request<{ Id: string }>(
+  /**
+   * Mailbox-wide "modified since" listing for the manual-filing harvester
+   * (2026-11-05): ONE query over `/me/messages` instead of a `$top=10` probe
+   * per leaf folder, paged via nextLink up to `maxPages`. The orderby
+   * property is also the filter's leading property (Exchange rule).
+   * `complete` is false when the page cap stopped the walk — callers must
+   * not advance a watermark past an incomplete listing.
+   */
+  async listMessagesModifiedSince(
+    sinceIso: string,
+    opts: { pageSize?: number; maxPages?: number; signal?: AbortSignal } = {},
+  ): Promise<{ messages: ModifiedMessage[]; complete: boolean; pages: number }> {
+    const pageSize = opts.pageSize ?? 100
+    const parts = [
+      `$filter=${encodeURIComponent(`LastModifiedDateTime gt ${sinceIso}`)}`,
+      `$orderby=${encodeURIComponent('LastModifiedDateTime desc')}`,
+      '$select=Id,Subject,From,ConversationId,LastModifiedDateTime,ParentFolderId',
+      `$top=${pageSize}`,
+    ]
+    const r = await this.collectPages<ModifiedMessage>(`/me/messages?${parts.join('&')}`, {
+      maxPages: opts.maxPages ?? 20,
+      signal: opts.signal,
+    })
+    return { messages: r.items, complete: r.complete, pages: r.pages }
+  }
+
+  async moveMessage(messageId: string, destinationFolderId: string, signal?: AbortSignal): Promise<MovedMessage> {
+    return this.request<MovedMessage>(
       'POST',
       `/me/messages/${messageId}/move`,
       { DestinationId: destinationFolderId },
@@ -397,6 +720,30 @@ export class OutlookApi {
     )
   }
 
+  /**
+   * "Delete" = move into Deleted Items (2026-11-05). `DELETE /me/messages/{id}`
+   * lands in Recoverable Items — invisible in OWA's 已刪除的郵件, which is
+   * what the popup promises — and can't be reversed by 撤回. Outlook REST
+   * v2.0 accepts the well-known name as DestinationId; if a host rejects it
+   * (400 — the move was refused outright, nothing happened, so one retry
+   * cannot double-move), retry once with the resolved folder id.
+   */
+  async moveToDeletedItems(messageId: string, signal?: AbortSignal): Promise<MovedMessage> {
+    try {
+      return await this.moveMessage(messageId, 'DeletedItems', signal)
+    } catch (e) {
+      if (e instanceof OutlookError && e.status === 400) {
+        const id = (await this.getWellKnownFolderIds()).get('deleteditems')
+        if (id) return this.moveMessage(messageId, id, signal)
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Hard delete (lands in Recoverable Items). No longer used by execute —
+   * see moveToDeletedItems — kept for API completeness.
+   */
   async deleteMessage(messageId: string, signal?: AbortSignal): Promise<void> {
     await this.request<void>('DELETE', `/me/messages/${messageId}`, undefined, signal)
   }
@@ -410,6 +757,59 @@ export class OutlookApi {
       signal,
     )
     return typeof r.EmailAddress === 'string' ? r.EmailAddress : ''
+  }
+
+  /**
+   * One page of the inbox listing plus the server's continuation link
+   * (2026-11-05, inbox starvation). Same $select / $orderby as
+   * listInboxMessages; pass the returned `nextLink` back to get the next page
+   * (it already encodes $top/$skip/$select, so `top`/`select` only shape the
+   * first request).
+   *
+   * The link is re-based onto OUR resolved REST base: only its path + query
+   * are kept, so the bearer token can never be sent to whatever host the
+   * link happens to name.
+   */
+  async listInboxMessagesPage(opts: {
+    top: number
+    nextLink?: string | null
+    select?: string
+    signal?: AbortSignal
+  }): Promise<{ messages: Email[]; nextLink: string | null }> {
+    let path: string
+    if (opts.nextLink) {
+      let rel: string | null = null
+      try {
+        const u = new URL(opts.nextLink)
+        const idx = u.pathname.toLowerCase().indexOf('/api/v2.0/')
+        if (idx >= 0) rel = u.pathname.slice(idx + '/api/v2.0'.length) + u.search
+      } catch {
+        rel = null
+      }
+      if (!rel) {
+        throw new OutlookError(0, `Unexpected @odata.nextLink: ${opts.nextLink.slice(0, 200)}`)
+      }
+      path = rel
+    } else {
+      const parts = [
+        `$top=${opts.top}`,
+        `$skip=0`,
+        `$select=${opts.select ?? MESSAGE_SELECT_DEFAULT}`,
+        `$orderby=${encodeURIComponent('ReceivedDateTime desc')}`,
+      ]
+      path = `/me/MailFolders/inbox/messages?${parts.join('&')}`
+    }
+    const r = await this.request<{ value?: Email[]; '@odata.nextLink'?: unknown }>(
+      'GET',
+      path,
+      undefined,
+      opts.signal,
+    )
+    const next = r['@odata.nextLink']
+    return {
+      messages: Array.isArray(r.value) ? r.value : [],
+      nextLink: typeof next === 'string' && next.length > 0 ? next : null,
+    }
   }
 }
 

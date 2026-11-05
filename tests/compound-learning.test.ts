@@ -174,8 +174,10 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
     }
     await setRules([seed])
 
+    // ≥ 8 chars: shorter subjects are no longer learnable (2026-11-05, see
+    // the demote-only companion below).
     const item = planItem({
-      emailSubject: '請款通知',
+      emailSubject: '五月份請款通知單據',
       emailFrom: 'billing@vendor.com',
       action: 'move',
       targetFolderPath: '05/發票',
@@ -193,10 +195,46 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
     const parsed = decodeCompound(compound!.signal)
     expect(parsed?.conditions).toEqual([
       { type: 'domain', value: 'vendor.com' },
-      { type: 'subject_keyword', value: '請款通知' },
+      { type: 'subject_keyword', value: '五月份請款通知單據' },
     ])
-    // Old plain-domain rule still exists but is disabled.
+    // Old plain-domain rule still exists but is disabled — as an AUTO
+    // disable ('superseded', 2026-11-05) so it can revive / be purged
+    // later instead of reading as user-disabled forever.
     const oldDomainRule = rules.find((rl) => rl.id === seed.id)
     expect(oldDomainRule?.enabled).toBe(false)
+    expect(oldDomainRule?.autoDisabledReason).toBe('superseded')
+    expect(oldDomainRule?.autoDisabledAt).toBeDefined()
+  })
+
+  it('short subject (< 8 chars) on a conflict: demote the broad rule, learn nothing (2026-11-05)', async () => {
+    await setRules([
+      {
+        id: 'seed-vendor-2',
+        type: 'domain',
+        signal: 'vendor.com',
+        targetFolderId: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3',
+        targetFolderPath: '02/未分類',
+        confidence: 0.55,
+        matchCount: 5,
+        enabled: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        source: 'ai_confirmed',
+      },
+    ])
+    const item = planItem({
+      emailSubject: '請款通知', // 4 chars — would have minted vendor.com + 請款通知
+      emailFrom: 'billing@vendor.com',
+      action: 'move',
+      targetFolderPath: '05/發票',
+      aiOriginalAction: 'move',
+      aiOriginalTargetFolderPath: '02/未分類',
+    })
+    const r = await generateAiOverrideRules([item], [okResult(item.emailId)])
+    expect(r.added).toBe(0)
+    expect(r.disabled).toBe(1)
+    const [seed] = await listRules()
+    expect(seed!.enabled).toBe(false)
+    // Nothing narrower replaced it — the user's correction silenced it.
+    expect(seed!.autoDisabledReason).toBe('override')
   })
 })

@@ -184,15 +184,14 @@ function email(over: Partial<Email> & { Id: string }): Email {
 }
 
 describe('buildEmailBlock', () => {
-  it('numbers emails [0], [1], ...', () => {
+  it('fences each email in an indexed <email> record (2026-11-05 injection hardening)', () => {
     const block = buildEmailBlock([
       email({ Id: 'e1', Subject: 'hello' }),
       email({ Id: 'e2', Subject: 'world' }),
     ])
-    expect(block).toContain('[0]')
-    expect(block).toContain('[1]')
-    expect(block).toContain('hello')
-    expect(block).toContain('world')
+    expect(block).toContain('<email index="0">\n主旨:hello')
+    expect(block).toContain('<email index="1">\n主旨:world')
+    expect(block.match(/<\/email>/g)).toHaveLength(2)
   })
 
   it('truncates long bodies to 800 chars (B3-C4 raised from 200)', () => {
@@ -362,7 +361,7 @@ describe('buildActiveFoldersBlock', () => {
 const zeroUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 }
 
 describe('estimateUsageCostUsd', () => {
-  it('prices base input/output at the model rate (sonnet: $3 / $15 per MTok)', () => {
+  it('prices base input/output at the model rate (sonnet 4.6: $3 / $15 per MTok)', () => {
     expect(
       estimateUsageCostUsd({ ...zeroUsage, inputTokens: 1_000_000 }, 'claude-sonnet-4-6'),
     ).toBeCloseTo(3, 6)
@@ -371,17 +370,40 @@ describe('estimateUsageCostUsd', () => {
     ).toBeCloseTo(15, 6)
   })
 
-  it('selects the model family by name (opus > sonnet > haiku for input)', () => {
-    const oneM = { ...zeroUsage, inputTokens: 1_000_000 }
-    expect(estimateUsageCostUsd(oneM, 'claude-opus-4-7')).toBeCloseTo(15, 6)
-    expect(estimateUsageCostUsd(oneM, 'claude-sonnet-4-6')).toBeCloseTo(3, 6)
-    expect(estimateUsageCostUsd(oneM, 'claude-haiku-4-5-20251001')).toBeCloseTo(1, 6)
+  // 2026-11-05: per-model list prices from the known-model table. The old flat
+  // family table priced Opus 4.7 at $15/$75 (real: $5/$25).
+  it('uses the own price of each offered model', () => {
+    const inM = { ...zeroUsage, inputTokens: 1_000_000 }
+    const outM = { ...zeroUsage, outputTokens: 1_000_000 }
+    const cases: Array<[string, number, number]> = [
+      ['claude-opus-5-5', 4, 20],
+      ['claude-sonnet-5-5', 2, 10],
+      ['claude-haiku-5-5', 0.1, 0.5],
+      ['claude-opus-4-7', 5, 25],
+      ['claude-sonnet-4-6', 3, 15],
+      ['claude-haiku-4-5-20251001', 1, 5],
+    ]
+    for (const [model, input, output] of cases) {
+      expect(estimateUsageCostUsd(inM, model), model).toBeCloseTo(input, 6)
+      expect(estimateUsageCostUsd(outM, model), model).toBeCloseTo(output, 6)
+    }
   })
 
-  it('falls back to sonnet rate for an unknown model id', () => {
+  it('falls back to the current model of the family for an unknown id', () => {
+    const oneM = { ...zeroUsage, inputTokens: 1_000_000 }
+    expect(estimateUsageCostUsd(oneM, 'claude-opus-9')).toBeCloseTo(4, 6)
+    expect(estimateUsageCostUsd(oneM, 'claude-haiku-9')).toBeCloseTo(0.1, 6)
+    // Unrecognised family → Sonnet (current: $2).
+    expect(estimateUsageCostUsd(oneM, 'claude-future-9')).toBeCloseTo(2, 6)
+  })
+
+  it('prices Opus 5.5 cache reads at its documented $0.20 (0.05×), not 0.1×', () => {
     expect(
-      estimateUsageCostUsd({ ...zeroUsage, inputTokens: 1_000_000 }, 'claude-future-9'),
-    ).toBeCloseTo(3, 6)
+      estimateUsageCostUsd({ ...zeroUsage, cacheReadTokens: 1_000_000 }, 'claude-opus-5-5'),
+    ).toBeCloseTo(0.2, 6)
+    expect(
+      estimateUsageCostUsd({ ...zeroUsage, cacheCreationTokens: 1_000_000 }, 'claude-opus-5-5'),
+    ).toBeCloseTo(8, 6)
   })
 
   it('discounts cache reads (~0.1×) and surcharges cache writes (~2×) vs base input', () => {

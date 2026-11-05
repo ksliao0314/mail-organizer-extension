@@ -11,7 +11,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { generateAiConfirmedRules } from '@/background/execute'
 import { listRules } from '@/shared/rules'
-import { recordSubjectFilings, setRules, setSettings } from '@/shared/storage'
+import { getSubjectMemory, recordSubjectFilings, setRules, setSettings } from '@/shared/storage'
 import { normalizeSubject } from '@/shared/normalize'
 import type { PlanItem } from '@/shared/types'
 
@@ -116,12 +116,15 @@ describe('full_subject 出生閘門 (兩次觀察)', () => {
     expect(['compound', 'subject_keyword', 'case_code']).toContain(rules[0]!.type)
   })
 
-  it('短主旨（<8 字、SubjectMemory 永不記錄）回退為首見即鑄，不被無限封鎖', async () => {
-    // 覆核 F1: SubjectMemory 寫入端以 MIN_NORMALIZED_SUBJECT_LEN=8 為門檻，
-    // 2-7 字主旨永遠不會有 entry — 對它們套閘門是無限封鎖而非兩次觀察。
+  it('短主旨（<8 字）不再學成 full_subject 規則（2026-11-05）', async () => {
+    // 原本（覆核 F1）2-7 字主旨因 SubjectMemory 永不記錄而回退為首見即鑄。
+    // 2026-11-05 起 extractSubjectSignal 的門檻與 SubjectMemory 一致（8）：
+    // 這類短主旨本身就太泛（子字串誤中同寄件人的無關信、又以 compound 身分
+    // 蓋過 thread memory），不是閘門要等的訊號 — 交給 AI / thread memory。
     const item = planItem({ emailSubject: '委任狀用印' }) // 5 字
     const r = await generateAiConfirmedRules([item], [moved(item.emailId)])
-    expect(r.added).toBe(1)
+    expect(r.added).toBe(0)
+    expect(await listRules()).toHaveLength(0)
   })
 
   it('外部網域（P4 → domain 規則，非 full_subject）不受閘門影響', async () => {
@@ -130,5 +133,95 @@ describe('full_subject 出生閘門 (兩次觀察)', () => {
     expect(r.added).toBe(1)
     const rules = await listRules()
     expect(rules[0]!.type).toBe('domain')
+  })
+})
+
+// ---- 2026-11-05 (item 7): the gate reads memory BEFORE this batch's filing,
+// and a thread-routed subject repeat counts as the second observation.
+//
+// In the real flow the second same-subject email is routed by SUBJECT memory
+// (source 'thread'), and thread-routed non-structural rows never learned — so
+// passive full_subject rules could never be minted. And because execute
+// recorded the filing first, the `harvested` exclusion was dead: the real
+// filing had already cleared the flag. startExecute now snapshots subject
+// memory before recording and passes it as `priorSubjectMemory`.
+describe('full_subject 出生閘門 — 先前快照 + thread 重複 (2026-11-05)', () => {
+  /** Mirror execute: snapshot (a copy, as startExecute takes), then record this batch's filing. */
+  async function executeBatchFiling() {
+    const prior = { ...(await getSubjectMemory()) }
+    await fileSubject(1)
+    return prior
+  }
+
+  it('首見（快照中無紀錄）→ 不鑄', async () => {
+    const prior = await executeBatchFiling()
+    const item = planItem()
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)], { priorSubjectMemory: prior })
+    expect(r.added).toBe(0)
+  })
+
+  it('第二封同主旨信由 thread memory（subject）路由、使用者未改 → 鑄', async () => {
+    await fileSubject(1) // first email, filed by an earlier batch
+    const prior = await executeBatchFiling()
+    const item = planItem({
+      source: 'thread',
+      threadMatch: { kind: 'subject', previousFolderPath: FOLDER },
+      targetFolderId: 'FID_' + FOLDER,
+    })
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)], { priorSubjectMemory: prior })
+    expect(r.added).toBe(1) // was 0: thread rows never reached the gate
+    expect((await listRules())[0]!.type).toBe('compound')
+  })
+
+  it('同對話的回覆（convId 路由）不算第二次觀察 → 不鑄', async () => {
+    await fileSubject(1)
+    const prior = await executeBatchFiling()
+    const item = planItem({
+      source: 'thread',
+      threadMatch: { kind: 'convId', previousFolderPath: FOLDER },
+    })
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)], { priorSubjectMemory: prior })
+    expect(r.added).toBe(0)
+  })
+
+  it('使用者改過目標的 thread 列不算確認 → 不鑄', async () => {
+    await fileSubject(1)
+    const prior = await executeBatchFiling()
+    const item = planItem({
+      source: 'thread',
+      threadMatch: { kind: 'subject', previousFolderPath: FOLDER },
+      userTouched: true,
+    })
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)], { priorSubjectMemory: prior })
+    expect(r.added).toBe(0)
+  })
+
+  it('harvested-only 的先前紀錄在快照下確實不算（舊流程中該檢查已失效）', async () => {
+    await fileSubject(2, { harvested: true })
+    const prior = await executeBatchFiling() // the real filing clears the flag AFTER the snapshot
+    expect((await getSubjectMemory())[normalizeSubject(SUBJECT)]!.harvested).toBeUndefined()
+    const item = planItem()
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)], { priorSubjectMemory: prior })
+    expect(r.added).toBe(0)
+  })
+
+  it('同批兩個不同對話的同主旨信 → 視為跨對話重複，鑄一條', async () => {
+    const prior = await getSubjectMemory()
+    const a = planItem({ conversationId: 'conv-a' })
+    const b = planItem({ conversationId: 'conv-b' })
+    const r = await generateAiConfirmedRules([a, b], [moved(a.emailId), moved(b.emailId)], {
+      priorSubjectMemory: prior,
+    })
+    expect(r.added).toBe(1)
+  })
+
+  it('同批同一對話的兩封 → 仍是單一 thread，不鑄', async () => {
+    const prior = await getSubjectMemory()
+    const a = planItem({ conversationId: 'conv-a' })
+    const b = planItem({ conversationId: 'conv-a' })
+    const r = await generateAiConfirmedRules([a, b], [moved(a.emailId), moved(b.emailId)], {
+      priorSubjectMemory: prior,
+    })
+    expect(r.added).toBe(0)
   })
 })

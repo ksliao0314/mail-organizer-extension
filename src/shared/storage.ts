@@ -1,5 +1,7 @@
 import {
   ACTIVE_DAYS_CAP,
+  BATCH_SIZE_MAX,
+  BATCH_SIZE_MIN,
   CONVERSATION_MEMORY_CAP,
   DECAY_AFTER_STABLE,
   FOLDER_ACTIVITY_CAP,
@@ -13,11 +15,13 @@ import {
   RULE_HISTORY_CAP,
   SKIP_HISTORY_CAP,
   SKIP_HISTORY_TTL_MS,
+  STORAGE_USAGE_TOP_KEYS,
   SUBJECT_MEMORY_CAP,
   THREAD_MEMORY_MAX_AGE_MS,
   TOMBSTONE_CAP,
 } from './constants'
 import { joinFolderPath } from './outlook-api'
+import { isKnownClaudeModel } from './claude-models'
 import {
   DEFAULT_METRICS,
   DEFAULT_SETTINGS,
@@ -108,10 +112,11 @@ function sanitizeSettings(raw: Record<string, unknown>): Settings {
   return {
     claudeApiKey:
       typeof raw.claudeApiKey === 'string' ? raw.claudeApiKey : DEFAULT_SETTINGS.claudeApiKey,
-    claudeModel:
-      typeof raw.claudeModel === 'string' && raw.claudeModel.length > 0
-        ? raw.claudeModel
-        : DEFAULT_SETTINGS.claudeModel,
+    // Unknown / retired ids map to the default (2026-11-05): the value syncs
+    // across machines and an id the API no longer serves fails every AI email.
+    claudeModel: isKnownClaudeModel(raw.claudeModel)
+      ? raw.claudeModel
+      : DEFAULT_SETTINGS.claudeModel,
     batchSize:
       typeof raw.batchSize === 'number' && Number.isFinite(raw.batchSize)
         ? raw.batchSize
@@ -190,6 +195,81 @@ function sanitizeSettings(raw: Record<string, unknown>): Settings {
   }
 }
 
+/** Trim, drop empties, dedupe (first occurrence wins, order kept). */
+function cleanStringList(list: readonly string[]): string[] {
+  return Array.from(new Set(list.map((s) => s.trim()).filter((s) => s.length > 0)))
+}
+
+/**
+ * Canonical folder-path prefix: strip every leading/trailing slash AND
+ * whitespace. Matches the SW handler's / Options checkbox's
+ * `trim().replace(/^\/+|\/+$/g, '')` on every realistic input, but is
+ * idempotent even for pathological ones like '/ x' (the two-step form needs a
+ * second pass there, which would let a re-normalized closed-case prefix fall
+ * out of the exclude list it was derived from).
+ */
+function normalizeFolderPrefix(s: string): string {
+  return s.replace(/^[\s/]+|[\s/]+$/g, '')
+}
+
+/**
+ * Value-level invariants on top of sanitizeSettings' type guards (2026-11-05).
+ *
+ * Applied to EVERY read and to the MERGED result of EVERY setSettings write.
+ * The SW 'setSettings' handler always clamped these, but sync pull (doPull's
+ * settings overlay) and restoreBackup call storage.setSettings directly, so a
+ * cloud/backup payload could persist batchSize 0 (every batch empty) or
+ * aiConfidenceThreshold 7 (every AI item held back as low-confidence) — and
+ * the read path handed those values straight back. Enforcing here covers all
+ * writers, current and future; the handler keeps its whitelist (which fields a
+ * UI page may set at all).
+ *
+ * Also keeps closedCasePrefixes ⊆ excludeFolderPrefixes on every write (it
+ * used to be checked only when the handler saw excludeFolderPrefixes in the
+ * patch, against a settings read taken outside the lock). An orphan
+ * closed-case prefix keeps retiring + hard-deleting rules while the Options
+ * checkbox list — derived from the exclude list — offers no way to see or
+ * untick it.
+ *
+ * Idempotent, so getSettings' "dirty" write-back can never loop. claudeModel
+ * is deliberately untouched here (owned by sanitizeSettings).
+ */
+function normalizeSettings(s: Settings): Settings {
+  const excludeFolderPrefixes = cleanStringList(s.excludeFolderPrefixes)
+  const excludeSet = new Set(excludeFolderPrefixes.map(normalizeFolderPrefix))
+  return {
+    ...s,
+    batchSize: Math.max(BATCH_SIZE_MIN, Math.min(BATCH_SIZE_MAX, Math.floor(s.batchSize))),
+    aiConfidenceThreshold: Math.max(0, Math.min(1, s.aiConfidenceThreshold)),
+    // Keep slashes on these two: `startsWith` semantics differ with/without a
+    // trailing slash (e.g. `<root>/` = descendants only). Trim + drop empties
+    // matters most for the exclude list — `path.startsWith('')` is always true,
+    // so one stray empty entry excluded EVERY folder from scans.
+    excludeFolderPrefixes,
+    recentActivityIncludePrefixes: cleanStringList(s.recentActivityIncludePrefixes),
+    recentActivityIncludeLeafNames: cleanStringList(s.recentActivityIncludeLeafNames),
+    closedCasePrefixes: Array.from(
+      new Set(
+        s.closedCasePrefixes
+          .map(normalizeFolderPrefix)
+          .filter((p) => p.length > 0 && excludeSet.has(p)),
+      ),
+    ),
+    // Same canonical form the handler writes: lowercase, no leading '@'. A
+    // stored '@example.com' never equals an extracted 'example.com', so mail
+    // from that domain stopped being recognised as internal.
+    internalDomains: Array.from(
+      new Set(
+        s.internalDomains
+          .map((d) => d.trim().toLowerCase().replace(/^@+/, '').trim())
+          .filter((d) => d.length > 0),
+      ),
+    ),
+    primaryRootPath: normalizeFolderPrefix(s.primaryRootPath),
+    internalSubjectCategories: cleanStringList(s.internalSubjectCategories),
+  }
+}
+
 const ALLOWED_SETTINGS_KEYS: ReadonlySet<keyof Settings> = new Set([
   'claudeApiKey',
   'claudeModel',
@@ -234,7 +314,7 @@ async function readAndMigrateSettings(): Promise<{ cleaned: Settings; dirty: boo
     raw.internalSubjectCategories = ['工時', '薪資', '利衝', '行政', '公告']
     migrated = true
   }
-  const cleaned = sanitizeSettings(raw)
+  const cleaned = normalizeSettings(sanitizeSettings(raw))
   const hasExtraKeys = Object.keys(raw).some(
     (k) => !ALLOWED_SETTINGS_KEYS.has(k as keyof Settings),
   )
@@ -264,7 +344,19 @@ export async function setSettings(patch: Partial<Settings>): Promise<Settings> {
   return withSettingsLock(async () => {
     // Use the PURE reader, not getSettings(), to avoid re-entering the lock.
     const { cleaned } = await readAndMigrateSettings()
-    const next = { ...cleaned, ...patch }
+    // (2026-11-05) Sanitize + normalize the MERGED result, not just the patch:
+    // sync pull and restoreBackup pass cloud/backup payloads straight in, so
+    // out-of-range numbers, untrimmed lists, unknown keys or an orphan
+    // closed-case prefix used to be persisted verbatim. Run on the merge so
+    // cross-field invariants (closedCasePrefixes ⊆ excludeFolderPrefixes) see
+    // the final state under the lock. An explicit `undefined` in the patch
+    // means "not provided" (Partial<> semantics) — it must not reset a field
+    // such as claudeApiKey to its default.
+    const merged: Record<string, unknown> = { ...cleaned }
+    for (const [k, v] of Object.entries(patch)) {
+      if (v !== undefined) merged[k] = v
+    }
+    const next = normalizeSettings(sanitizeSettings(merged))
     await chrome.storage.local.set({ [KEY_SETTINGS]: next })
     return next
   })
@@ -544,25 +636,41 @@ export async function addToRecentlyProcessed(emailIds: string[]): Promise<void> 
 // ---- Moved-by-us ledger (harvester provenance) -----------------------------
 //
 // Records the DESTINATION-side new message id of every mail WE moved, plus its
-// conversation id / normalized subject, so the manual-filing harvester can
-// exclude our own moves (a move creates a NEW id, so recentlyProcessed's
-// source-side ids can never match what the harvester scans). Local-only, never
-// synced; weeks-long TTL since a harvest may run days after the batch.
+// conversation id, so the manual-filing harvester can exclude our own moves (a
+// move creates a NEW id, so recentlyProcessed's source-side ids can never
+// match what the harvester scans). Local-only, never synced. TTL matches
+// thread memory's 90 days (2026-11-05): with the old 21-day TTL a 22-day-old
+// own move was re-harvested as a "manual filing". Written only while
+// settings.harvestEnabled (execute's bookkeeping gates it).
 
 /** One mail we moved, keyed for harvester provenance exclusion. */
 export type MovedByUsEntry = {
   newMessageId: string
   destinationFolderId: string
   conversationId?: string
-  normalizedSubject?: string
   movedAt: number
 }
 
 const withMovedByUsLedgerLock = createWriteMutex()
 
+// Slim stored shape (2026-11-05): legacy entries also carried
+// normalizedSubject, which the harvester never reads — ≈2.7 MB at the 5000
+// cap. Rebuilding each entry from the known fields drops it (and any other
+// stray field) on the next write.
+function slimMovedByUsEntry(e: MovedByUsEntry): MovedByUsEntry {
+  return {
+    newMessageId: e.newMessageId,
+    destinationFolderId: e.destinationFolderId,
+    ...(e.conversationId ? { conversationId: e.conversationId } : {}),
+    movedAt: e.movedAt,
+  }
+}
+
 function pruneMovedByUsLedger(entries: MovedByUsEntry[]): MovedByUsEntry[] {
   const cutoff = Date.now() - MOVED_BY_US_LEDGER_TTL_MS
-  const fresh = entries.filter((e) => typeof e.movedAt === 'number' && e.movedAt >= cutoff)
+  const fresh = entries
+    .filter((e) => typeof e.movedAt === 'number' && e.movedAt >= cutoff)
+    .map(slimMovedByUsEntry)
   if (fresh.length > MOVED_BY_US_LEDGER_CAP) {
     fresh.sort((a, b) => b.movedAt - a.movedAt) // newest first
     fresh.length = MOVED_BY_US_LEDGER_CAP
@@ -657,6 +765,52 @@ export async function getLastSweepAt(): Promise<number | null> {
 
 export async function setLastSweepAt(ms: number): Promise<void> {
   await chrome.storage.local.set({ [KEY_LAST_SWEEP_AT]: ms })
+}
+
+// ---- Mailbox identity (2026-11-05) -----------------------------------------
+//
+// The signed-in mailbox's own address + domain. The learners treat the own
+// domain like settings.internalDomains (never learn a domain rule for it) and
+// the matcher keeps it from triggering auto domain rules — with
+// internalDomains empty (the default) the first AI filing of a colleague's
+// mail used to learn `domain: <own domain>`, which then claimed nearly every
+// inbound email because the owner is on To/Cc of all of them. Per-device
+// (local only): never synced, never exported — each machine records the
+// mailbox it is actually signed in to.
+
+const KEY_MAILBOX_IDENTITY = 'mailboxIdentity'
+
+export type MailboxIdentity = { address: string; domain: string; at: string }
+
+function sanitizeMailboxIdentity(raw: unknown): MailboxIdentity | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const address = typeof r.address === 'string' ? r.address.trim().toLowerCase() : ''
+  const at = address.lastIndexOf('@')
+  if (at <= 0 || at === address.length - 1) return null
+  const fromAddress = address.slice(at + 1)
+  const declared =
+    typeof r.domain === 'string' ? r.domain.trim().toLowerCase().replace(/^@/, '') : ''
+  return {
+    address,
+    domain: declared || fromAddress,
+    at: typeof r.at === 'string' ? r.at : '',
+  }
+}
+
+export async function getMailboxIdentity(): Promise<MailboxIdentity | null> {
+  const r = await chrome.storage.local.get(KEY_MAILBOX_IDENTITY)
+  return sanitizeMailboxIdentity(r[KEY_MAILBOX_IDENTITY])
+}
+
+/** Persist the signed-in mailbox. An address without a usable domain is ignored. */
+export async function setMailboxIdentity(id: MailboxIdentity): Promise<void> {
+  const clean = sanitizeMailboxIdentity(id)
+  if (!clean) {
+    console.warn('[mail-organizer] setMailboxIdentity: ignoring invalid identity')
+    return
+  }
+  await chrome.storage.local.set({ [KEY_MAILBOX_IDENTITY]: clean })
 }
 
 // ---- Rule tombstones -------------------------------------------------------
@@ -1168,9 +1322,17 @@ function nextThreadMemoryEntry(
   now: string,
   harvested = false,
 ): ThreadMemoryEntry {
+  // Provenance firewall (2026-11-05): folder-content evidence (harvester /
+  // initial-scan seed) must NEVER mutate an entry a plan-reviewed filing
+  // confirmed. The harvester can't prove a human made the move — an own move
+  // older than the moved-by-us ledger, or an Outlook server rule, looks the
+  // same — and letting it count flipped CONFIRMED routes (folderId → the
+  // harvested folder, conflictCount 1, previousFolderId = the real home),
+  // silently disabling a trusted auto-route.
+  if (harvested && prev && prev.harvested !== true) return prev
   // An entry stays "harvested-only" iff EVERY filing so far was harvested. Any
   // real (plan-reviewed) filing confirms the route and permanently clears the
-  // flag; a later harvest filing on a confirmed entry does NOT re-flag it.
+  // flag.
   const harvestedFlag = harvested && (!prev || prev.harvested === true)
   const withHarvest = (e: ThreadMemoryEntry): ThreadMemoryEntry =>
     harvestedFlag ? { ...e, harvested: true } : e
@@ -1348,14 +1510,38 @@ export async function getThreadMemoryCounts(): Promise<{
 // ---- Storage usage --------------------------------------------------------
 
 // LOCAL_STORAGE_QUOTA_BYTES / LOCAL_STORAGE_WARN_THRESHOLD: see
-// src/shared/constants.ts. We don't declare 'unlimitedStorage', so the
-// 5 MB cap is real — folderCache + ruleHistory + tombstones can reach it.
+// src/shared/constants.ts.
+//
+// (2026-11-05) The quota is READ, not assumed: the old hard-coded 5 MB was
+// half of Chrome's real 10 MB default, and with the `unlimitedStorage`
+// permission there is no enforced cap at all — Chrome still reports
+// QUOTA_BYTES but ignores it, so the meter must not warn against it.
+// folderCache + ruleHistory + tombstones + backups are what grow.
 
 export type StorageUsage = {
   bytesInUse: number
-  quotaBytes: number
-  percentUsed: number
-  approaching: boolean // true once we cross the warn threshold
+  /** null = no enforced quota (manifest declares `unlimitedStorage`). */
+  quotaBytes: number | null
+  /** 0..1 of quotaBytes; null when there is no quota. */
+  percentUsed: number | null
+  approaching: boolean // true once we cross the warn threshold (never when unlimited)
+}
+
+function hasUnlimitedStorage(): boolean {
+  try {
+    // Required (non-optional) permission → present in the manifest iff granted.
+    // Optional chaining: storage.ts also runs in tests with no chrome.runtime.
+    return chrome.runtime?.getManifest?.().permissions?.includes('unlimitedStorage') === true
+  } catch {
+    return false
+  }
+}
+
+/** Effective chrome.storage.local quota in bytes; null when unlimited. */
+export function getLocalStorageQuotaBytes(): number | null {
+  if (hasUnlimitedStorage()) return null
+  const reported = chrome.storage.local.QUOTA_BYTES
+  return typeof reported === 'number' && reported > 0 ? reported : LOCAL_STORAGE_QUOTA_BYTES
 }
 
 export async function getStorageUsage(): Promise<StorageUsage> {
@@ -1365,11 +1551,34 @@ export async function getStorageUsage(): Promise<StorageUsage> {
   } catch (e) {
     console.warn('[mail-organizer] getBytesInUse failed', e)
   }
-  const percentUsed = bytesInUse / LOCAL_STORAGE_QUOTA_BYTES
+  const quotaBytes = getLocalStorageQuotaBytes()
+  const percentUsed = quotaBytes === null ? null : bytesInUse / quotaBytes
   return {
     bytesInUse,
-    quotaBytes: LOCAL_STORAGE_QUOTA_BYTES,
+    quotaBytes,
     percentUsed,
-    approaching: percentUsed >= LOCAL_STORAGE_WARN_THRESHOLD,
+    approaching: percentUsed !== null && percentUsed >= LOCAL_STORAGE_WARN_THRESHOLD,
   }
+}
+
+/**
+ * The largest chrome.storage.local keys by Chrome's own accounting
+ * (getBytesInUse per key), biggest first. Key names only — never values (the
+ * settings key holds the API key). Lets the Options page show WHAT is filling
+ * storage instead of a bare total.
+ */
+export async function getStorageTopKeys(
+  limit: number = STORAGE_USAGE_TOP_KEYS,
+): Promise<Array<{ key: string; bytes: number }>> {
+  const area = chrome.storage.local
+  // getKeys() is Chrome 130+; older Chromium (and the test mock) fall back to
+  // listing via get(null).
+  const keys =
+    typeof area.getKeys === 'function' ? await area.getKeys() : Object.keys(await area.get(null))
+  const sized = await Promise.all(
+    keys.map(async (key) => ({ key, bytes: await area.getBytesInUse(key) })),
+  )
+  return sized
+    .sort((a, b) => b.bytes - a.bytes || a.key.localeCompare(b.key))
+    .slice(0, Math.max(0, limit))
 }

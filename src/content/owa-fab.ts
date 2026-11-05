@@ -7,10 +7,17 @@
 //
 // Architecture:
 //   - One Shadow DOM host (#mail-organizer-fab-host) appended to <body>.
+//     The shadow root is CLOSED and only this script keeps a reference
+//     (`fabShadow`) — page scripts can't reach in to grab the iframes
+//     (2026-11-05).
 //   - Shadow tree contains the FAB <button> + an <iframe> panel pointing at
 //     our existing popup index.html. The popup runs in its native chrome-
 //     extension:// origin so chrome.* APIs, MSAL token fetch, and all the
 //     existing classify / execute flows work without any change.
+//   - The iframes talk to us over a private MessageChannel handed to them in
+//     `parent-hello` (see pairFrame below + shared/parent-bridge.ts) — never
+//     through window.postMessage on the OWA page, where every JS world can
+//     listen (2026-11-05).
 //   - Click outside / Escape collapses the panel. Click the FAB again toggles.
 //   - Visibility: asks the SW ('getOwaFabVisibility') at init, and the SW
 //     pushes 'owaFabVisibility' when the "show OWA floating icon" setting
@@ -20,6 +27,22 @@
 
 const HOST_ID = 'mail-organizer-fab-host'
 const LOG_PREFIX = '[mail-organizer-fab]'
+
+// Private handle to the CLOSED shadow root (2026-11-05). `host.shadowRoot`
+// is null for closed roots, so the toast helper reads this instead.
+let fabShadow: ShadowRoot | null = null
+
+// After an extension update / reload this content script is orphaned: every
+// chrome.* call throws "Extension context invalidated" and the iframes would
+// load the NEW popup against this OLD bridge code. Detect it without
+// throwing so the FAB can tell the user to reload Outlook (2026-11-05).
+function extensionContextAlive(): boolean {
+  try {
+    return typeof chrome !== 'undefined' && !!chrome.runtime?.id
+  } catch {
+    return false
+  }
+}
 
 // Visual: white pill matching the Copilot launcher next to us. Icon is
 // lucide-react's "folder-down" — represents "organize mail into folders",
@@ -137,13 +160,13 @@ function waitForDom(check: () => boolean, timeoutMs: number): Promise<boolean> {
 // Auto-dismisses after 6 seconds; manually closable via × button. Re-calling
 // before the timer fires replaces any prior toast (no stacking).
 function showNavToast(title: string, detail?: string): void {
-  const host = document.getElementById(HOST_ID)
-  if (!host || !host.shadowRoot) {
+  const shadow = fabShadow
+  if (!shadow) {
     console.warn(LOG_PREFIX, 'no shadow root, falling back to console:', title, detail)
     return
   }
   // Replace any existing toast to avoid stacking.
-  host.shadowRoot.querySelectorAll('.nav-toast').forEach((el) => el.remove())
+  shadow.querySelectorAll('.nav-toast').forEach((el) => el.remove())
 
   const toast = document.createElement('div')
   toast.className = 'nav-toast'
@@ -175,7 +198,7 @@ function showNavToast(title: string, detail?: string): void {
   }
   toast.appendChild(dismiss)
 
-  host.shadowRoot.appendChild(toast)
+  shadow.appendChild(toast)
   timer = window.setTimeout(() => {
     toast.remove()
     timer = null
@@ -500,6 +523,110 @@ async function shouldShow(): Promise<boolean> {
   }
 }
 
+// ---- Private bridge to our iframes (2026-11-05) ----------------------------
+//
+// One MessageChannel per iframe LOAD: on every load of an extension page we
+// offer a fresh port inside `parent-hello`, posted straight to the frame's
+// contentWindow with targetOrigin = the extension origin (so it can never
+// land in an OWA-origin document — e.g. the about:blank we swap in after the
+// unload grace period). The page side (shared/parent-bridge.ts) accepts the
+// first hello from its parent window and acks over the port; until the ack
+// arrives we re-offer on a short backoff, in case the page's listener wasn't
+// installed yet. Commands then arrive ONLY over the port — nothing goes
+// through window.postMessage, where any script on the page can listen.
+
+type BridgeCommand = {
+  type?: unknown
+  folderName?: unknown
+  folderPath?: unknown
+  folderId?: unknown
+  paths?: unknown
+}
+
+const HELLO_RETRY_DELAYS_MS = [150, 400, 1000, 2000, 4000]
+
+function pairFrame(
+  frame: HTMLIFrameElement,
+  extOrigin: string,
+  onCommand: (cmd: BridgeCommand) => void,
+): () => void {
+  let generation = 0
+  let ports: MessagePort[] = []
+  let retryTimer: number | null = null
+
+  const release = () => {
+    for (const p of ports) {
+      try {
+        p.close()
+      } catch {
+        /* ignore */
+      }
+    }
+    ports = []
+    if (retryTimer !== null) {
+      window.clearTimeout(retryTimer)
+      retryTimer = null
+    }
+  }
+
+  const onLoad = () => {
+    release()
+    const gen = ++generation
+    if (!frame.src.startsWith(`${extOrigin}/`)) return // about:blank — not ours
+    let acked = false
+    let attempt = 0
+    const offer = () => {
+      retryTimer = null
+      if (acked || gen !== generation) return
+      const channel = new MessageChannel()
+      const mine = channel.port1
+      ports.push(mine)
+      mine.onmessage = (ev: MessageEvent) => {
+        if (gen !== generation) return
+        const data = ev.data as BridgeCommand | null
+        if (!data || typeof data !== 'object') return
+        if (data.type === 'mail-organizer/bridge-ack') {
+          acked = true
+          // The frame refused every other offer — release those ports.
+          for (const p of ports) {
+            if (p === mine) continue
+            try {
+              p.close()
+            } catch {
+              /* ignore */
+            }
+          }
+          ports = [mine]
+          if (retryTimer !== null) {
+            window.clearTimeout(retryTimer)
+            retryTimer = null
+          }
+          return
+        }
+        onCommand(data)
+      }
+      try {
+        frame.contentWindow?.postMessage(
+          { type: 'mail-organizer/parent-hello' },
+          { targetOrigin: extOrigin, transfer: [channel.port2] },
+        )
+      } catch (e) {
+        console.warn(LOG_PREFIX, 'parent-hello failed', e)
+      }
+      const delay = HELLO_RETRY_DELAYS_MS[attempt++]
+      if (delay !== undefined) retryTimer = window.setTimeout(offer, delay)
+    }
+    offer()
+  }
+
+  frame.addEventListener('load', onLoad)
+  return () => {
+    frame.removeEventListener('load', onLoad)
+    generation++
+    release()
+  }
+}
+
 function buildShadow(host: HTMLElement): {
   fab: HTMLButtonElement
   panelBackdrop: HTMLDivElement
@@ -510,7 +637,11 @@ function buildShadow(host: HTMLElement): {
   optionsClose: HTMLButtonElement
   optionsIframe: HTMLIFrameElement
 } {
-  const shadow = host.attachShadow({ mode: 'open' })
+  // CLOSED (2026-11-05): with an open root any OWA page script could walk
+  // host.shadowRoot to our iframes and inject a forged handshake. We keep
+  // the only reference ourselves.
+  const shadow = host.attachShadow({ mode: 'closed' })
+  fabShadow = shadow
   // Styles scoped to the shadow root — OWA's global CSS can't reach in,
   // and our styles can't leak out.
   const style = document.createElement('style')
@@ -813,6 +944,25 @@ function createFab() {
     return
   }
 
+  // Resolve extension URLs ONCE (2026-11-05). chrome.runtime.getURL throws
+  // after the extension is updated / reloaded (orphaned content script);
+  // the old code called it on every incoming message, so one update broke
+  // Esc / close / open-options / navigate for the rest of the tab's life.
+  let POPUP_URL: string
+  let OPTIONS_URL: string
+  let EXT_ORIGIN: string
+  try {
+    POPUP_URL = chrome.runtime.getURL('src/popup/index.html')
+    OPTIONS_URL = chrome.runtime.getURL('src/options/index.html')
+    // `chrome-extension://<id>/` minus the slash IS the serialized origin.
+    // (Not `new URL(...).origin`: outside Chromium's scheme registry —
+    // e.g. a WHATWG URL in tests — a non-special scheme's origin is "null".)
+    EXT_ORIGIN = chrome.runtime.getURL('').replace(/\/+$/, '')
+  } catch (e) {
+    console.warn(LOG_PREFIX, 'extension context unavailable — not creating FAB', e)
+    return
+  }
+
   console.log(LOG_PREFIX, 'creating FAB host')
   const host = document.createElement('div')
   host.id = HOST_ID
@@ -842,8 +992,6 @@ function createFab() {
   const IFRAME_UNLOAD_GRACE_MS = 30_000
   let panelUnloadTimer: number | null = null
   let optionsUnloadTimer: number | null = null
-  const POPUP_URL = chrome.runtime.getURL('src/popup/index.html')
-  const OPTIONS_URL = chrome.runtime.getURL('src/options/index.html')
 
   function setOpen(next: boolean) {
     open = next
@@ -888,6 +1036,16 @@ function createFab() {
   }
 
   function onFabClick() {
+    // Orphaned after an extension update (2026-11-05): the panel would load
+    // the NEW popup against this OLD bridge, and half the flows would fail
+    // silently. Say so instead — one reload re-injects the current script.
+    if (!open && !extensionContextAlive()) {
+      showNavToast(
+        'Mail Organizer 已更新',
+        '請重新整理這個 Outlook 分頁（F5 / ⌘R）後再使用歸類面板。',
+      )
+      return
+    }
     setOpen(!open)
   }
 
@@ -912,66 +1070,29 @@ function createFab() {
     }
   }
 
-  function onPostMessage(e: MessageEvent) {
-    // The popup / options iframe sends these. Strict origin + type check so
-    // a random OWA postMessage can't trigger us.
-    //   iframe-ready:    iframe says "I'm up" — reply with parent-hello so
-    //                    it learns our origin and can postMessage back with
-    //                    a specific targetOrigin (no more '*' broadcasts).
-    //   open-options:    popup's "設定" link → show the modal
-    //   close-options:   options page's ESC handler → hide the modal
-    //   close-panel:     popup's ESC handler → hide the FAB panel
-    //   navigate-folder: popup's "近日活動" row click → ask OWA to navigate
-    //                    to that folder in-place (no reload)
-    const expectedOrigin = new URL(chrome.runtime.getURL('')).origin
-    // Log EVERY incoming message so we can prove the content script is
-    // actually receiving them — diagnostic for cases where the user clicks
-    // a row but sees nothing happen.
-    const inData = (e.data as { type?: string } | undefined) || undefined
-    if (inData?.type?.startsWith('mail-organizer/')) {
-      console.log(LOG_PREFIX, 'incoming postMessage', {
-        origin: e.origin,
-        expected: expectedOrigin,
-        match: e.origin === expectedOrigin,
-        type: inData.type,
-      })
-    }
-    if (e.origin !== expectedOrigin) return
-    const data = e.data as
-      | {
-          type?: string
-          folderName?: string
-          folderPath?: string
-          folderId?: string
-          paths?: string[]
-        }
-      | undefined
-    if (data?.type === 'mail-organizer/iframe-ready') {
-      // Reply with hello so the iframe learns our origin. Target the
-      // extension origin so the reply isn't broadcast.
-      const src = e.source as Window | null
-      if (src) {
-        src.postMessage(
-          { type: 'mail-organizer/parent-hello' },
-          { targetOrigin: expectedOrigin },
-        )
-      }
-    } else if (data?.type === 'mail-organizer/open-options') {
+  // Commands from the popup / options iframe — they arrive ONLY over the
+  // private MessagePort set up by pairFrame (2026-11-05), so no origin
+  // check is needed and no OWA page script can trigger them.
+  //   open-options:    popup's "設定" link → show the modal
+  //   close-options:   options page's ESC handler → hide the modal
+  //   close-panel:     popup's ESC handler → hide the FAB panel
+  //   navigate-folder: popup's "近日活動" row click → ask OWA to navigate
+  //                    to that folder in-place (no reload)
+  //   prewarm-sidebar: popup's 近日活動 list → pre-expand ancestors
+  function onBridgeCommand(data: BridgeCommand) {
+    const str = (v: unknown) => (typeof v === 'string' ? v : '')
+    if (data.type === 'mail-organizer/open-options') {
       setOptionsOpen(true)
-    } else if (data?.type === 'mail-organizer/close-options') {
+    } else if (data.type === 'mail-organizer/close-options') {
       setOptionsOpen(false)
-    } else if (data?.type === 'mail-organizer/close-panel') {
+    } else if (data.type === 'mail-organizer/close-panel') {
       // If options modal is currently open, close it first (ESC closes the
       // top-most layer). Otherwise close the panel.
       if (optionsOpen) setOptionsOpen(false)
       else setOpen(false)
-    } else if (data?.type === 'mail-organizer/navigate-folder') {
-      void navigateOwaToFolder(
-        data.folderName || '',
-        data.folderPath || '',
-        data.folderId || '',
-      )
-    } else if (data?.type === 'mail-organizer/prewarm-sidebar' && Array.isArray(data.paths)) {
+    } else if (data.type === 'mail-organizer/navigate-folder') {
+      void navigateOwaToFolder(str(data.folderName), str(data.folderPath), str(data.folderId))
+    } else if (data.type === 'mail-organizer/prewarm-sidebar' && Array.isArray(data.paths)) {
       // Pipeline-style optimisation (Option B): popup ships the list of
       // folderPaths visible in 「近日活動」when it mounts; we silently
       // pre-expand the ancestors so the user's later click navigates
@@ -984,17 +1105,8 @@ function createFab() {
     }
   }
 
-  // Also push parent-hello when an iframe finishes loading — covers the
-  // case where our iframe-ready listener isn't ready when the iframe boots.
-  function sendHelloToIframe(targetIframe: HTMLIFrameElement) {
-    const extOrigin = new URL(chrome.runtime.getURL('')).origin
-    targetIframe.contentWindow?.postMessage(
-      { type: 'mail-organizer/parent-hello' },
-      extOrigin,
-    )
-  }
-  iframe.addEventListener('load', () => sendHelloToIframe(iframe))
-  optionsIframe.addEventListener('load', () => sendHelloToIframe(optionsIframe))
+  const unpairPanel = pairFrame(iframe, EXT_ORIGIN, onBridgeCommand)
+  const unpairOptions = pairFrame(optionsIframe, EXT_ORIGIN, onBridgeCommand)
 
   function onOptionsCloseClick() {
     setOptionsOpen(false)
@@ -1028,7 +1140,6 @@ function createFab() {
   fab.addEventListener('click', onFabClick)
   panelBackdrop.addEventListener('click', onPanelBackdropClick)
   document.addEventListener('keydown', onDocKey, true)
-  window.addEventListener('message', onPostMessage)
   optionsBack.addEventListener('click', onOptionsBackClick)
   optionsClose.addEventListener('click', onOptionsCloseClick)
   optionsBackdrop.addEventListener('click', onOptionsBackdropClick)
@@ -1150,7 +1261,8 @@ function createFab() {
     panelBackdrop.removeEventListener('click', onPanelBackdropClick)
     document.removeEventListener('keydown', onDocKey, true)
     window.removeEventListener('resize', onResize)
-    window.removeEventListener('message', onPostMessage)
+    unpairPanel()
+    unpairOptions()
     optionsBack.removeEventListener('click', onOptionsBackClick)
     optionsClose.removeEventListener('click', onOptionsCloseClick)
     optionsBackdrop.removeEventListener('click', onOptionsBackdropClick)
@@ -1159,6 +1271,7 @@ function createFab() {
     if (panelUnloadTimer !== null) window.clearTimeout(panelUnloadTimer)
     if (optionsUnloadTimer !== null) window.clearTimeout(optionsUnloadTimer)
     host.remove()
+    fabShadow = null
     teardown = null
   }
 }

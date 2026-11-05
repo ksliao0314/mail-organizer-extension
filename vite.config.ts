@@ -14,6 +14,8 @@ export default defineConfig({
   },
   build: {
     target: 'esnext',
-    sourcemap: true,
+    // Sourcemaps were 2.6 MB of the 3.5 MB dist and the built manifest exposed the
+    // content scripts' maps to OWA pages. Opt in for debugging: SOURCEMAP=1 npm run build
+    sourcemap: process.env.SOURCEMAP === '1',
   },
 })

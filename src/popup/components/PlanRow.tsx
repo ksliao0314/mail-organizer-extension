@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -29,6 +29,14 @@ const ACTION_RAIL: Record<PlanAction, string> = {
 }
 
 const ACTIONS: PlanAction[] = ['move', 'delete', 'new_folder', 'skip']
+
+// 「刪除」is a MOVE to Outlook's Deleted Items folder (2026-11-05) —
+// recoverable there and undoable from the done screen. Every surface that
+// describes it says the same thing (this row, the footer, the ? help).
+export const DELETE_DESTINATION_LABEL = '移到「已刪除的郵件」'
+const ACTION_TITLE: Partial<Record<PlanAction, string>> = {
+  delete: '移到 Outlook「已刪除的郵件」資料夾（可回復、可撤回）',
+}
 
 // Source badge — small chip identifying whether the routing decision came
 // from a rule match, AI inference, or is unresolved. Exported so the
@@ -117,6 +125,8 @@ export function willLearnFromOverride(item: PlanItem): boolean {
 
 export type PlanRowProps = {
   item: PlanItem
+  /** Position in the rendered list — handed back through onActivate. */
+  index: number
   tree: MailFolderNode[]
   excludePrefixes: string[]
   selected: boolean
@@ -140,10 +150,12 @@ export type PlanRowProps = {
    * (with 50 rows × 500 folders that was 25k ops on every keystroke).
    */
   validPaths: ReadonlySet<string>
+  // Handlers are id/item/index-based (2026-11-05) so the parent can pass
+  // ONE stable function to every row and React.memo can skip unchanged rows.
   onChange: (next: PlanItem) => void
-  onToggleSelect: () => void
+  onToggleSelect: (emailId: string) => void
   /** Copy this row's action+target onto all currently-selected rows + clear selection. */
-  onPropagate: () => void
+  onPropagate: (source: PlanItem) => void
   /**
    * Disable/enable a rule the user wants to stop matching globally. Wired
    * from the trace block's inline button — only meaningful for rule-sourced
@@ -156,11 +168,15 @@ export type PlanRowProps = {
    * mouse hover updates the sidebar the same way keyboard j/k does. Only
    * passed in wide mode — narrow mode falls back to keyboard-only.
    */
-  onActivate?: () => void
+  onActivate?: (index: number) => void
 }
 
-export function PlanRow({
+// Memoized (2026-11-05): with stable handlers from PlanScreen, a j/k press
+// re-renders only the two rows whose `focused` flips, and a filter
+// keystroke re-renders none of the unchanged rows.
+export const PlanRow = memo(function PlanRow({
   item,
+  index,
   tree,
   excludePrefixes,
   selected,
@@ -176,7 +192,7 @@ export function PlanRow({
   onActivate,
 }: PlanRowProps) {
   const [expanded, setExpanded] = useState(false)
-  const rowRef = useRef<HTMLLIElement | null>(null)
+  const rowRef = useRef<HTMLDivElement | null>(null)
   const { isWide } = useLayout()
 
   // Imperatively trigger expand toggle when PlanScreen bumps the token.
@@ -286,7 +302,7 @@ export function PlanRow({
       : item.action === 'new_folder'
       ? `${joinFolderPath(item.suggestedParentPath, item.suggestedFolderName ?? '?')}（新建）`
       : item.action === 'delete'
-      ? '永久刪除'
+      ? DELETE_DESTINATION_LABEL
       : '保留在收件夾'
 
   const sourceDetailBadge = renderSourceBadge(item.source)
@@ -354,10 +370,12 @@ export function PlanRow({
     return at >= 0 && at < raw.length - 1 ? raw.slice(at + 1) : raw
   })()
 
+  // A div, not an <li> (2026-11-05): PlanScreen already wraps each row in
+  // its own <li> — the nested <li> was invalid list markup.
   return (
-    <li
+    <div
       ref={rowRef}
-      onClick={onActivate}
+      onClick={onActivate ? () => onActivate(index) : undefined}
       className={cn(
         // 勾選與游標分離的視覺語言（UI/UX 檢討 2026-07）：
         //   勾選 = checkbox 打勾 + accent 底色 tint（不再用 ring）
@@ -377,7 +395,7 @@ export function PlanRow({
           <input
             type="checkbox"
             checked={selected}
-            onChange={onToggleSelect}
+            onChange={() => onToggleSelect(item.emailId)}
             className={cn(
               'accent-foreground cursor-pointer transition-opacity',
               selected || focused
@@ -491,6 +509,7 @@ export function PlanRow({
                 key={a}
                 type="button"
                 onClick={() => setAction(a)}
+                title={ACTION_TITLE[a]}
                 className={cn(
                   'rounded-md border px-2 py-1 text-[10px] font-medium transition-colors',
                   a === item.action
@@ -564,7 +583,7 @@ export function PlanRow({
                   size="sm"
                   variant="default"
                   disabled={!canPropagate}
-                  onClick={onPropagate}
+                  onClick={() => onPropagate(item)}
                   title={
                     canPropagate
                       ? `把這張卡的目標套用到其他 ${otherSelectedCount} 張勾選的卡，套用後自動清空勾選`
@@ -579,9 +598,9 @@ export function PlanRow({
           </div>
         </div>
       )}
-    </li>
+    </div>
   )
-}
+})
 
 
 // ---- Rule trace block ----------------------------------------------------
@@ -637,6 +656,10 @@ export function RuleTraceBlock({
 }) {
   const [localDisabled, setLocalDisabled] = useState(false)
   const [toggleFailed, setToggleFailed] = useState(false)
+  // NOT_FOUND from the SW (2026-11-05): the rule was deleted elsewhere
+  // (another machine via sync, the daily sweep). Retrying can't help, and
+  // the outcome the user wanted — "stop matching" — already holds.
+  const [ruleGone, setRuleGone] = useState(false)
   const mr = item.matchedRule
 
   // Compute AI-override hint: when user changed away from what AI suggested.
@@ -693,7 +716,11 @@ export function RuleTraceBlock({
                   setToggleFailed(false)
                   try {
                     await onToggleRule(mr.id, false)
-                  } catch {
+                  } catch (e) {
+                    if ((e as { code?: unknown } | null)?.code === 'NOT_FOUND') {
+                      setRuleGone(true)
+                      return
+                    }
                     // Roll back optimistic flag so the button reappears, and
                     // surface a visible hint so the user knows the toggle
                     // didn't actually take effect (rather than silently
@@ -714,7 +741,11 @@ export function RuleTraceBlock({
           {localDisabled && (
             <div className="flex items-center gap-1 text-emerald-700 italic">
               <Check className="size-3 shrink-0" />
-              <span>已停用、未來不再自動命中</span>
+              <span>
+                {ruleGone
+                  ? '這條規則已不存在（可能已在別處刪除）、不會再自動命中'
+                  : '已停用、未來不再自動命中'}
+              </span>
             </div>
           )}
         </div>

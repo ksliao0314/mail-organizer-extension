@@ -3,14 +3,25 @@
 // Storage:
 //   chrome.storage.local['rules'] = Rule[]  (managed via getRules/setRules in storage.ts)
 //
-// Matching priority (lower number = checked first):
-//   1. case_code        — specific identifier in subject (highest signal)
-//   2. domain           — email-address suffix on any party
-//   3. compound         — JSON-encoded AND of (domain | subject_keyword | sender)
-//   4. subject_keyword  — substring in subject
-//   5. sender           — exact From address
+// Matching order — matchEmailWithIndex; the first tier that matches wins
+// (2026-11-05). TYPE_PRIORITY below is only the within-library sort key —
+// the real match path interleaves tiers by source and specificity:
+//   1. case_code                — Latin case code in the subject (any source)
+//   2. compound                 — AND of (domain | subject_keyword | sender);
+//                                 longest subject condition first
+//   3. court-case subject rule  — subject_keyword whose signal IS a court
+//                                 case number (any source)
+//   4. user_manual domain → subject_keyword → sender — hand-written rules
+//                                 outrank every auto-learned broad rule
+//   5. auto domain              — any party's address, except the mailbox
+//                                 owner's own domains (buildRuleIndex opts)
+//   6. body case pass           — the single case number in the fetched body
+//                                 vs structural rules (AI path only)
+//   7. auto subject_keyword     — substring, longest signal first
+//   8. auto sender              — exact From address
 //
-// Within the same type, higher `confidence` wins, then later `lastUsedAt`.
+// Within a tier: effective confidence (empirical accuracy over ALL fires —
+// accepted hits + user overrides — once there are enough), then recency.
 
 import { CASE_CLOSED_PURGE_DAYS } from './constants'
 import {
@@ -34,7 +45,7 @@ import type {
   RuleTombstone,
   RuleType,
 } from './types'
-import { normalizeSubject } from './normalize'
+import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from './normalize'
 
 // ---- Concurrency guard -----------------------------------------------------
 //
@@ -61,12 +72,29 @@ async function withRulesLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+export type MutateRulesOptions = {
+  /**
+   * Write `next` exactly as returned — do NOT stamp `editedAt`. ONLY for
+   * writers whose rules carry an authoritative editedAt from elsewhere:
+   * the sync pull merge (another machine's / the cloud's version) and backup
+   * restore (the snapshot's version). Every other writer must leave this off
+   * so its semantic edits get stamped (2026-11-05).
+   */
+  preserveEditedAt?: boolean
+}
+
 /**
  * Transactional rule mutation: read → transform → write, all under lock.
  * Use this for any operation that needs to read current state to compute next.
+ *
+ * editedAt (2026-11-05): this is the ONE place `Rule.editedAt` is stamped, so
+ * no call site can forget it. Cross-machine sync merges per rule by editedAt;
+ * without a reliable stamp a stale copy from another machine overwrote newer
+ * edits (a re-target reverted → mail filed into the old case folder).
  */
 export async function mutateRules<T>(
   fn: (rules: Rule[]) => { next: Rule[]; result: T } | Promise<{ next: Rule[]; result: T }>,
+  opts: MutateRulesOptions = {},
 ): Promise<T> {
   return withRulesLock(async () => {
     const current = await getRules()
@@ -78,9 +106,108 @@ export async function mutateRules<T>(
     // EVERY SW wake (module-load listener), so idle wakes used to pay 2 full
     // writes each — and also suppresses the redundant sync push the rules
     // onChanged listener would schedule.
-    if (next !== current) await setRules(next)
+    if (next !== current) {
+      await setRules(opts.preserveEditedAt ? next : stampEditedAt(current, next, Date.now()))
+    }
     return result
   })
+}
+
+// Fields whose change is a real EDIT of the rule's behaviour (2026-11-05).
+// Hit counters (matchCount / overrideCount / lastUsedAt) are deliberately
+// absent: they change on every batch and sync merges them separately (max).
+const SEMANTIC_RULE_FIELDS = [
+  'type',
+  'signal',
+  'targetFolderId',
+  'targetFolderPath',
+  'confidence',
+  'enabled',
+  'source',
+  'autoDisabledReason',
+  'autoDisabledAt',
+  'orphaned',
+] as const
+
+function sameSemanticValue(
+  field: (typeof SEMANTIC_RULE_FIELDS)[number],
+  a: unknown,
+  b: unknown,
+): boolean {
+  // undefined / false are the same "not orphaned" state (mirrors diffSnapshots).
+  if (field === 'orphaned') return !!a === !!b
+  // An explicitly-cleared optional (`autoDisabledAt: undefined`) equals absent.
+  return (a ?? undefined) === (b ?? undefined)
+}
+
+/**
+ * Did `next` change the rule's behaviour relative to `prev`?
+ *
+ * One exception (2026-11-05): bumpRuleHits' auto-promotion (+confidence on a
+ * matchCount threshold crossing) is counter-derived, not an edit. If it
+ * stamped editedAt, a machine that merely matched mail while offline would
+ * out-date a re-target / disable made elsewhere and revert it on its next
+ * push. Its signature — confidence went UP, matchCount went UP, nothing else
+ * semantic moved — never occurs on a user edit (the Options form never
+ * bumps matchCount). The sync merge keeps the promotion via max-on-tie.
+ */
+function isSemanticChange(prev: Rule, next: Rule): boolean {
+  let changed = false
+  let confidenceOnly = true
+  for (const f of SEMANTIC_RULE_FIELDS) {
+    if (!sameSemanticValue(f, prev[f], next[f])) {
+      changed = true
+      if (f !== 'confidence') confidenceOnly = false
+    }
+  }
+  if (!changed) return false
+  if (
+    confidenceOnly &&
+    next.confidence > prev.confidence &&
+    (next.matchCount ?? 0) > (prev.matchCount ?? 0)
+  ) {
+    return false
+  }
+  return true
+}
+
+function withEditedAt(r: Rule, editedAt: number | undefined): Rule {
+  if (editedAt === undefined) {
+    if (!('editedAt' in r)) return r
+    const { editedAt: _drop, ...rest } = r
+    void _drop
+    return rest
+  }
+  return r.editedAt === editedAt ? r : { ...r, editedAt }
+}
+
+/**
+ * Stamp editedAt on every rule in `next` whose semantic fields differ from its
+ * `prev` version (same id), and on new rules. Everything else carries its
+ * stored editedAt forward — a caller passing back a stale rule object (e.g. a
+ * UI round-trip) can neither forge nor erase it. Monotonic per rule:
+ * max(now, prev + 1), so an edit always supersedes the version it was based
+ * on even when that version came from a machine whose clock runs ahead.
+ * Exported for tests; production code reaches it only through mutateRules.
+ */
+export function stampEditedAt(prev: Rule[], next: Rule[], now: number): Rule[] {
+  const prevById = new Map<string, Rule>()
+  for (const r of prev) prevById.set(r.id, r)
+  let out: Rule[] | null = null
+  for (let i = 0; i < next.length; i++) {
+    const r = next[i]!
+    const p = prevById.get(r.id)
+    if (p === r) continue // copy-on-write: untouched rule keeps its ref
+    let stamped: Rule
+    if (!p) stamped = withEditedAt(r, now)
+    else if (isSemanticChange(p, r)) stamped = withEditedAt(r, Math.max(now, (p.editedAt ?? 0) + 1))
+    else stamped = withEditedAt(r, p.editedAt)
+    if (stamped !== r) {
+      out ??= next.slice()
+      out[i] = stamped
+    }
+  }
+  return out ?? next
 }
 
 // ---- CRUD ------------------------------------------------------------------
@@ -132,38 +259,119 @@ async function logRuleEvents(events: RuleEvent[]): Promise<void> {
   )
 }
 
-export async function upsertRule(rule: Rule, opts?: { actor?: Actor }): Promise<Rule> {
+/**
+ * upsertRule(mode 'edit') target no longer exists — deleted elsewhere (another
+ * tab, the stale sweep, a sync pull) after the editing page loaded. `code`
+ * lets the SW map it without importing this class (2026-11-05).
+ */
+export class RuleNotFoundError extends Error {
+  readonly code = 'NOT_FOUND' as const
+  constructor(readonly ruleId: string) {
+    super(`rule ${ruleId} not found`)
+    this.name = 'RuleNotFoundError'
+  }
+}
+
+export type UpsertMode = 'create' | 'edit'
+
+/**
+ * Overlay the fields the rule form owns onto the STORED rule (2026-11-05).
+ * The Options page sends back its whole — possibly hours-old — copy;
+ * writing that verbatim reset matchCount / overrideCount / lastUsedAt that
+ * batches had bumped since the page loaded. Engine-owned fields (stats,
+ * createdAt, source, sync stamps) always come from storage.
+ */
+function mergeEditableFields(stored: Rule, incoming: Rule): Rule {
+  const next: Rule = {
+    ...stored,
+    type: incoming.type,
+    signal: incoming.signal,
+    targetFolderId: incoming.targetFolderId,
+    targetFolderPath: incoming.targetFolderPath,
+    confidence: incoming.confidence,
+    enabled: incoming.enabled,
+  }
+  if (!stored.enabled && incoming.enabled) {
+    // Re-enable clears the auto-disable provenance (same as toggleRule),
+    // except that a closed-case retirement leaves its reason behind as the
+    // user's exemption marker — see applyClosedCaseRetirement.
+    next.autoDisabledAt = undefined
+    next.autoDisabledReason = closedCaseExemptionOnEnable(stored)
+  } else if (stored.enabled && !incoming.enabled && isClosedCaseExempt(stored)) {
+    next.autoDisabledReason = undefined
+  }
+  if (
+    stored.orphaned &&
+    (stored.targetFolderId !== incoming.targetFolderId ||
+      stored.targetFolderPath !== incoming.targetFolderPath)
+  ) {
+    // The form only offers live folders, so a re-target resolves the orphan.
+    next.orphaned = false
+  }
+  return next
+}
+
+/**
+ * Clear tombstones for a triple the user is (re)creating — including ones
+ * stored in a legacy, pre-canonical form (2026-11-05: normalizeSignal now
+ * folds court-case forms / whitespace / '@', so a raw-key clear would miss a
+ * tombstone written by an older build and leave the ghost behind).
+ */
+async function clearTombstonesForRule(r: Rule): Promise<void> {
+  const signalNorm = normalizeSignal(r.type, r.signal)
+  const triples = [{ type: r.type, signalNorm, targetFolderPath: r.targetFolderPath }]
+  const want = `${r.type}::${signalNorm}::${r.targetFolderPath}`
+  for (const t of await getRuleTombstones()) {
+    if (t.signalNorm !== signalNorm && tombstoneKey(t) === want) {
+      triples.push({ type: t.type, signalNorm: t.signalNorm, targetFolderPath: t.targetFolderPath })
+    }
+  }
+  await clearMatchingTombstones(triples)
+}
+
+/**
+ * Create or edit a rule.
+ *   - id exists → merge only the form-owned fields onto the stored rule
+ *     (stats / createdAt / lastUsedAt preserved), any mode.
+ *   - id missing + mode 'edit' → RuleNotFoundError: no insert, no tombstone
+ *     clearing. Re-inserting a stale copy resurrected rules deleted after the
+ *     page loaded.
+ *   - id missing + mode 'create' or no mode (legacy internal callers that
+ *     build fresh rules) → insert.
+ */
+export async function upsertRule(
+  rule: Rule,
+  opts?: { actor?: Actor; mode?: UpsertMode },
+): Promise<Rule> {
   const actor = opts?.actor ?? 'system'
-  // Enforce the per-type confidence cap on every write (see
-  // applyConfidenceCap). For user_manual rules this is a no-op.
-  const capped = applyConfidenceCap(rule)
   let prevSnapshot: RuleSnapshot | undefined
-  const result = await mutateRules(async (rules) => {
+  const saved = await mutateRules(async (rules) => {
+    const idx = rules.findIndex((r) => r.id === rule.id)
+    if (idx < 0 && opts?.mode === 'edit') throw new RuleNotFoundError(rule.id)
+    const stored = idx >= 0 ? rules[idx]! : undefined
+    // Enforce the per-type confidence cap on every write (see
+    // applyConfidenceCap). For user_manual rules this is a no-op.
+    const merged = applyConfidenceCap(stored ? mergeEditableFields(stored, rule) : rule)
     // Tombstone clear lives INSIDE the rules lock — otherwise an auto
     // generator could read tombstones (seeing this rule's ghost), filter
     // us out, and write rules between our clear and our write.
-    await clearMatchingTombstones([
-      {
-        type: capped.type,
-        signalNorm: normalizeSignal(capped.type, capped.signal),
-        targetFolderPath: capped.targetFolderPath,
-      },
-    ]).catch((e) => console.warn('[mail-organizer] clearMatchingTombstones (upsert)', e))
-    const idx = rules.findIndex((r) => r.id === capped.id)
-    if (idx >= 0) prevSnapshot = snapshotOf(rules[idx]!)
+    await clearTombstonesForRule(merged).catch((e) =>
+      console.warn('[mail-organizer] clearMatchingTombstones (upsert)', e),
+    )
+    if (stored) prevSnapshot = snapshotOf(stored)
     const next = [...rules]
-    if (idx >= 0) next[idx] = capped
-    else next.push(capped)
-    return { next, result: capped }
+    if (idx >= 0) next[idx] = merged
+    else next.push(merged)
+    return { next, result: merged }
   })
-  const after = snapshotOf(capped)
+  const after = snapshotOf(saved)
   if (prevSnapshot) {
     const changedFields = diffSnapshots(prevSnapshot, after)
     if (changedFields.length > 0) {
       await logRuleEvents([
         {
           kind: 'edit',
-          ruleId: capped.id,
+          ruleId: saved.id,
           at: Date.now(),
           actor,
           before: prevSnapshot,
@@ -174,10 +382,10 @@ export async function upsertRule(rule: Rule, opts?: { actor?: Actor }): Promise<
     }
   } else {
     await logRuleEvents([
-      { kind: 'create', ruleId: capped.id, at: Date.now(), actor, after },
+      { kind: 'create', ruleId: saved.id, at: Date.now(), actor, after },
     ])
   }
-  return result
+  return saved
 }
 
 export async function deleteRule(id: string, opts?: { actor?: Actor }): Promise<boolean> {
@@ -196,7 +404,7 @@ export async function deleteRule(id: string, opts?: { actor?: Actor }): Promise<
         type: target.type,
         signalNorm: normalizeSignal(target.type, target.signal),
         targetFolderPath: target.targetFolderPath,
-        deletedAt: Date.now(),
+        deletedAt: tombstoneDeletedAt(target),
       },
     ]).catch((e) =>
       console.warn('[mail-organizer] addRuleTombstones (delete)', e),
@@ -245,9 +453,18 @@ export async function toggleRule(
       // chose to disable): leave any old auto-disable timestamp alone —
       // doesn't make sense to "auto-disable" something the user
       // explicitly disabled.
+      //
+      // Closed-case exemption (2026-11-05): re-enabling a 'case_closed'
+      // rule keeps that reason on the now-enabled rule as the marker
+      // applyClosedCaseRetirement honours ("the user wants this rule live
+      // even though its folder is archived"); disabling an exempt rule
+      // drops the marker so a later un-archive can't re-enable a rule the
+      // user turned off.
       ...(enabled
-        ? { autoDisabledAt: undefined, autoDisabledReason: undefined }
-        : {}),
+        ? { autoDisabledAt: undefined, autoDisabledReason: closedCaseExemptionOnEnable(before) }
+        : isClosedCaseExempt(before)
+          ? { autoDisabledReason: undefined }
+          : {}),
     }
     const next = [...rules]
     next[idx] = updated
@@ -385,8 +602,10 @@ export async function bumpRuleHits(hits: Map<string, number>): Promise<{
         // Don't bump confidence on rules the user keeps overriding. The
         // empirical error rate gate is checked at promotion time, not at
         // creation — a rule that started clean and went bad still gets
-        // its confidence frozen here.
-        const errorRate = nextCount > 0 ? (r.overrideCount ?? 0) / nextCount : 0
+        // its confidence frozen here. Rate over ALL fires (2026-11-05):
+        // overrides never bump matchCount, so overrides/matchCount was a
+        // rejected-to-accepted ratio, not an error rate.
+        const errorRate = ruleErrorRate({ matchCount: nextCount, overrideCount: r.overrideCount })
         if (steps > 0 && errorRate <= PROMOTION_MAX_ERROR_RATE) {
           const cap = confidenceCapForType(r.type)
           const candidate = Math.min(cap, r.confidence + steps * CONFIDENCE_STEP)
@@ -546,12 +765,78 @@ export function countActiveDaysAfter(
   return n
 }
 
-// High-error-rate auto-disable thresholds. A rule with this many
-// override events out of total matches is clearly mis-routing; let it
-// rest. User can re-enable in the rules UI if the recent overrides
-// were exceptional.
+// High-error-rate auto-disable thresholds. A rule that fired this many
+// times, with at least this share of the fires overridden by the user, is
+// clearly mis-routing; let it rest. User can re-enable in the rules UI if
+// the recent overrides were exceptional. Both are measured over ALL fires
+// (matchCount + overrideCount — see ruleFires), 2026-11-05.
 const HIGH_ERROR_RATE_MIN_SAMPLES = 20
 const HIGH_ERROR_RATE_THRESHOLD = 0.5
+
+/**
+ * Auto-disable reasons the learners may undo when they re-derive the same
+ * (type, normalized signal, target) — fresh evidence the routing is right
+ * (2026-11-05). Before, every learner treated ANY disabled copy as "already
+ * covered", so the revive branch in addRulesFilteringTombstones was
+ * unreachable: a one-strike ('override') or superseded rule stayed dead
+ * forever AND blocked its own triple.
+ *   - never revived: no reason (user-disabled — user intent), 'case_closed'
+ *     (folder LOCATION decides, see applyClosedCaseRetirement),
+ *     'legacy_token' (the sweep would re-disable it immediately).
+ *   - 'stale' only exists on pre-hard-delete libraries; the same "the signal
+ *     came back" logic applies.
+ */
+const REVIVABLE_DISABLE_REASONS: ReadonlySet<string> = new Set([
+  'override',
+  'superseded',
+  'high-error-rate',
+  'stale',
+])
+
+/** Disabled by the engine for a reason learning may reverse (see above). */
+export function isRevivableAutoDisabled(
+  r: Pick<Rule, 'enabled' | 'autoDisabledAt' | 'autoDisabledReason'>,
+): boolean {
+  if (r.enabled) return false
+  if (r.autoDisabledReason) return REVIVABLE_DISABLE_REASONS.has(r.autoDisabledReason)
+  // Reason-less auto-disable from older builds: the pre-2026-11-05 revive
+  // branch keyed on autoDisabledAt alone — keep honouring it.
+  return !!r.autoDisabledAt
+}
+
+/**
+ * A rule switched back on by learning. Clears the auto-disable provenance
+ * (as toggleRule does). A 'high-error-rate' rule also restarts its accuracy
+ * window (2026-11-05): the stored rate is what disabled it and cannot change
+ * while the rule is off, so keeping it would let the very next sweep disable
+ * it again — a revive/disable flap that also restarts its dormant clock. The
+ * confirming filing counts as its first accepted fire.
+ */
+export function revivedRule(r: Rule, nowIso: string): Rule {
+  const freshWindow = r.autoDisabledReason === 'high-error-rate'
+  return {
+    ...r,
+    enabled: true,
+    autoDisabledAt: undefined,
+    autoDisabledReason: undefined,
+    ...(freshWindow ? { matchCount: 1, overrideCount: 0, lastUsedAt: nowIso } : {}),
+  }
+}
+
+/**
+ * Auto-disabled rules the sweep hard-deletes after DORMANT_PURGE_ACTIVE_DAYS
+ * active days in that state (2026-11-05). They used to be kept forever —
+ * blocking their triple and eating sync budget. The predicate reads only
+ * synced fields (autoDisabledReason + autoDisabledAt) plus the active-day
+ * clock, so — like the stale delete — every machine reaches the same verdict
+ * and no tombstone is needed. user_manual is never purged.
+ */
+const DORMANT_PURGE_REASONS: ReadonlySet<string> = new Set([
+  'override',
+  'superseded',
+  'high-error-rate',
+])
+const DORMANT_PURGE_ACTIVE_DAYS = 60
 
 /**
  * True when a rule's subject condition is an ENTIRE normalized subject
@@ -586,6 +871,13 @@ export function isFullSubjectRule(r: Pick<Rule, 'type' | 'signal'>): boolean {
  *   3. Tiebreak: higher matchCount (more "proven").
  *   4. Final tiebreak: older createdAt (most established).
  *
+ * The survivor then absorbs the group's usage history (2026-11-05): max
+ * lastUsedAt, max matchCount / overrideCount, min createdAt. Picking it
+ * without looking at lastUsedAt used to drop the copy used yesterday and
+ * keep a stale twin that the very same sweep then hard-deleted. Max (not
+ * sum) because duplicates are mostly copies of ONE rule (sync / import) —
+ * summing would double-count shared history.
+ *
  * Like stale deletion: no tombstone, no audit. These are storage
  * duplicates, not policy decisions — they shouldn't show up in the
  * audit trail or block future learning.
@@ -604,57 +896,93 @@ const SOURCE_RANK: Record<RuleSource, number> = {
   auto_scan: 3,
 }
 
-export async function dedupeRulesByKey(): Promise<DedupeReport> {
+function compareDedupeSurvivor(a: Rule, b: Rule): number {
+  // F8 (2026-06-03): user_manual is sacred — it must NEVER be
+  // dropped in favour of an auto/AI rule, even when the manual
+  // rule is DISABLED and the auto one is enabled. Previously
+  // `enabled` was the first sort key, so a disabled user_manual
+  // rule lost to an enabled auto_scan/ai_confirmed rule sharing
+  // the same triple and got hard-deleted (no tombstone, no
+  // audit), silently destroying deliberate user intent. Putting
+  // user_manual ahead of the enabled-preference restores the
+  // invariant. For NON-user_manual rules, enabled-first still
+  // holds (keep the rule that's actually routing).
+  const aUM = a.source === 'user_manual'
+  const bUM = b.source === 'user_manual'
+  if (aUM !== bUM) return aUM ? -1 : 1
+  if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
+  const rA = SOURCE_RANK[a.source] ?? 9
+  const rB = SOURCE_RANK[b.source] ?? 9
+  if (rA !== rB) return rA - rB
+  if (a.matchCount !== b.matchCount) return b.matchCount - a.matchCount
+  return a.createdAt.localeCompare(b.createdAt)
+}
+
+function isoMs(iso: string | undefined): number {
+  const ms = iso ? Date.parse(iso) : NaN
+  return Number.isFinite(ms) ? ms : NaN
+}
+
+/** Fold a duplicate group's usage history into its survivor. */
+function mergeDuplicateStats(survivor: Rule, group: readonly Rule[]): Rule {
+  let lastUsedAt = survivor.lastUsedAt
+  let createdAt = survivor.createdAt
+  let matchCount = survivor.matchCount
+  let overrideCount = survivor.overrideCount
+  for (const r of group) {
+    const used = isoMs(r.lastUsedAt)
+    if (Number.isFinite(used) && !(isoMs(lastUsedAt) >= used)) lastUsedAt = r.lastUsedAt
+    const born = isoMs(r.createdAt)
+    if (Number.isFinite(born) && !(isoMs(createdAt) <= born)) createdAt = r.createdAt
+    if (r.matchCount > matchCount) matchCount = r.matchCount
+    if ((r.overrideCount ?? 0) > (overrideCount ?? 0)) overrideCount = r.overrideCount
+  }
+  return {
+    ...survivor,
+    matchCount,
+    createdAt,
+    ...(lastUsedAt !== undefined ? { lastUsedAt } : {}),
+    ...(overrideCount !== undefined ? { overrideCount } : {}),
+  }
+}
+
+function dedupeTransform(rules: Rule[]): { next: Rule[]; report: DedupeReport } {
+  const buckets = new Map<string, Rule[]>()
+  for (const r of rules) {
+    const key = ruleTripleKey(r)
+    const arr = buckets.get(key)
+    if (arr) arr.push(r)
+    else buckets.set(key, [r])
+  }
   let removed = 0
   let groupsAffected = 0
-  await mutateRules((rules) => {
-    const buckets = new Map<string, Rule[]>()
-    for (const r of rules) {
-      const key = `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
-      const arr = buckets.get(key) ?? []
-      arr.push(r)
-      buckets.set(key, arr)
-    }
-    const keepIds = new Set<string>()
-    for (const arr of buckets.values()) {
-      if (arr.length === 1) {
-        keepIds.add(arr[0]!.id)
-        continue
-      }
-      groupsAffected++
-      removed += arr.length - 1
-      const sorted = [...arr].sort((a, b) => {
-        // F8 (2026-06-03): user_manual is sacred — it must NEVER be
-        // dropped in favour of an auto/AI rule, even when the manual
-        // rule is DISABLED and the auto one is enabled. Previously
-        // `enabled` was the first sort key, so a disabled user_manual
-        // rule lost to an enabled auto_scan/ai_confirmed rule sharing
-        // the same triple and got hard-deleted (no tombstone, no
-        // audit), silently destroying deliberate user intent. Putting
-        // user_manual ahead of the enabled-preference restores the
-        // invariant. For NON-user_manual rules, enabled-first still
-        // holds (keep the rule that's actually routing).
-        const aUM = a.source === 'user_manual'
-        const bUM = b.source === 'user_manual'
-        if (aUM !== bUM) return aUM ? -1 : 1
-        if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
-        const rA = SOURCE_RANK[a.source]
-        const rB = SOURCE_RANK[b.source]
-        if (rA !== rB) return rA - rB
-        if (a.matchCount !== b.matchCount) return b.matchCount - a.matchCount
-        return a.createdAt.localeCompare(b.createdAt)
-      })
-      keepIds.add(sorted[0]!.id)
-    }
-    if (removed === 0) {
-      return { next: rules, result: undefined }
-    }
-    return {
-      next: rules.filter((r) => keepIds.has(r.id)),
-      result: undefined,
-    }
+  // Keyed on object identity, not id: duplicate ids exist in the wild
+  // (pre-2026-11-05 import merge), and an id-keyed keep-set kept or dropped
+  // both copies together.
+  const replacement = new Map<Rule, Rule>()
+  const dropped = new Set<Rule>()
+  for (const arr of buckets.values()) {
+    if (arr.length === 1) continue
+    groupsAffected++
+    removed += arr.length - 1
+    const sorted = [...arr].sort(compareDedupeSurvivor)
+    replacement.set(sorted[0]!, mergeDuplicateStats(sorted[0]!, arr))
+    for (const r of sorted.slice(1)) dropped.add(r)
+  }
+  if (removed === 0) return { next: rules, report: { removed: 0, groupsAffected: 0 } }
+  const next: Rule[] = []
+  for (const r of rules) {
+    if (dropped.has(r)) continue
+    next.push(replacement.get(r) ?? r)
+  }
+  return { next, report: { removed, groupsAffected } }
+}
+
+export async function dedupeRulesByKey(): Promise<DedupeReport> {
+  return mutateRules((rules) => {
+    const { next, report } = dedupeTransform(rules)
+    return { next, result: report }
   })
-  return { removed, groupsAffected }
 }
 
 export type StaleAutoDisableReport = {
@@ -663,8 +991,9 @@ export type StaleAutoDisableReport = {
    *  UI as "已自動休眠" so user can re-enable if needed. */
   disabled: Rule[]
   /** Counts by reason. `stale` counts rules that were hard-deleted (not
-   *  in `disabled` — kept here for telemetry). */
-  byReason: { stale: number; highErrorRate: number; legacyToken: number }
+   *  in `disabled` — kept here for telemetry). `dormantPurged` counts
+   *  auto-disabled rules hard-deleted after DORMANT_PURGE_ACTIVE_DAYS. */
+  byReason: { stale: number; highErrorRate: number; legacyToken: number; dormantPurged: number }
 }
 
 /**
@@ -708,12 +1037,133 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
   return r.createdAt < REDESIGN_CUTOFF_ISO
 }
 
+type StaleSweepOptions = {
+  now: number
+  staleDays: number
+  fullSubjectDays: number
+  /** Active days, unique, sorted DESC (see buildActiveDaysDesc). */
+  daysDesc: readonly string[]
+}
+
+function buildActiveDaysDesc(
+  recordedDays: readonly string[],
+  rules: readonly Rule[],
+): string[] {
+  return [...new Set([...recordedDays, ...deriveActiveDaysFromRules(rules)])].sort().reverse()
+}
+
+function staleTransform(
+  rules: Rule[],
+  o: StaleSweepOptions,
+): { next: Rule[]; report: StaleAutoDisableReport; events: RuleEvent[] } {
+  const disabled: Rule[] = []
+  const byReason = { stale: 0, highErrorRate: 0, legacyToken: 0, dormantPurged: 0 }
+  const events: RuleEvent[] = []
+  const next: Rule[] = []
+  for (const r of rules) {
+    // Untouched paths — keep as-is.
+    if (r.source === 'user_manual' || r.orphaned) {
+      next.push(r)
+      continue
+    }
+    if (!r.enabled) {
+      // Dormant purge (2026-11-05) — see DORMANT_PURGE_REASONS. Hard
+      // delete, no tombstone / audit, same as the stale branch.
+      if (r.autoDisabledReason && DORMANT_PURGE_REASONS.has(r.autoDisabledReason)) {
+        const dormant = countActiveDaysAfter(o.daysDesc, r.autoDisabledAt, DORMANT_PURGE_ACTIVE_DAYS)
+        if (dormant !== null && dormant >= DORMANT_PURGE_ACTIVE_DAYS) {
+          byReason.dormantPurged++
+          continue
+        }
+      }
+      next.push(r)
+      continue
+    }
+
+    // Fires = accepted hits + overrides (2026-11-05). Overrides never bump
+    // matchCount, so the old matchCount-only gates treated a 100%-wrong rule
+    // as "never matched" (and, its lastUsedAt refreshed by every override,
+    // never stale either) — it was never demoted, disabled or swept.
+    const fires = ruleFires(r)
+    let reason: 'stale' | 'high-error-rate' | 'legacy_token' | null = null
+    if (isLegacyTokenSubjectRule(r)) {
+      reason = 'legacy_token'
+    } else if (fires === 0) {
+      // full_subject 類的死規則走 45 個使用日短週期 (見
+      // FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT 的說明)。謂詞依賴同步欄位
+      // (type / signal / matchCount / overrideCount / createdAt) + 使用日，
+      // 使用日大部分由同步規則本身推導 → 各機器 sweep 判定大致相同、維持無
+      // tombstone 硬刪的收斂性。
+      const cutoff = isFullSubjectRule(r) ? o.fullSubjectDays : o.staleDays
+      const idle = countActiveDaysAfter(o.daysDesc, r.createdAt, cutoff)
+      if (idle !== null && idle >= cutoff) {
+        reason = 'stale'
+      }
+    } else if (
+      fires >= HIGH_ERROR_RATE_MIN_SAMPLES &&
+      ruleErrorRate(r) >= HIGH_ERROR_RATE_THRESHOLD
+    ) {
+      reason = 'high-error-rate'
+    }
+    // Last-used stale (added 2026-05-27): rule fired in the past but
+    // has not been used for `staleDays` ACTIVE days. Catches "topic ran
+    // for a few weeks then moved on" patterns.
+    if (!reason && fires > 0) {
+      const idle = countActiveDaysAfter(o.daysDesc, r.lastUsedAt ?? r.createdAt, o.staleDays)
+      if (idle !== null && idle >= o.staleDays) {
+        reason = 'stale'
+      }
+    }
+    if (!reason) {
+      next.push(r)
+      continue
+    }
+
+    // Stale → hard delete. Don't add to `next`, don't write tombstone
+    // (so future learning can re-discover the same signal/target if
+    // the inbox starts seeing it again), don't push audit event.
+    // Only telemetry count survives, and even that lives in memory
+    // and is dropped after the sweep returns.
+    if (reason === 'stale') {
+      byReason.stale++
+      continue
+    }
+
+    // legacy_token / high-error-rate → soft disable + audit trail.
+    const updated: Rule = {
+      ...r,
+      enabled: false,
+      autoDisabledAt: new Date(o.now).toISOString(),
+      autoDisabledReason: reason,
+    }
+    next.push(updated)
+    disabled.push(updated)
+    if (reason === 'high-error-rate') byReason.highErrorRate++
+    else byReason.legacyToken++
+    events.push({
+      kind: 'toggle',
+      ruleId: r.id,
+      at: o.now,
+      actor: 'system',
+      enabled: false,
+      type: r.type,
+      signal: r.signal,
+      targetFolderPath: r.targetFolderPath,
+    })
+  }
+  // Nothing disabled AND nothing deleted → `next` holds exactly the same
+  // refs in the same order. Return the ORIGINAL array so mutateRules'
+  // identity check skips the full-library rewrite.
+  const changed = disabled.length > 0 || byReason.stale > 0 || byReason.dormantPurged > 0
+  return { next: changed ? next : rules, report: { disabled, byReason }, events }
+}
+
 /**
- * Auto-retire rules in three scenarios — two different fates per bucket:
+ * Auto-retire rules — different fates per bucket:
  *
  * 1. **Stale** (HARD DELETE, no trace):
- *    - never matched + `staleDays` ACTIVE days since createdAt, OR
- *    - matchCount > 0 but `staleDays` ACTIVE days since lastUsedAt
+ *    - never fired + `staleDays` ACTIVE days since createdAt, OR
+ *    - fired but `staleDays` ACTIVE days since lastUsedAt
  *    (active day = a UTC day on which a batch was executed; see
  *    deriveActiveDaysFromRules / recordActiveDay — idle periods don't count)
  *    The signal isn't reaching the inbox anymore. Per user request:
@@ -724,8 +1174,8 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
  *    NO error log (this is the design, not an error).
  *
  * 2. **High error rate** (SOFT DISABLE):
- *    - matchCount ≥ HIGH_ERROR_RATE_MIN_SAMPLES
- *    - overrideCount/matchCount ≥ HIGH_ERROR_RATE_THRESHOLD
+ *    - fires (matchCount + overrideCount) ≥ HIGH_ERROR_RATE_MIN_SAMPLES
+ *    - overrideCount / fires ≥ HIGH_ERROR_RATE_THRESHOLD
  *    The rule is mis-routing — user keeps fixing its verdicts. Surface
  *    in "自動休眠" so user can decide whether the overrides were
  *    exceptional or the rule is fundamentally wrong.
@@ -735,10 +1185,14 @@ function isLegacyTokenSubjectRule(r: Rule): boolean {
  *      token/fragment design. Surface in "自動休眠" so user can
  *      reactivate any that are still relevant.
  *
+ * 4. **Dormant purge** (HARD DELETE, 2026-11-05): a rule auto-disabled as
+ *    'superseded' / 'override' / 'high-error-rate' for
+ *    DORMANT_PURGE_ACTIVE_DAYS active days.
+ *
  * Skipped (never touched):
- *   - already-disabled rules
  *   - `source === 'user_manual'` (sacred)
  *   - `orphaned === true` (handled by reconcile UI)
+ *   - disabled rules other than the dormant-purge reasons above
  */
 export async function autoDisableStaleRules(
   options: {
@@ -753,114 +1207,111 @@ export async function autoDisableStaleRules(
   } = {},
 ): Promise<StaleAutoDisableReport> {
   const now = options.now ?? Date.now()
-  const staleDays = options.staleDays ?? STALE_AGE_DAYS_DEFAULT
-  const fullSubjectDays =
-    options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT
   const recordedDays = options.activeDays ?? (await getActiveDays())
-  const disabled: Rule[] = []
-  const byReason = { stale: 0, highErrorRate: 0, legacyToken: 0 }
-  const auditEvents: RuleEvent[] = []
-
-  await mutateRules((rules) => {
+  const { report, events } = await mutateRules((rules) => {
     // Computed ONCE from the pre-sweep library so deletions in this pass
     // can't shift the clock for rules evaluated later in the same pass.
-    const daysDesc = [...new Set([...recordedDays, ...deriveActiveDaysFromRules(rules)])]
-      .sort()
-      .reverse()
-    const next: Rule[] = []
-    for (const r of rules) {
-      // Untouched paths — keep as-is.
-      if (!r.enabled || r.source === 'user_manual' || r.orphaned) {
-        next.push(r)
-        continue
-      }
-
-      // Determine which bucket (if any) this rule falls into.
-      let reason: 'stale' | 'high-error-rate' | 'legacy_token' | null = null
-      if (isLegacyTokenSubjectRule(r)) {
-        reason = 'legacy_token'
-      } else if (r.matchCount === 0) {
-        // full_subject 類的死規則走 45 個使用日短週期 (見
-        // FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT 的說明)。謂詞依賴同步欄位
-        // (type / signal / matchCount / createdAt) + 使用日，使用日大部分
-        // 由同步規則本身推導 → 各機器 sweep 判定大致相同、維持無 tombstone
-        // 硬刪的收斂性。
-        const cutoff = isFullSubjectRule(r) ? fullSubjectDays : staleDays
-        const idle = countActiveDaysAfter(daysDesc, r.createdAt, cutoff)
-        if (idle !== null && idle >= cutoff) {
-          reason = 'stale'
-        }
-      } else if (r.matchCount >= HIGH_ERROR_RATE_MIN_SAMPLES) {
-        const errRate = (r.overrideCount ?? 0) / r.matchCount
-        if (errRate >= HIGH_ERROR_RATE_THRESHOLD) {
-          reason = 'high-error-rate'
-        }
-      }
-      // Last-used stale (added 2026-05-27): rule fired in the past but
-      // has not been used for `staleDays` ACTIVE days. Catches "topic ran
-      // for a few weeks then moved on" patterns.
-      if (!reason && r.matchCount > 0) {
-        const idle = countActiveDaysAfter(daysDesc, r.lastUsedAt ?? r.createdAt, staleDays)
-        if (idle !== null && idle >= staleDays) {
-          reason = 'stale'
-        }
-      }
-      if (!reason) {
-        next.push(r)
-        continue
-      }
-
-      // Stale → hard delete. Don't add to `next`, don't write tombstone
-      // (so future learning can re-discover the same signal/target if
-      // the inbox starts seeing it again), don't push audit event.
-      // Only telemetry count survives, and even that lives in memory
-      // and is dropped after the sweep returns.
-      if (reason === 'stale') {
-        byReason.stale++
-        continue
-      }
-
-      // legacy_token / high-error-rate → soft disable + audit trail.
-      const updated: Rule = {
-        ...r,
-        enabled: false,
-        autoDisabledAt: new Date(now).toISOString(),
-        autoDisabledReason: reason,
-      }
-      next.push(updated)
-      disabled.push(updated)
-      if (reason === 'high-error-rate') byReason.highErrorRate++
-      else byReason.legacyToken++
-      auditEvents.push({
-        kind: 'toggle',
-        ruleId: r.id,
-        at: now,
-        actor: 'system',
-        enabled: false,
-        type: r.type,
-        signal: r.signal,
-        targetFolderPath: r.targetFolderPath,
-      })
-    }
-    // Nothing disabled AND nothing stale-deleted → `next` holds exactly the
-    // same refs in the same order. Return the ORIGINAL array so mutateRules'
-    // identity check skips the full-library rewrite (this runs on every SW
-    // wake via the module-load sweep).
-    if (disabled.length === 0 && byReason.stale === 0) {
-      return { next: rules, result: undefined }
-    }
-    return { next, result: undefined }
+    const out = staleTransform(rules, {
+      now,
+      staleDays: options.staleDays ?? STALE_AGE_DAYS_DEFAULT,
+      fullSubjectDays:
+        options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT,
+      daysDesc: buildActiveDaysDesc(recordedDays, rules),
+    })
+    return { next: out.next, result: out }
   })
-
-  if (auditEvents.length > 0) {
-    await logRuleEvents(auditEvents)
+  if (events.length > 0) {
+    await logRuleEvents(events)
   }
-  return { disabled, byReason }
+  return report
 }
 
 /** Exact segment-prefix match: path IS the prefix, or lives under it. */
 function pathUnderAnyPrefix(path: string, prefixes: readonly string[]): boolean {
   return prefixes.some((p) => p.length > 0 && (path === p || path.startsWith(p + '/')))
+}
+
+/**
+ * Closed-case exemption marker (2026-11-05): an ENABLED rule that still
+ * carries autoDisabledReason 'case_closed'. Written when the user re-enables
+ * a retired rule (toggleRule / upsertRule) — "keep this one live even though
+ * its folder is archived". Phase 1 then leaves it alone instead of retiring
+ * it again on the next preflight, and drops the marker once the folder is
+ * back outside every archive prefix. Built from existing synced fields only
+ * (enabled + autoDisabledReason), so it propagates without a new Rule field.
+ */
+function isClosedCaseExempt(r: Pick<Rule, 'enabled' | 'autoDisabledReason'>): boolean {
+  return r.enabled && r.autoDisabledReason === 'case_closed'
+}
+
+/** autoDisabledReason a disabled rule keeps when it is switched back on. */
+function closedCaseExemptionOnEnable(
+  before: Pick<Rule, 'autoDisabledReason'>,
+): Rule['autoDisabledReason'] {
+  return before.autoDisabledReason === 'case_closed' ? 'case_closed' : undefined
+}
+
+function closedCaseRetirementTransform(
+  rules: Rule[],
+  closedCasePrefixes: readonly string[],
+  nowIso: string,
+): { next: Rule[]; retired: Rule[]; revived: Rule[] } {
+  const retired: Rule[] = []
+  const revived: Rule[] = []
+  let changed = false
+  const next = rules.map((r) => {
+    if (r.orphaned) return r
+    const underArchive =
+      closedCasePrefixes.length > 0 && pathUnderAnyPrefix(r.targetFolderPath, closedCasePrefixes)
+    if (r.enabled && underArchive) {
+      // The user re-enabled this rule while its folder was archived — an
+      // explicit, newer statement than the archive location. Respect it.
+      if (isClosedCaseExempt(r)) return r
+      const updated: Rule = {
+        ...r,
+        enabled: false,
+        autoDisabledAt: nowIso,
+        autoDisabledReason: 'case_closed',
+      }
+      retired.push(updated)
+      changed = true
+      return updated
+    }
+    // Revive fires even when the prefix list is emptied — un-designating
+    // an archive tree releases every rule it had retired.
+    if (!r.enabled && r.autoDisabledReason === 'case_closed' && !underArchive) {
+      const updated: Rule = {
+        ...r,
+        enabled: true,
+        autoDisabledAt: undefined,
+        autoDisabledReason: undefined,
+      }
+      revived.push(updated)
+      changed = true
+      return updated
+    }
+    // Folder left the archive: the exemption has nothing left to exempt.
+    // Dropping it means a later re-archive retires the rule normally.
+    if (isClosedCaseExempt(r) && !underArchive) {
+      changed = true
+      return { ...r, autoDisabledReason: undefined }
+    }
+    return r
+  })
+  return { next: changed ? next : rules, retired, revived }
+}
+
+function closedCaseToggleEvents(rules: readonly Rule[], at: number): RuleEvent[] {
+  return rules.map((r) => ({
+    kind: 'toggle',
+    ruleId: r.id,
+    at,
+    actor: 'system',
+    enabled: r.enabled,
+    type: r.type,
+    signal: r.signal,
+    targetFolderPath: r.targetFolderPath,
+  }))
 }
 
 /**
@@ -871,14 +1322,15 @@ function pathUnderAnyPrefix(path: string, prefixes: readonly string[]): boolean 
  *     case folder into the archive tree is a NEWER statement of intent
  *     than the rule, and a rule pointing into the archive silently files
  *     new mail where nobody looks. (user_manual is still exempt from the
- *     Phase-2 hard delete below.)
+ *     Phase-2 hard delete below.) Exception (2026-11-05): a rule the user
+ *     re-enabled AFTER it was retired (exemption marker, see
+ *     isClosedCaseExempt) is an even newer statement and stays live.
  *   - revive: a rule retired with 'case_closed' whose path is NO LONGER
  *     under any archive prefix (folder moved back out — reconcile has
  *     just refreshed stored paths by folderId) → re-enable. This is the
- *     case-reopen path; it does NOT rely on new mail arriving (the
- *     alreadyCovered dedup in generateAiConfirmedRules blocks re-mint
- *     while a disabled twin exists, so mail-driven re-enable would never
- *     fire — the folder's LOCATION is the single source of truth).
+ *     case-reopen path; it does NOT rely on new mail arriving — the
+ *     folder's LOCATION is the single source of truth, so learning never
+ *     revives 'case_closed' (REVIVABLE_DISABLE_REASONS).
  *
  * Call sites: classify preflight (right after reconcileRulesAgainstTree,
  * fresh paths, before matching — closes the "rule still routes into the
@@ -891,67 +1343,36 @@ export async function applyClosedCaseRetirement(
   options: { now?: number } = {},
 ): Promise<{ retired: number; revived: number; rules: Rule[] }> {
   const nowMs = options.now ?? Date.now()
-  const nowIso = new Date(nowMs).toISOString()
-  let retiredRules: Rule[] = []
-  let revivedRules: Rule[] = []
-
   // Returns the post-mutation array so the classify-preflight caller can
   // refresh its in-memory snapshot — it captured `rules` from the reconcile
   // mutateRules BEFORE this ran, and building the match index from that
   // stale capture would let a just-retired rule still route this round.
-  const updated = await mutateRules<Rule[]>((rules) => {
-    const retired: Rule[] = []
-    const revived: Rule[] = []
-    const next = rules.map((r) => {
-      if (r.orphaned) return r
-      const underArchive =
-        closedCasePrefixes.length > 0 && pathUnderAnyPrefix(r.targetFolderPath, closedCasePrefixes)
-      if (r.enabled && underArchive) {
-        const updated: Rule = {
-          ...r,
-          enabled: false,
-          autoDisabledAt: nowIso,
-          autoDisabledReason: 'case_closed',
-        }
-        retired.push(updated)
-        return updated
-      }
-      // Revive fires even when the prefix list is emptied — un-designating
-      // an archive tree releases every rule it had retired.
-      if (!r.enabled && r.autoDisabledReason === 'case_closed' && !underArchive) {
-        const updated: Rule = {
-          ...r,
-          enabled: true,
-          autoDisabledAt: undefined,
-          autoDisabledReason: undefined,
-        }
-        revived.push(updated)
-        return updated
-      }
-      return r
-    })
-    retiredRules = retired
-    revivedRules = revived
-    if (retired.length === 0 && revived.length === 0) {
-      return { next: rules, result: rules }
-    }
-    return { next, result: next }
+  const out = await mutateRules((rules) => {
+    const t = closedCaseRetirementTransform(rules, closedCasePrefixes, new Date(nowMs).toISOString())
+    return { next: t.next, result: t }
   })
-
-  const auditEvents: RuleEvent[] = [...retiredRules, ...revivedRules].map((r) => ({
-    kind: 'toggle',
-    ruleId: r.id,
-    at: nowMs,
-    actor: 'system',
-    enabled: r.enabled,
-    type: r.type,
-    signal: r.signal,
-    targetFolderPath: r.targetFolderPath,
-  }))
+  const auditEvents = closedCaseToggleEvents([...out.retired, ...out.revived], nowMs)
   if (auditEvents.length > 0) {
     await logRuleEvents(auditEvents)
   }
-  return { retired: retiredRules.length, revived: revivedRules.length, rules: updated }
+  return { retired: out.retired.length, revived: out.revived.length, rules: out.next }
+}
+
+function purgeClosedCaseTransform(
+  rules: Rule[],
+  now: number,
+  purgeMs: number,
+): { next: Rule[]; purged: number } {
+  let purged = 0
+  const next = rules.filter((r) => {
+    if (r.enabled || r.autoDisabledReason !== 'case_closed') return true
+    if (r.source === 'user_manual') return true
+    const disabledMs = Date.parse(r.autoDisabledAt ?? '')
+    if (!Number.isFinite(disabledMs) || now - disabledMs < purgeMs) return true
+    purged++
+    return false
+  })
+  return { next: purged > 0 ? next : rules, purged }
 }
 
 /**
@@ -977,24 +1398,117 @@ export async function purgeExpiredClosedCaseRules(
 ): Promise<{ purged: number }> {
   const now = options.now ?? Date.now()
   const purgeMs = (options.purgeDays ?? CASE_CLOSED_PURGE_DAYS) * 86_400_000
-  let purged = 0
-  await mutateRules((rules) => {
-    const next = rules.filter((r) => {
-      if (r.enabled || r.autoDisabledReason !== 'case_closed') return true
-      if (r.source === 'user_manual') return true
-      const disabledMs = Date.parse(r.autoDisabledAt ?? '')
-      if (!Number.isFinite(disabledMs) || now - disabledMs < purgeMs) return true
-      purged++
-      return false
-    })
-    if (purged === 0) return { next: rules, result: undefined }
-    return { next, result: undefined }
+  const purged = await mutateRules((rules) => {
+    const t = purgeClosedCaseTransform(rules, now, purgeMs)
+    return { next: t.next, result: t.purged }
   })
   return { purged }
 }
 
+export type RuleSweepReport = {
+  dedupe: DedupeReport
+  retirement: { retired: number; revived: number }
+  closedCasePurged: number
+  stale: StaleAutoDisableReport
+}
+
 /**
- * Minimum hits before we trust the empirical accuracy number over the
+ * The whole daily sweep — dedupe → closed-case retire/revive → closed-case
+ * purge → stale / error-rate / dormant retirement — as ONE mutateRules
+ * transaction (2026-11-05): one library read, at most one write, so at most
+ * one sync push per day instead of up to four. Each step is the same
+ * transform its standalone export runs, applied in the same order the
+ * sweep always used; a step that throws is skipped (logged) so one bad
+ * step can't block the others' cleanup. `closedCasePrefixes` omitted → the
+ * two closed-case steps are skipped (see below).
+ */
+export async function runRuleSweepPass(
+  options: {
+    closedCasePrefixes?: readonly string[]
+    now?: number
+    staleDays?: number
+    fullSubjectNeverMatchedDays?: number
+    activeDays?: readonly string[]
+    purgeDays?: number
+  } = {},
+): Promise<RuleSweepReport> {
+  const now = options.now ?? Date.now()
+  const nowIso = new Date(now).toISOString()
+  const recordedDays = options.activeDays ?? (await getActiveDays())
+  const purgeMs = (options.purgeDays ?? CASE_CLOSED_PURGE_DAYS) * 86_400_000
+  const step = <T>(name: string, fallback: T, fn: () => T): T => {
+    try {
+      return fn()
+    } catch (e) {
+      console.warn(`[mail-organizer] sweep step ${name} failed (non-fatal)`, e)
+      return fallback
+    }
+  }
+  const { report, events } = await mutateRules((original) => {
+    let rules = original
+    const dedupe = step('dedupe', { next: rules, report: { removed: 0, groupsAffected: 0 } }, () =>
+      dedupeTransform(rules),
+    )
+    rules = dedupe.next
+    // Closed-case steps only run with a KNOWN prefix list: [] means "the user
+    // un-designated every archive" and revives every retired rule, so an
+    // unknown list (settings unreadable) must skip them, not default to [].
+    const prefixes = options.closedCasePrefixes
+    const noRetirement = { next: rules, retired: [] as Rule[], revived: [] as Rule[] }
+    const retirement = prefixes
+      ? step('closed-case-retire', noRetirement, () =>
+          closedCaseRetirementTransform(rules, prefixes, nowIso),
+        )
+      : noRetirement
+    rules = retirement.next
+    const noPurge = { next: rules, purged: 0 }
+    const purge = prefixes
+      ? step('closed-case-purge', noPurge, () => purgeClosedCaseTransform(rules, now, purgeMs))
+      : noPurge
+    rules = purge.next
+    const emptyStale: StaleAutoDisableReport = {
+      disabled: [],
+      byReason: { stale: 0, highErrorRate: 0, legacyToken: 0, dormantPurged: 0 },
+    }
+    const stale = step(
+      'stale',
+      { next: rules, report: emptyStale, events: [] as RuleEvent[] },
+      () =>
+        staleTransform(rules, {
+          now,
+          staleDays: options.staleDays ?? STALE_AGE_DAYS_DEFAULT,
+          fullSubjectDays:
+            options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT,
+          // Clock from the PRE-pass library — same "computed once" rule as
+          // the standalone sweep, so this pass's own deletions can't shift it.
+          daysDesc: buildActiveDaysDesc(recordedDays, original),
+        }),
+    )
+    rules = stale.next
+    return {
+      next: rules,
+      result: {
+        report: {
+          dedupe: dedupe.report,
+          retirement: { retired: retirement.retired.length, revived: retirement.revived.length },
+          closedCasePurged: purge.purged,
+          stale: stale.report,
+        },
+        events: [
+          ...closedCaseToggleEvents([...retirement.retired, ...retirement.revived], now),
+          ...stale.events,
+        ],
+      },
+    }
+  })
+  if (events.length > 0) {
+    await logRuleEvents(events)
+  }
+  return report
+}
+
+/**
+ * Minimum fires before we trust the empirical accuracy number over the
  * configured confidence. Below this, the configured confidence (which
  * encodes "intent" — user_manual gets 0.95, auto_scan gets 0.65, etc.)
  * is the better signal because the empirical sample is too small.
@@ -1002,17 +1516,34 @@ export async function purgeExpiredClosedCaseRules(
 const ACCURACY_MIN_SAMPLES = 10
 
 /**
+ * Times the rule's verdict reached a plan that was executed: accepted hits
+ * (matchCount) + user overrides (overrideCount). The denominator for every
+ * accuracy / error-rate number (2026-11-05) — overrides never bump
+ * matchCount, so matchCount alone is "accepted fires", not "fires".
+ */
+export function ruleFires(r: Pick<Rule, 'matchCount' | 'overrideCount'>): number {
+  return (r.matchCount ?? 0) + (r.overrideCount ?? 0)
+}
+
+/** Share of fires the user overrode; 0 for a rule that never fired. */
+export function ruleErrorRate(r: Pick<Rule, 'matchCount' | 'overrideCount'>): number {
+  const fires = ruleFires(r)
+  return fires > 0 ? (r.overrideCount ?? 0) / fires : 0
+}
+
+/**
  * Configured confidence blended with empirical accuracy. When a rule has
- * fired enough times (>= ACCURACY_MIN_SAMPLES), trust the empirical
- * track record; otherwise fall back to the configured value. Used by
- * matchEmail's tiebreak so a rule that's been proven unreliable
- * (high overrideCount) demotes itself naturally.
+ * fired enough times (>= ACCURACY_MIN_SAMPLES fires), trust the empirical
+ * track record (accepted / fires); otherwise fall back to the configured
+ * value. Used by the matcher's in-tier tiebreak so a rule that's been
+ * proven unreliable (high overrideCount) demotes itself naturally — before
+ * 2026-11-05 a rule that was ONLY ever overridden kept matchCount 0 and
+ * never reached the sample floor, so it was never demoted.
  */
 export function effectiveConfidence(r: Pick<Rule, 'confidence' | 'matchCount' | 'overrideCount'>): number {
-  if (r.matchCount >= ACCURACY_MIN_SAMPLES) {
-    const overrides = r.overrideCount ?? 0
-    const empirical = (r.matchCount - overrides) / r.matchCount
-    return Math.max(0, Math.min(1, empirical))
+  const fires = ruleFires(r)
+  if (fires >= ACCURACY_MIN_SAMPLES) {
+    return Math.max(0, Math.min(1, (r.matchCount ?? 0) / fires))
   }
   return r.confidence
 }
@@ -1066,41 +1597,54 @@ export async function addRulesFilteringTombstones(
     // identical rules into the array. With the dedup check INSIDE the
     // lock, the second writer sees the first's rule and drops it.
     //
-    // Auto-re-enable (2026-05-22): when a candidate matches an
-    // auto-disabled existing rule (same type+signalNorm+target,
-    // `autoDisabledAt` set), the user is implicitly confirming the
-    // dormant rule was correct. Flip it back to `enabled=true` instead
-    // of just skipping. User-disabled rules (no `autoDisabledAt`) stay
-    // disabled — that's user intent.
+    // Auto-re-enable: when a candidate re-derives the triple of a rule the
+    // ENGINE disabled for a revivable reason (isRevivableAutoDisabled —
+    // 'override' / 'superseded' / 'high-error-rate' …), the fresh evidence
+    // says the routing is right again: flip it back on instead of adding a
+    // twin. User-disabled rules (no reason) and 'case_closed' /
+    // 'legacy_token' stay disabled. Never revive into a conflict: if another
+    // ENABLED rule now routes the same (type, signal) elsewhere, the twin
+    // stays dormant — e.g. a case number the user re-targeted A→B must not
+    // get its A rule back from old mail still sitting in folder A
+    // (2026-11-05).
     //
     // Key shape mirrors filterByTombstones: (type, signalNorm, target).
-    const existingByKey = new Map<string, { idx: number; rule: Rule }>()
+    const byKey = new Map<string, { enabled: boolean; revivable?: number }>()
+    const enabledTargets = new Map<string, Set<string>>()
     rules.forEach((r, idx) => {
-      const key = `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
-      existingByKey.set(key, { idx, rule: r })
+      const sig = `${r.type}::${normalizeSignal(r.type, r.signal)}`
+      const key = `${sig}::${r.targetFolderPath}`
+      const slot = byKey.get(key) ?? { enabled: false }
+      if (r.enabled) {
+        slot.enabled = true
+        const targets = enabledTargets.get(sig) ?? new Set<string>()
+        targets.add(r.targetFolderPath)
+        enabledTargets.set(sig, targets)
+      } else if (slot.revivable === undefined && isRevivableAutoDisabled(r)) {
+        slot.revivable = idx
+      }
+      byKey.set(key, slot)
     })
     const seenInBatch = new Set<string>()
     const reEnabledIndexes = new Map<number, Rule>()
+    const nowIso = new Date().toISOString()
     survivors = afterTombstone.filter((r) => {
-      const key = `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
-      const existing = existingByKey.get(key)
+      const sig = `${r.type}::${normalizeSignal(r.type, r.signal)}`
+      const key = `${sig}::${r.targetFolderPath}`
+      const existing = byKey.get(key)
       if (existing) {
-        const e = existing.rule
-        // Re-enable auto-disabled rule when the same signal+target
-        // gets re-learned. User intent is implicit: "this routing
-        // is still correct, you just hadn't seen mail for a while".
-        if (!e.enabled && e.autoDisabledAt) {
-          reEnabledIndexes.set(existing.idx, {
-            ...e,
-            enabled: true,
-            autoDisabledAt: undefined,
-            // Audit: also clear autoDisabledReason to honour the types.ts
-            // contract ("Cleared along with autoDisabledAt on re-enable")
-            // and match toggleRule — otherwise the rule ends up enabled
-            // with a stale 'high-error-rate'/'legacy_token' reason that
-            // round-trips through export/sync and misreports the rule.
-            autoDisabledReason: undefined,
-          })
+        if (!existing.enabled && existing.revivable !== undefined) {
+          const conflicting = [...(enabledTargets.get(sig) ?? [])].some(
+            (t) => t !== r.targetFolderPath,
+          )
+          if (!conflicting && !reEnabledIndexes.has(existing.revivable)) {
+            // revivedRule also clears autoDisabledReason, honouring the
+            // types.ts contract ("Cleared along with autoDisabledAt on
+            // re-enable") like toggleRule — otherwise the rule would end up
+            // enabled with a stale reason that round-trips through
+            // export/sync and misreports the rule.
+            reEnabledIndexes.set(existing.revivable, revivedRule(rules[existing.revivable]!, nowIso))
+          }
         }
         return false
       }
@@ -1157,6 +1701,46 @@ export async function addRulesFilteringTombstones(
   }
 }
 
+/** Canonical (type, normalized signal, target) key — the identity every
+ *  dedupe / tombstone / revive comparison uses. */
+export function ruleTripleKey(r: Pick<Rule, 'type' | 'signal' | 'targetFolderPath'>): string {
+  return `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
+}
+
+/**
+ * Canonical key of a tombstone. The stored signalNorm is re-normalized
+ * (normalizeSignal is idempotent on its own output) so tombstones written
+ * by older builds — before court-case forms / whitespace / '@' were folded,
+ * or with compound conditions in their raw form — still match the rule they
+ * were written for (2026-11-05). Comparing the raw stored string would let
+ * those deletions silently stop blocking re-learning.
+ */
+/**
+ * deletedAt for a tombstone of rule `r` (2026-11-05). Sync applies a tombstone
+ * only to rule versions with max(createdAt, editedAt) <= deletedAt, so a
+ * machine whose clock runs BEHIND the one that last edited the rule would
+ * mint a tombstone that never suppresses that version — the delete silently
+ * fails to propagate. Stamping strictly after the rule's own timestamps makes
+ * the delete win regardless of clock skew.
+ */
+export function tombstoneDeletedAt(
+  r: Pick<Rule, 'createdAt' | 'editedAt'>,
+  now: number = Date.now(),
+): number {
+  const created = Date.parse(r.createdAt)
+  return Math.max(
+    now,
+    typeof r.editedAt === 'number' && Number.isFinite(r.editedAt) ? r.editedAt + 1 : 0,
+    Number.isFinite(created) ? created + 1 : 0,
+  )
+}
+
+export function tombstoneKey(
+  t: Pick<RuleTombstone, 'type' | 'signalNorm' | 'targetFolderPath'>,
+): string {
+  return `${t.type}::${normalizeSignal(t.type, t.signalNorm)}::${t.targetFolderPath}`
+}
+
 /**
  * Given a set of candidate rules + the current tombstones, return the
  * subset whose (type, signalNorm, targetFolderPath) is NOT tombstoned.
@@ -1166,13 +1750,8 @@ export async function addRulesFilteringTombstones(
  */
 export function filterByTombstones(candidates: Rule[], tombstones: RuleTombstone[]): Rule[] {
   if (tombstones.length === 0) return candidates
-  const blocked = new Set(
-    tombstones.map((t) => `${t.type}::${t.signalNorm}::${t.targetFolderPath}`),
-  )
-  return candidates.filter((r) => {
-    const key = `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
-    return !blocked.has(key)
-  })
+  const blocked = new Set(tombstones.map(tombstoneKey))
+  return candidates.filter((r) => !blocked.has(ruleTripleKey(r)))
 }
 
 /** Convenience: load tombstones + filter in one call. */
@@ -1292,17 +1871,21 @@ export function reconcileRulesAgainstTree(
 // "domain company-b.example → A" would match before "domain company-b.example AND subject k → B"
 // — the conflict-split feature wouldn't actually do anything useful.
 //
-// This map is the SINGLE SOURCE OF TRUTH for type ordering. It controls:
+// This map is the single source of truth for TYPE ordering. It controls:
 //   1. `compareRulePriority` — sorts rules by type before tiebreaking on
-//      effective confidence + recency.
-//   2. `matchEmailWithIndex` — iterates buckets in this exact order.
+//      effective confidence + recency (and the Options rule list mirrors it).
+//   2. `matchEmailWithIndex` — the type order INSIDE each source class.
+//      Since 2026-11-05 the match path is tiered by source as well
+//      (user_manual broad rules before auto ones) and lifts structural
+//      court-case subject rules above domain — see the file header for the
+//      full tier list.
 //
 // If you change a value here, double-check both call sites still behave
 // as intended. There was a 2026-05-22 incident where matchEmailWithIndex
 // was rewritten to iterate sender BEFORE domain/subject_keyword, with
 // TYPE_PRIORITY left at the old values — the divergence silently broke
-// working subject_keyword rules. Lesson: this map and matchEmailWithIndex
-// must stay in lockstep.
+// working subject_keyword rules. Lesson: within a source class this map
+// and matchEmailWithIndex must stay in lockstep.
 export const TYPE_PRIORITY: Record<RuleType, number> = {
   case_code: 1,
   compound: 2,
@@ -1324,6 +1907,12 @@ export const TYPE_PRIORITY: Record<RuleType, number> = {
  *   / subject_keyword / sender) → thread wins, since thread memory
  *   captures actual past human filings, which is sharper than a broad
  *   auto-derived rule.
+ *
+ * Consistent with the matcher (2026-11-05): matchEmailWithIndex checks every
+ * user_manual rule before any auto domain rule, so the outcome handed to
+ * this helper is the hand-written rule whenever one matches — previously
+ * the matcher returned the auto domain rule instead, this helper said
+ * "thread wins", and the user's rule lost twice.
  *
  * Tests in tests/rules.test.ts pin this contract.
  */
@@ -1355,17 +1944,100 @@ export function matchEmail(email: Email, rules: Rule[]): MatchOutcome | null {
   return matchEmailWithIndex(email, buildRuleIndex(rules))
 }
 
+// ---- Compiled index (2026-11-05) -------------------------------------------
+//
+// Everything a rule needs at match time is derived ONCE per index build:
+// compound signals are JSON-decoded once (≈73% of a real library is compound,
+// and every one used to cost a JSON.parse per email in preflight AND harvest),
+// subject needles are lowercased / whitespace-collapsed / court-case-detected
+// once, and compounds are bucketed by their sender / domain condition so an
+// email only tests the compounds that could possibly match it. Per-email
+// features (lowercased addresses, subject forms, court cases) are likewise
+// computed once per email instead of once per rule.
+
+/** A subject needle pre-processed at index build. */
+type SubjectNeedle = {
+  /** Raw signal / condition value — echoed verbatim in the reason. */
+  raw: string
+  /** Canonical compact case number when the needle IS one, else null. */
+  court: string | null
+  /** Lowercased, whitespace-collapsed substring needle. */
+  needle: string
+}
+
+type CompiledCondition =
+  | { type: 'domain'; domain: string }
+  | { type: 'sender'; raw: string; addr: string }
+  | { type: 'subject_keyword'; subj: SubjectNeedle }
+
+type CompiledCompound = {
+  rule: Rule
+  conds: CompiledCondition[]
+  /** Position in the specificity-sorted compound tier; candidates gathered
+   *  from the anchor buckets are tried in this order. */
+  order: number
+}
+
+type CompiledSubjectRule = { rule: Rule; subj: SubjectNeedle }
+
+function compileSubjectNeedle(raw: string): SubjectNeedle {
+  return {
+    raw,
+    court: courtCaseSignal(raw),
+    needle: collapseSubjectWhitespace(raw.toLowerCase()),
+  }
+}
+
+function compileConditions(conds: readonly CompoundCondition[]): CompiledCondition[] {
+  return conds.map((c): CompiledCondition => {
+    if (c.type === 'domain') return { type: 'domain', domain: normalizeDomain(c.value) }
+    if (c.type === 'sender') return { type: 'sender', raw: c.value, addr: c.value.toLowerCase().trim() }
+    return { type: 'subject_keyword', subj: compileSubjectNeedle(c.value) }
+  })
+}
+
+/** Per-email features, computed once per match call. */
+type EmailFeatures = {
+  subject: string
+  subjectUpper: string
+  /** Lowercased, whitespace-collapsed subject (the substring haystack). */
+  hay: string
+  /** Lowercased From address (untrimmed, like the sender-map lookup always was). */
+  from: string | undefined
+  /** Lowercased From + To + Cc + Bcc, From first. */
+  addrs: string[]
+  /** Domain of addrs[i] (text after the last '@'); '' when there is none. */
+  domains: string[]
+  courtCases: () => string[]
+}
+
+function emailFeatures(email: Email): EmailFeatures {
+  const subject = email.Subject ?? ''
+  const addrs = allEmailAddresses(email)
+  let courtCases: string[] | undefined
+  return {
+    subject,
+    subjectUpper: subject.toUpperCase(),
+    hay: collapseSubjectWhitespace(subject.toLowerCase()),
+    from: email.From?.EmailAddress?.Address?.toLowerCase(),
+    addrs,
+    domains: addrs.map((a) => {
+      const at = a.lastIndexOf('@')
+      return at < 0 ? '' : a.slice(at + 1)
+    }),
+    courtCases: () => (courtCases ??= extractCourtCaseNumbers(subject)),
+  }
+}
+
 /**
- * Pre-built rule index for batch matching. Bucketed by type so the
- * matcher can short-circuit on type priority and use O(1) Map lookups
- * for domain / sender rules (the two types where exact-string match is
- * the dominant cost in a 500+ rule library).
- *
- * Each bucket is pre-sorted by `compareRulePriority` so iteration order
- * inside a type returns the best candidate first.
+ * Pre-built rule index for batch matching — one bucket per tier of the
+ * match order in the file header, each pre-sorted so the first hit inside a
+ * tier is the best candidate. The Rule[] / Map fields mirror the buckets for
+ * callers that inspect them; matching runs off the compiled fields.
  */
 export type RuleIndex = {
   caseCodeRules: Rule[]
+  /** Specificity order: longest subject condition first (2026-11-05). */
   compoundRules: Rule[]
   /**
    * subject_keyword rules whose signal IS a court case number (優化
@@ -1374,19 +2046,99 @@ export type RuleIndex = {
    * plain-domain rule (the same-client-multiple-cases hole). This bucket
    * order INTENTIONALLY diverges from TYPE_PRIORITY (subject_keyword=4);
    * compareRulePriority still sorts these as priority 4 for within-library
-   * ordering, only the match path elevates them.
+   * ordering, only the match path elevates them. Any source.
    */
   courtCaseSubjectRules: Rule[]
-  /** Map from normalized domain → rules targeting that domain. Sorted by priority. */
+  /** AUTO domain rules by normalized domain; own-domain rules are left out. */
   domainMap: Map<string, Rule[]>
-  /** Subject-keyword rules sorted by effective confidence desc (no easy index). */
+  /** AUTO non-court subject_keyword rules, longest signal first. */
   subjectKeywordRules: Rule[]
-  /** Map from lowercased sender address → rules. Sorted by priority. */
+  /** AUTO sender rules by lowercased address. */
   senderMap: Map<string, Rule[]>
+  /** user_manual tier (2026-11-05) — checked before every auto broad rule. */
+  manualDomainMap: Map<string, Rule[]>
+  manualSubjectKeywordRules: Rule[]
+  manualSenderMap: Map<string, Rule[]>
+  /** The mailbox owner's own domains (lowercased) — see buildRuleIndex. */
+  ownDomains: ReadonlySet<string>
+  // ---- compiled (internal) ----
+  compiledCaseCodes: Array<{ rule: Rule; upper: string }>
+  compiledCompounds: {
+    bySender: Map<string, CompiledCompound[]>
+    byDomain: Map<string, CompiledCompound[]>
+    unanchored: CompiledCompound[]
+    size: number
+  }
+  compiledCourtSubjects: CompiledSubjectRule[]
+  compiledManualSubjects: CompiledSubjectRule[]
+  compiledAutoSubjects: CompiledSubjectRule[]
 }
 
-export function buildRuleIndex(rules: Rule[]): RuleIndex {
-  const enabled = rules.filter((r) => r.enabled && !r.orphaned).sort(compareRulePriority)
+// Subject_keyword has no good index — it's linear substring scan. To
+// avoid "通知" (shorter, broad) winning over "112訴204" (longer,
+// specific) just because the broad one happens to sort first by
+// confidence, the subject buckets sort longest signal first, then
+// effective confidence, then recency.
+function subjectKeywordSort(a: Rule, b: Rule): number {
+  const lenDelta = b.signal.length - a.signal.length
+  if (lenDelta !== 0) return lenDelta
+  const confDelta = effectiveConfidence(b) - effectiveConfidence(a)
+  if (confDelta !== 0) return confDelta
+  const aUsed = a.lastUsedAt ?? a.createdAt
+  const bUsed = b.lastUsedAt ?? b.createdAt
+  return bUsed.localeCompare(aUsed)
+}
+
+function longestSubjectCondition(conds: readonly CompiledCondition[]): number {
+  let n = 0
+  for (const c of conds) {
+    if (c.type === 'subject_keyword' && c.subj.needle.length > n) n = c.subj.needle.length
+  }
+  return n
+}
+
+function pushTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const bucket = map.get(key)
+  if (bucket) bucket.push(value)
+  else map.set(key, [value])
+}
+
+/**
+ * Build the match index.
+ *
+ * `ownDomains` (2026-11-05): the mailbox owner's own domain(s). The owner is
+ * on To/Cc of essentially every inbound email, and a domain rule matches ANY
+ * party — so an auto-learned `domain: <own domain>` (minted from the first AI
+ * filing of a colleague's mail while internalDomains was still empty, the
+ * default) claimed the whole inbox, and its empirical confidence climbed above
+ * every client's rule. So:
+ *   - AUTO domain rules never fire on an own-domain address (the own-domain
+ *     rules themselves are left out of the index; other auto domain rules
+ *     can't be matched by such an address anyway).
+ *   - user_manual domain rules for an own domain stay honoured, but only on
+ *     the From side: the owner's address on To/Cc would make a hand-written
+ *     「所內網域 → 所內」 rule swallow all external mail too, which is
+ *     clearly not what it means ("mail FROM colleagues").
+ *   - compound / sender / subject rules are unaffected.
+ */
+export function buildRuleIndex(
+  rules: Rule[],
+  opts?: { ownDomains?: readonly string[] },
+): RuleIndex {
+  const ownDomains = new Set(
+    (opts?.ownDomains ?? []).map((d) => normalizeDomain(d)).filter((d) => d.length > 0),
+  )
+  // Corrupt rows (unknown type / non-string signal — a bad import, a buggy
+  // sync peer) are skipped rather than allowed to throw for every email.
+  const enabled = rules
+    .filter(
+      (r) =>
+        r.enabled &&
+        !r.orphaned &&
+        typeof r.signal === 'string' &&
+        Object.prototype.hasOwnProperty.call(TYPE_PRIORITY, r.type),
+    )
+    .sort(compareRulePriority)
   const index: RuleIndex = {
     caseCodeRules: [],
     compoundRules: [],
@@ -1394,162 +2146,270 @@ export function buildRuleIndex(rules: Rule[]): RuleIndex {
     domainMap: new Map(),
     subjectKeywordRules: [],
     senderMap: new Map(),
+    manualDomainMap: new Map(),
+    manualSubjectKeywordRules: [],
+    manualSenderMap: new Map(),
+    ownDomains,
+    compiledCaseCodes: [],
+    compiledCompounds: { bySender: new Map(), byDomain: new Map(), unanchored: [], size: 0 },
+    compiledCourtSubjects: [],
+    compiledManualSubjects: [],
+    compiledAutoSubjects: [],
   }
-  // Subject_keyword has no good index — it's linear substring scan. To
-  // avoid "通知" (shorter, broad) winning over "112訴204" (longer,
-  // specific) just because the broad one happens to sort first by
-  // confidence, we override the bucket's sort: longest signal first,
-  // then effective confidence, then recency. This is local to the
-  // bucket; doesn't affect other rule types' priority.
-  const subjectKeywordSort = (a: Rule, b: Rule): number => {
-    const lenDelta = b.signal.length - a.signal.length
-    if (lenDelta !== 0) return lenDelta
-    const confDelta = effectiveConfidence(b) - effectiveConfidence(a)
-    if (confDelta !== 0) return confDelta
-    const aUsed = a.lastUsedAt ?? a.createdAt
-    const bUsed = b.lastUsedAt ?? b.createdAt
-    return bUsed.localeCompare(aUsed)
-  }
+  const compounds: Array<{ rule: Rule; conds: CompiledCondition[]; subjectLen: number }> = []
   for (const r of enabled) {
+    const manual = r.source === 'user_manual'
     switch (r.type) {
       case 'case_code':
         index.caseCodeRules.push(r)
         break
-      case 'compound':
-        index.compoundRules.push(r)
+      case 'compound': {
+        // Malformed compound → never matches (decodeCompound validates).
+        const decoded = decodeCompound(r.signal)
+        if (!decoded || decoded.conditions.length === 0) break
+        const conds = compileConditions(decoded.conditions)
+        compounds.push({ rule: r, conds, subjectLen: longestSubjectCondition(conds) })
         break
+      }
       case 'domain': {
         const d = normalizeDomain(r.signal)
         if (!d) break
-        let bucket = index.domainMap.get(d)
-        if (!bucket) {
-          bucket = []
-          index.domainMap.set(d, bucket)
-        }
-        bucket.push(r)
+        if (manual) pushTo(index.manualDomainMap, d, r)
+        else if (!ownDomains.has(d)) pushTo(index.domainMap, d, r)
         break
       }
       case 'subject_keyword':
         // Pure court-case-number subject rules go in their own high-priority
-        // bucket (優化 2026-07); everything else stays a plain subject rule.
+        // bucket (優化 2026-07); everything else is a plain subject rule.
         if (courtCaseSignal(r.signal)) index.courtCaseSubjectRules.push(r)
+        else if (manual) index.manualSubjectKeywordRules.push(r)
         else index.subjectKeywordRules.push(r)
         break
       case 'sender': {
         const s = r.signal.toLowerCase().trim()
         if (!s) break
-        let bucket = index.senderMap.get(s)
-        if (!bucket) {
-          bucket = []
-          index.senderMap.set(s, bucket)
-        }
-        bucket.push(r)
+        pushTo(manual ? index.manualSenderMap : index.senderMap, s, r)
         break
       }
     }
   }
-  // Re-sort subject_keyword bucket by longest-signal-first. Other
-  // buckets already have the right sort from `compareRulePriority`.
-  index.subjectKeywordRules.sort(subjectKeywordSort)
-  // Court-case bucket: distinct case numbers rarely collide, but keep the
-  // same longest-first / confidence sort for determinism.
   index.courtCaseSubjectRules.sort(subjectKeywordSort)
+  index.manualSubjectKeywordRules.sort(subjectKeywordSort)
+  index.subjectKeywordRules.sort(subjectKeywordSort)
+  // Compound specificity (2026-11-05): the LONGEST subject condition first,
+  // then more conditions, then effective confidence / recency. Sorting on
+  // confidence / recency alone let 「報告」→甲 claim 「RE: 乙案進度報告」
+  // just because it fired more recently than the 乙案 rule.
+  compounds.sort(
+    (a, b) =>
+      b.subjectLen - a.subjectLen ||
+      b.conds.length - a.conds.length ||
+      compareRulePriority(a.rule, b.rule),
+  )
+  compounds.forEach((c, order) => {
+    const entry: CompiledCompound = { rule: c.rule, conds: c.conds, order }
+    index.compoundRules.push(c.rule)
+    // Bucket by one REQUIRED condition (sender is the most selective): an
+    // email can only satisfy the compound if it carries that anchor.
+    const sender = c.conds.find(
+      (x): x is Extract<CompiledCondition, { type: 'sender' }> => x.type === 'sender',
+    )
+    const domain = c.conds.find(
+      (x): x is Extract<CompiledCondition, { type: 'domain' }> => x.type === 'domain',
+    )
+    if (sender) pushTo(index.compiledCompounds.bySender, sender.addr, entry)
+    else if (domain) pushTo(index.compiledCompounds.byDomain, domain.domain, entry)
+    else index.compiledCompounds.unanchored.push(entry)
+  })
+  index.compiledCompounds.size = compounds.length
+  index.compiledCaseCodes = index.caseCodeRules.map((rule) => ({
+    rule,
+    upper: rule.signal.toUpperCase(),
+  }))
+  const compileSubjects = (list: Rule[]): CompiledSubjectRule[] =>
+    list.map((rule) => ({ rule, subj: compileSubjectNeedle(rule.signal) }))
+  index.compiledCourtSubjects = compileSubjects(index.courtCaseSubjectRules)
+  index.compiledManualSubjects = compileSubjects(index.manualSubjectKeywordRules)
+  index.compiledAutoSubjects = compileSubjects(index.subjectKeywordRules)
   return index
 }
 
-/**
- * Match a single email against a pre-built RuleIndex. Mirrors
- * matchEmail's semantics (highest-priority type that matches wins, with
- * effective-confidence tiebreak inside the bucket) but uses Map lookups
- * to skip rules whose signal can't possibly match the email's
- * address/domain set.
- *
- * Domain match: iterate every address in the email; collect candidate
- * rules from `domainMap` keyed by each address's normalized domain;
- * pick the one with the highest effective confidence among matches.
- */
-export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcome | null {
-  // Order matches TYPE_PRIORITY: case_code(1) → compound(2) → domain(3)
-  // → subject_keyword(4) → sender(5). Each bucket is pre-sorted by
-  // `compareRulePriority` (or `subjectKeywordSort` for the subject
-  // bucket — longest signal first).
-  //
-  // Historical note (2026-05-22): an earlier fix briefly promoted
-  // sender above domain in match order, with the intent "sender is more
-  // specific than domain so it should win". The promotion went further
-  // than intended — it also placed sender above subject_keyword, which
-  // broke working `工時審閱` style rules whenever the user had any
-  // sender rule for the same From. Reverted to TYPE_PRIORITY order to
-  // restore consistency between sort metadata and match path. Use a
-  // `user_manual` sender rule with high explicit confidence if you
-  // really need it to outrank a domain.
+function caseCodeReason(upper: string, raw: string, f: EmailFeatures): string | null {
+  if (!upper || !f.subject) return null
+  return f.subjectUpper.includes(upper) ? `主旨含案件代號「${raw}」` : null
+}
 
-  // case_code (priority 1)
-  for (const r of index.caseCodeRules) {
-    const reason = matchCaseCode(r.signal, email)
-    if (reason) return { rule: r, reason }
-  }
-  // compound (priority 2)
-  for (const r of index.compoundRules) {
-    const reason = matchCompound(r.signal, email)
-    if (reason) return { rule: r, reason }
-  }
-  // court-case subject rules (優化 2026-07) — checked here, between compound
-  // and domain, so a structural case-number identifier outranks a broad
-  // plain-domain rule (same-client-multiple-cases: 主旨帶 B 案案號的信不再
-  //被 @client.com→A 案規則搶先誤歸).
-  for (const r of index.courtCaseSubjectRules) {
-    const reason = matchSubjectKeyword(r.signal, email)
-    if (reason) return { rule: r, reason }
-  }
-  // domain (priority 3) — O(K) where K = email address count (≤ 6 normally)
-  let bestDomain: MatchOutcome | null = null
-  let bestDomainConf = -1
-  for (const addr of allEmailAddresses(email)) {
-    const atIdx = addr.lastIndexOf('@')
-    if (atIdx < 0) continue
-    const domain = addr.slice(atIdx + 1)
-    const candidates = index.domainMap.get(domain)
-    if (!candidates) continue
-    for (const r of candidates) {
-      const reason = matchDomain(r.signal, email)
-      if (reason) {
-        const conf = effectiveConfidence(r)
-        if (conf > bestDomainConf) {
-          bestDomainConf = conf
-          bestDomain = { rule: r, reason }
-        }
-        break // candidates sorted desc — first match dominates within this domain
-      }
-    }
-  }
-  if (bestDomain) return bestDomain
-  // Internal-body case pass (batch-3, priority ~3.5 — after domain, before
-  // plain subject_keyword). See matchBodyCaseWithIndex. Requires the fully-
-  // fetched bodyText, so it is inert at preflight (BodyPreview only) and fires
-  // in the AI path after getMessageBody (service-worker classifyAi).
-  const bodyOutcome = matchBodyCaseWithIndex(email, index)
-  if (bodyOutcome) return bodyOutcome
-  // subject_keyword (priority 4) — linear, no index possible without
-  // bringing in a substring data structure (trie / aho-corasick).
-  // Bucket is sorted longest-signal-first by buildRuleIndex so
-  // "112訴204" wins over a shorter "通知" if both match.
-  for (const r of index.subjectKeywordRules) {
-    const reason = matchSubjectKeyword(r.signal, email)
-    if (reason) return { rule: r, reason }
-  }
-  // sender (priority 5) — O(1) lookup by From address
-  const fromAddr = email.From?.EmailAddress?.Address?.toLowerCase()
-  if (fromAddr) {
-    const candidates = index.senderMap.get(fromAddr)
-    if (candidates) {
-      for (const r of candidates) {
-        const reason = matchSender(r.signal, email)
-        if (reason) return { rule: r, reason }
-      }
-    }
+function subjectReason(s: SubjectNeedle, f: EmailFeatures): string | null {
+  if (!s.raw || !f.subject) return null
+  // Canonical case-number equivalence (優化 2026-07): the learning side
+  // stores the COMPACT form (「112訴304」) but official court notices use the
+  // FULL form (「112年度訴字第304號」). Plain substring never matched across
+  // the two forms — so a case-number rule couldn't even match the notice
+  // that taught it, and (never firing) got hard-deleted by the stale sweep.
+  // When the signal IS a pure case number, compare against the subject's
+  // extracted case-number set; otherwise fall through to the literal.
+  if (s.court && f.courtCases().includes(s.court)) return `主旨含案號「${s.court}」`
+  // Whitespace-collapsed + digit-boundary-aware substring. Collapse fixes
+  // learn-side normalized / match-side raw whitespace mismatches; the
+  // boundary stops 「112訴20」 from matching 「112訴204」.
+  return subjectIncludesBoundary(f.hay, s.needle) ? `主旨含「${s.raw}」` : null
+}
+
+/** First party (From first) on `domain`, as the reason; fromOnly restricts to From. */
+function domainReason(domain: string, f: EmailFeatures, fromOnly = false): string | null {
+  if (!domain) return null
+  for (let i = 0; i < f.addrs.length; i++) {
+    if (f.domains[i] !== domain) continue
+    const isFrom = f.addrs[i] === f.from
+    if (fromOnly && !isFrom) continue
+    return `${isFrom ? '寄件人' : '收件人'}網域 @${domain}`
   }
   return null
+}
+
+function senderReason(addr: string, raw: string, f: EmailFeatures): string | null {
+  if (!addr) return null
+  return f.from === addr ? `寄件人 ${raw}` : null
+}
+
+function compoundReason(c: CompiledCompound, f: EmailFeatures): string | null {
+  const reasons: string[] = []
+  for (const cond of c.conds) {
+    const r =
+      cond.type === 'domain'
+        ? domainReason(cond.domain, f)
+        : cond.type === 'subject_keyword'
+          ? subjectReason(cond.subj, f)
+          : senderReason(cond.addr, cond.raw, f)
+    if (!r) return null
+    reasons.push(r)
+  }
+  return reasons.join(' + ')
+}
+
+function matchCompoundTier(index: RuleIndex, f: EmailFeatures): MatchOutcome | null {
+  const c = index.compiledCompounds
+  if (c.size === 0) return null
+  const candidates: CompiledCompound[] = [...c.unanchored]
+  if (f.from) {
+    const bySender = c.bySender.get(f.from)
+    if (bySender) candidates.push(...bySender)
+  }
+  const seen = new Set<string>()
+  for (const d of f.domains) {
+    if (!d || seen.has(d)) continue
+    seen.add(d)
+    const byDomain = c.byDomain.get(d)
+    if (byDomain) candidates.push(...byDomain)
+  }
+  candidates.sort((a, b) => a.order - b.order)
+  for (const cc of candidates) {
+    const reason = compoundReason(cc, f)
+    if (reason) return { rule: cc.rule, reason }
+  }
+  return null
+}
+
+function matchSubjectTier(list: readonly CompiledSubjectRule[], f: EmailFeatures): MatchOutcome | null {
+  for (const s of list) {
+    const reason = subjectReason(s.subj, f)
+    if (reason) return { rule: s.rule, reason }
+  }
+  return null
+}
+
+/**
+ * Domain tier: for every address (From first) look up its domain's bucket,
+ * keep the candidate with the highest effective confidence. Own-domain
+ * addresses never reach AUTO rules; for user_manual they count on the From
+ * side only (see buildRuleIndex).
+ */
+function matchDomainTier(
+  map: Map<string, Rule[]>,
+  f: EmailFeatures,
+  ownDomains: ReadonlySet<string>,
+  manual: boolean,
+): MatchOutcome | null {
+  if (map.size === 0) return null
+  let best: MatchOutcome | null = null
+  let bestConf = -1
+  for (let i = 0; i < f.addrs.length; i++) {
+    const d = f.domains[i]!
+    if (!d) continue
+    const own = ownDomains.has(d)
+    if (own && (!manual || f.addrs[i] !== f.from)) continue
+    const top = map.get(d)?.[0] // bucket sorted desc — first dominates
+    if (!top) continue
+    const conf = effectiveConfidence(top)
+    if (conf > bestConf) {
+      const reason = domainReason(d, f, own)
+      if (!reason) continue
+      bestConf = conf
+      best = { rule: top, reason }
+    }
+  }
+  return best
+}
+
+function matchSenderTier(map: Map<string, Rule[]>, f: EmailFeatures): MatchOutcome | null {
+  if (!f.from) return null
+  for (const r of map.get(f.from) ?? []) {
+    const reason = senderReason(r.signal.toLowerCase().trim(), r.signal, f)
+    if (reason) return { rule: r, reason }
+  }
+  return null
+}
+
+/**
+ * Match a single email against a pre-built RuleIndex — tiers in the order
+ * documented in the file header; the first tier with a hit wins.
+ *
+ * The user_manual tier (2026-11-05): previously the walk went strictly by
+ * type and ignored source, so a hand-written sender or subject rule never
+ * fired whenever ANY auto domain rule matched ANY party of the email (To/Cc
+ * included) — and thread memory then beat it too, because ruleBeatsThread
+ * was handed the auto domain rule. (The old advice to "give the sender rule
+ * a high explicit confidence" could not work: confidence only orders rules
+ * WITHIN a type.) Structural identifiers (case_code / compound / court-case
+ * subject) still come first, whatever their source. Inside the user_manual
+ * tier the type order stays TYPE_PRIORITY's (domain → subject → sender), the
+ * contract the 2026-05-22 incident pinned.
+ */
+export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcome | null {
+  const f = emailFeatures(email)
+  // 1. case_code
+  for (const c of index.compiledCaseCodes) {
+    const reason = caseCodeReason(c.upper, c.rule.signal, f)
+    if (reason) return { rule: c.rule, reason }
+  }
+  // 2. compound
+  const compound = matchCompoundTier(index, f)
+  if (compound) return compound
+  // 3. court-case subject rules (優化 2026-07) — a structural case-number
+  // identifier outranks a broad plain-domain rule (same-client-multiple-
+  // cases: 主旨帶 B 案案號的信不再被 @client.com→A 案規則搶先誤歸).
+  const court = matchSubjectTier(index.compiledCourtSubjects, f)
+  if (court) return court
+  // 4. user_manual: domain → subject_keyword → sender
+  const manual =
+    matchDomainTier(index.manualDomainMap, f, index.ownDomains, true) ??
+    matchSubjectTier(index.compiledManualSubjects, f) ??
+    matchSenderTier(index.manualSenderMap, f)
+  if (manual) return manual
+  // 5. auto domain — O(K) Map lookups, K = address count (≤ 6 normally)
+  const domain = matchDomainTier(index.domainMap, f, index.ownDomains, false)
+  if (domain) return domain
+  // 6. Internal-body case pass (batch-3 — after domain, before plain
+  // subject_keyword). See matchBodyCaseWithIndex. Requires the fully-
+  // fetched bodyText, so it is inert at preflight (BodyPreview only) and
+  // fires in the AI path after getMessageBody (service-worker classifyAi).
+  const body = matchBodyCaseWithIndex(email, index)
+  if (body) return body
+  // 7. auto subject_keyword — linear, longest signal first
+  const subject = matchSubjectTier(index.compiledAutoSubjects, f)
+  if (subject) return subject
+  // 8. auto sender — O(1) lookup by From address
+  return matchSenderTier(index.senderMap, f)
 }
 
 /**
@@ -1569,17 +2429,17 @@ export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcom
  * pass logic.
  */
 export function matchBodyCaseWithIndex(email: Email, index: RuleIndex): MatchOutcome | null {
+  if (!email.bodyText) return null
   const bodyCase = caseSignalsForMatch(email)
   if (bodyCase.source !== 'body' || bodyCase.bodyAmbiguous) return null
-  for (const r of index.caseCodeRules) {
-    if (bodyCase.caseCodes.some((c) => c.toUpperCase() === r.signal.toUpperCase())) {
-      return { rule: r, reason: `內文含案件代號「${r.signal}」` }
+  for (const c of index.compiledCaseCodes) {
+    if (bodyCase.caseCodes.some((code) => code.toUpperCase() === c.upper)) {
+      return { rule: c.rule, reason: `內文含案件代號「${c.rule.signal}」` }
     }
   }
-  for (const r of index.courtCaseSubjectRules) {
-    const cc = courtCaseSignal(r.signal)
-    if (cc && bodyCase.courtCases.includes(cc)) {
-      return { rule: r, reason: `內文含案號「${cc}」` }
+  for (const s of index.compiledCourtSubjects) {
+    if (s.subj.court && bodyCase.courtCases.includes(s.subj.court)) {
+      return { rule: s.rule, reason: `內文含案號「${s.subj.court}」` }
     }
   }
   return null
@@ -1587,8 +2447,8 @@ export function matchBodyCaseWithIndex(email: Email, index: RuleIndex): MatchOut
 
 /**
  * Sort comparator for rule matching: type priority first, then
- * effective confidence (empirical accuracy when matchCount is high
- * enough, else the configured confidence), then recency.
+ * effective confidence (empirical accuracy when the rule has fired enough,
+ * else the configured confidence), then recency.
  *
  * Using effective confidence here gives the engine a self-cleaning
  * property — a rule with bad track record drops in priority without
@@ -1607,17 +2467,13 @@ export function compareRulePriority(a: Rule, b: Rule): number {
   return bUsed.localeCompare(aUsed)
 }
 
-
-function matchCaseCode(code: string, email: Email): string | null {
-  if (!code || !email.Subject) return null
-  if (email.Subject.toUpperCase().includes(code.toUpperCase())) {
-    return `主旨含案件代號「${code}」`
-  }
-  return null
-}
-
+/**
+ * Canonical domain: trimmed, leading '@' dropped, lowercased (2026-11-05:
+ * trims first — `' @x.com'` used to keep its '@' and never match).
+ */
 function normalizeDomain(input: string): string {
-  return (input.startsWith('@') ? input.slice(1) : input).toLowerCase()
+  const s = input.trim()
+  return (s.startsWith('@') ? s.slice(1) : s).trim().toLowerCase()
 }
 
 // ---- Generic-provider domain blocklist ------------------------------------
@@ -1670,52 +2526,6 @@ function allEmailAddresses(email: Email): string[] {
   return out
 }
 
-function matchDomain(signal: string, email: Email): string | null {
-  const domain = normalizeDomain(signal)
-  if (!domain) return null
-  const addrs = allEmailAddresses(email)
-  const hit = addrs.find((a) => a.endsWith('@' + domain))
-  if (!hit) return null
-  const fromAddr = email.From?.EmailAddress?.Address?.toLowerCase()
-  const side = hit === fromAddr ? '寄件人' : '收件人'
-  return `${side}網域 @${domain}`
-}
-
-function matchSender(address: string, email: Email): string | null {
-  if (!address) return null
-  const target = address.toLowerCase().trim()
-  const from = email.From?.EmailAddress?.Address?.toLowerCase()
-  if (from === target) return `寄件人 ${address}`
-  return null
-}
-
-function matchSubjectKeyword(keyword: string, email: Email): string | null {
-  if (!keyword || !email.Subject) return null
-  // Canonical case-number equivalence (優化 2026-07): the learning side
-  // stores the COMPACT form (「112訴304」) but official court notices use the
-  // FULL form (「112年度訴字第304號」). Plain substring never matched across
-  // the two forms — so a case-number rule couldn't even match the notice
-  // that taught it, and (never firing) got hard-deleted by the 100-day
-  // stale sweep. When the signal IS a pure case number, compare against the
-  // subject's extracted case-number set instead.
-  const cc = courtCaseSignal(keyword)
-  if (cc) {
-    if (extractCourtCaseNumbers(email.Subject).includes(cc)) {
-      return `主旨含案號「${cc}」`
-    }
-    // fall through — the exact literal might still appear verbatim
-  }
-  // Whitespace-collapsed + digit-boundary-aware substring. Collapse fixes
-  // learn-side normalized / match-side raw whitespace mismatches; the
-  // boundary stops 「112訴20」 from matching 「112訴204」.
-  const hay = collapseSubjectWhitespace(email.Subject.toLowerCase())
-  const needle = collapseSubjectWhitespace(keyword.toLowerCase())
-  if (subjectIncludesBoundary(hay, needle)) {
-    return `主旨含「${keyword}」`
-  }
-  return null
-}
-
 // ---- Compound --------------------------------------------------------------
 
 export type CompoundCondition =
@@ -1729,29 +2539,61 @@ export function encodeCompound(conditions: CompoundCondition[]): string {
   return JSON.stringify({ conditions })
 }
 
+const COMPOUND_CONDITION_TYPES: ReadonlySet<string> = new Set([
+  'domain',
+  'subject_keyword',
+  'sender',
+])
+
+/**
+ * Validate parsed compound conditions (2026-11-05): every entry must be an
+ * object with a known `type` and a non-blank string `value`, else the whole
+ * compound is invalid (null). An imported `{"type":"domain","value":123}`
+ * used to throw inside matching for EVERY email — and the sweep's catch then
+ * silently skipped all cleanup.
+ */
+function validCompoundConditions(raw: unknown): CompoundCondition[] | null {
+  if (!Array.isArray(raw)) return null
+  const out: CompoundCondition[] = []
+  for (const c of raw) {
+    if (!c || typeof c !== 'object') return null
+    const { type, value } = c as { type?: unknown; value?: unknown }
+    if (typeof type !== 'string' || !COMPOUND_CONDITION_TYPES.has(type)) return null
+    if (typeof value !== 'string' || value.trim().length === 0) return null
+    out.push({ type, value } as CompoundCondition)
+  }
+  return out
+}
+
+/** Decode a compound rule signal; null when it is not a valid compound. */
 export function decodeCompound(signal: string): CompoundSignal | null {
+  if (typeof signal !== 'string') return null
   try {
-    const parsed = JSON.parse(signal) as CompoundSignal
-    if (!parsed || !Array.isArray(parsed.conditions)) return null
-    return parsed
+    const parsed = JSON.parse(signal) as { conditions?: unknown } | null
+    if (!parsed || typeof parsed !== 'object') return null
+    const conditions = validCompoundConditions(parsed.conditions)
+    return conditions ? { conditions } : null
   } catch {
     return null
   }
 }
 
-function matchCompound(signal: string, email: Email): string | null {
-  const parsed = decodeCompound(signal)
-  if (!parsed || parsed.conditions.length === 0) return null
-  const reasons: string[] = []
-  for (const cond of parsed.conditions) {
-    let r: string | null = null
-    if (cond.type === 'domain') r = matchDomain(cond.value, email)
-    else if (cond.type === 'subject_keyword') r = matchSubjectKeyword(cond.value, email)
-    else if (cond.type === 'sender') r = matchSender(cond.value, email)
-    if (!r) return null
-    reasons.push(r)
+/**
+ * Conditions of a compound for KEY purposes: the rule-signal form
+ * `{conditions:[…]}` or the bare-array form normalizeSignal itself emits —
+ * which is what older builds stored as a tombstone's signalNorm.
+ */
+function compoundConditionsForKey(signal: string): CompoundCondition[] | null {
+  try {
+    const parsed = JSON.parse(signal) as unknown
+    if (Array.isArray(parsed)) return validCompoundConditions(parsed)
+    if (parsed && typeof parsed === 'object') {
+      return validCompoundConditions((parsed as { conditions?: unknown }).conditions)
+    }
+    return null
+  } catch {
+    return null
   }
-  return reasons.join(' + ')
 }
 
 // ---- Conflict detection ----------------------------------------------------
@@ -1762,7 +2604,24 @@ export type RuleConflict = {
   rules: Rule[] // 2+ rules with the same key, different target folders
 }
 
+/** Canonical subject needle: a pure case number in compact form, else
+ *  lowercased + whitespace-collapsed (the matcher treats both as equal). */
+function normalizeSubjectValue(signal: string): string {
+  return courtCaseSignal(signal) ?? collapseSubjectWhitespace(signal.toLowerCase()).trim()
+}
+
+/**
+ * Canonical identity of a signal — the key for tombstones, dedupe, conflict
+ * detection and every learner's "already covered" check. Two signals the
+ * MATCHER treats as equal must normalize equal (2026-11-05): full vs compact
+ * court-case forms and full-width digits (「112年度訴字第304號」≡「112訴304」),
+ * subject whitespace runs, and a padded / '@'-prefixed domain — before this
+ * they were distinct keys, so tombstones, dedupe, conflict detection and
+ * alreadyCovered all missed equivalents. Idempotent on its own output (see
+ * tombstoneKey).
+ */
 export function normalizeSignal(type: RuleType, signal: string): string {
+  if (typeof signal !== 'string') return ''
   switch (type) {
     case 'domain':
       return normalizeDomain(signal)
@@ -1771,20 +2630,30 @@ export function normalizeSignal(type: RuleType, signal: string): string {
     case 'case_code':
       return signal.toUpperCase().trim()
     case 'subject_keyword':
-      return signal.toLowerCase().trim()
+      return normalizeSubjectValue(signal)
     case 'compound': {
       // Two compound rules with the same conditions in different orders
-      // should be considered identical for conflict detection. Sort by
-      // (type, value) then re-stringify so the key is canonical.
-      const parsed = decodeCompound(signal)
-      if (!parsed) return signal
-      const sorted = [...parsed.conditions].sort((a, b) => {
-        if (a.type !== b.type) return a.type.localeCompare(b.type)
-        return a.value.toLowerCase().localeCompare(b.value.toLowerCase())
-      })
-      return JSON.stringify(sorted.map((c) => ({ type: c.type, value: c.value.toLowerCase().trim() })))
+      // should be considered identical for conflict detection. Canonicalize
+      // each value by its condition type, sort by (type, value), then
+      // re-stringify so the key is canonical.
+      const conds = compoundConditionsForKey(signal)
+      if (!conds) return signal
+      const canon = conds.map((c) => ({
+        type: c.type,
+        value:
+          c.type === 'domain'
+            ? normalizeDomain(c.value)
+            : c.type === 'sender'
+              ? c.value.toLowerCase().trim()
+              : normalizeSubjectValue(c.value),
+      }))
+      canon.sort((a, b) =>
+        a.type !== b.type ? a.type.localeCompare(b.type) : a.value.localeCompare(b.value),
+      )
+      return JSON.stringify(canon)
     }
   }
+  return signal
 }
 
 export function findConflicts(rules: Rule[]): RuleConflict[] {
@@ -2080,16 +2949,17 @@ function subjectIncludesBoundary(haystack: string, needle: string): boolean {
 
 /**
  * Minimum length (after `normalizeSubject`) for a subject to qualify
- * as a routing signal. Below this the subject is too generic ("通知"
- * alone, single-char placeholders) to safely match emails.
+ * as a LEARNED routing signal. Below this the subject is too generic
+ * ("通知", "請款通知", "季報") to safely match emails.
  *
- * 2 chars is intentionally permissive — when paired with a domain in
- * a compound rule the domain itself disambiguates. Pure subject_keyword
- * rules (no domain) would benefit from a higher threshold, but the
- * gate above (P5) for those only fires when no domain is available, so
- * we accept the same threshold for simplicity.
+ * Raised from 2 to MIN_NORMALIZED_SUBJECT_LEN (8) on 2026-11-05. "The
+ * domain anchor disambiguates" did not hold: a 2–7 char subject condition
+ * minted on first sight, substring-matched unrelated mail of the same
+ * domain / sender, and — being a compound — beat thread memory as well.
+ * 8 is also the floor thread memory uses, so a subject too short to be
+ * remembered is too short to become a permanent rule.
  */
-const MIN_SUBJECT_SIGNAL_LEN = 2
+const MIN_SUBJECT_SIGNAL_LEN = MIN_NORMALIZED_SUBJECT_LEN
 
 /**
  * Convert a raw email subject into a routing signal — the entire
@@ -2099,7 +2969,7 @@ const MIN_SUBJECT_SIGNAL_LEN = 2
  * prefixes stripped, lowercased, whitespace collapsed) so:
  *   - "Re: 關於甲公司股權移轉案" → "關於甲公司股權移轉案"
  *   - "FW: [External] Project Phoenix" → "project phoenix"
- *   - "Re: Re: 通知" → "通知"
+ *   - "Re: Re: 通知" → "" (too short to learn)
  *
  * Match-time semantics: `matchSubjectKeyword` does case-insensitive
  * substring match against the raw email subject. Since the signal is

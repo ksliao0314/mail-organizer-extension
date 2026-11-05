@@ -12,6 +12,8 @@ import {
   listRules,
   newRule,
   purgeExpiredClosedCaseRules,
+  toggleRule,
+  upsertRule,
 } from '@/shared/rules'
 import { setRules } from '@/shared/storage'
 import type { Rule } from '@/shared/types'
@@ -177,5 +179,64 @@ describe('Phase 2 — purgeExpiredClosedCaseRules 硬刪', () => {
     await setRules([broken])
     const { purged } = await purgeExpiredClosedCaseRules({ now: NOW })
     expect(purged).toBe(0)
+  })
+})
+
+// ---- 2026-11-05 (item 14): an explicit user re-enable is respected while the
+// folder stays archived. Before, toggleRule cleared the reason and the next
+// preflight retired the rule again (user_manual included) — the user could
+// never keep one. The exemption is carried by EXISTING synced fields only:
+// an ENABLED rule that still wears autoDisabledReason 'case_closed'.
+describe('Phase 1 — 使用者手動復職的豁免標記', () => {
+  async function retiredUnderArchive(over: Partial<Rule> = {}): Promise<Rule> {
+    const r = rule({ targetFolderPath: `${ARCHIVE}/某案`, ...over })
+    await setRules([r])
+    await applyClosedCaseRetirement([ARCHIVE], { now: NOW })
+    return (await listRules())[0]!
+  }
+
+  it('user re-enable while archived → stays enabled through the next retirement pass', async () => {
+    const retired = await retiredUnderArchive({ source: 'user_manual' })
+    expect(retired.enabled).toBe(false)
+    const reenabled = await toggleRule(retired.id, true, { actor: 'user' })
+    expect(reenabled!.enabled).toBe(true)
+    expect(reenabled!.autoDisabledReason).toBe('case_closed') // the exemption marker
+    expect(reenabled!.autoDisabledAt).toBeUndefined()
+    const second = await applyClosedCaseRetirement([ARCHIVE], { now: NOW })
+    expect(second.retired).toBe(0) // was 1
+    expect((await listRules())[0]!.enabled).toBe(true)
+  })
+
+  it('the marker is dropped once the folder leaves the archive (a later re-archive retires normally)', async () => {
+    const retired = await retiredUnderArchive()
+    await toggleRule(retired.id, true, { actor: 'user' })
+    const moved = (await listRules())[0]!
+    await setRules([{ ...moved, targetFolderPath: '03進行中案件/某案' }])
+    await applyClosedCaseRetirement([ARCHIVE], { now: NOW })
+    const out = (await listRules())[0]!
+    expect(out.enabled).toBe(true)
+    expect(out.autoDisabledReason).toBeUndefined()
+    await setRules([{ ...out, targetFolderPath: `${ARCHIVE}/某案` }])
+    const again = await applyClosedCaseRetirement([ARCHIVE], { now: NOW })
+    expect(again.retired).toBe(1)
+  })
+
+  it('a user disable of an exempt rule drops the marker (un-archiving must not re-enable it)', async () => {
+    const retired = await retiredUnderArchive()
+    await toggleRule(retired.id, true, { actor: 'user' })
+    await toggleRule(retired.id, false, { actor: 'user' })
+    const off = (await listRules())[0]!
+    expect(off.autoDisabledReason).toBeUndefined()
+    await setRules([{ ...off, targetFolderPath: '03進行中案件/某案' }])
+    const r = await applyClosedCaseRetirement([ARCHIVE], { now: NOW })
+    expect(r.revived).toBe(0)
+    expect((await listRules())[0]!.enabled).toBe(false)
+  })
+
+  it('re-enabling through the rule form sets the same marker', async () => {
+    const retired = await retiredUnderArchive()
+    const saved = await upsertRule({ ...retired, enabled: true }, { actor: 'user', mode: 'edit' })
+    expect(saved.autoDisabledReason).toBe('case_closed')
+    expect((await applyClosedCaseRetirement([ARCHIVE], { now: NOW })).retired).toBe(0)
   })
 })

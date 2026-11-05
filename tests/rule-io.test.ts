@@ -327,3 +327,93 @@ describe('applyImport', () => {
     expect(result).toHaveLength(0)
   })
 })
+
+// ---- 2026-11-05 -------------------------------------------------------------
+
+describe('import merge keys on id, then the canonical triple (item 11)', () => {
+  it('repro: an older backup of an EDITED rule no longer lands as a second row with the same id', () => {
+    const edited = rule({ id: 'r-1', signal: 'new-signal.com', targetFolderPath: 'X/New', matchCount: 40 })
+    const backupCopy = rule({ id: 'r-1', signal: 'old-signal.com', targetFolderPath: 'X/Old' })
+    const merged = applyImport([edited], [backupCopy], 'merge')
+    expect(merged).toEqual([edited])
+    expect(previewImport([edited], [backupCopy])).toMatchObject({ duplicateCount: 1, newCount: 0 })
+  })
+
+  it('canonical triple: @-prefixed / padded / differently-cased signals are the same rule', () => {
+    const existing = [rule({ signal: 'client.example' })]
+    const imported = [rule({ signal: ' @Client.Example ' })]
+    expect(applyImport(existing, imported, 'merge')).toHaveLength(1)
+  })
+
+  it('a same-signal rule for a DIFFERENT target is a distinct rule and is added', () => {
+    const existing = [rule({ signal: 'client.example', targetFolderPath: 'X/A' })]
+    const imported = [rule({ signal: 'client.example', targetFolderPath: 'X/B' })]
+    expect(applyImport(existing, imported, 'merge')).toHaveLength(2)
+  })
+
+  it('duplicate ids inside the file collapse to the first copy (merge and replace)', () => {
+    const a = rule({ id: 'dup', signal: 'a.com' })
+    const b = rule({ id: 'dup', signal: 'b.com' })
+    expect(applyImport([], [a, b], 'merge').map((r) => r.signal)).toEqual(['a.com'])
+    expect(applyImport([], [a, b], 'replace').map((r) => r.signal)).toEqual(['a.com'])
+  })
+})
+
+describe('compound validation at import (item 10)', () => {
+  const payloadWith = (signal: string) =>
+    JSON.stringify({
+      type: RULE_PAYLOAD_TYPE,
+      schemaVersion: 2,
+      rules: [rule({ type: 'compound', signal })],
+    })
+
+  it('rejects conditions with a non-string value, unknown type, or no conditions', () => {
+    for (const bad of [
+      '{"conditions":[{"type":"domain","value":123}]}',
+      '{"conditions":[{"type":"body","value":"x"}]}',
+      '{"conditions":[]}',
+      '{"conditions":"nope"}',
+      'not json',
+    ]) {
+      const r = parseRulesPayload(payloadWith(bad))
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.error).toMatch(/第 1 筆規則 signal/)
+    }
+  })
+
+  it('accepts a well-formed compound', () => {
+    const r = parseRulesPayload(
+      payloadWith('{"conditions":[{"type":"domain","value":"a.com"},{"type":"subject_keyword","value":"合約審閱意見"}]}'),
+    )
+    expect(r.ok).toBe(true)
+  })
+})
+
+describe('new auto-disable reasons survive import (2026-11-05)', () => {
+  it("round-trips 'superseded' and 'override'", () => {
+    const json = serializeRules(
+      [
+        rule({ signal: 's.com', enabled: false, autoDisabledReason: 'superseded', autoDisabledAt: '2026-10-01T00:00:00.000Z' }),
+        rule({ signal: 'o.com', enabled: false, autoDisabledReason: 'override', autoDisabledAt: '2026-10-01T00:00:00.000Z' }),
+      ],
+      '0.0.1',
+    )
+    const r = parseRulesPayload(json)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.rules.map((x) => x.autoDisabledReason)).toEqual(['superseded', 'override'])
+  })
+})
+
+describe('imported tombstones are stored in canonical form (item 15)', () => {
+  it('a legacy full-form court-case tombstone is re-canonicalized', () => {
+    const json = serializeRules([], '0.0.1', [
+      { type: 'subject_keyword', signalNorm: '112年度訴字第304號', targetFolderPath: 'X/Y', deletedAt: 1 },
+      { type: 'domain', signalNorm: '@Client.Example', targetFolderPath: 'X/Y', deletedAt: 1 },
+    ])
+    const r = parseRulesPayload(json)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.tombstones.map((t) => t.signalNorm)).toEqual(['112訴304', 'client.example'])
+  })
+})

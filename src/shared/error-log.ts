@@ -9,7 +9,8 @@
 // Design:
 //   - One module-level helper `logError(source, message, context?)`.
 //   - Capped at ERROR_LOG_CAP entries, oldest evicted FIFO.
-//   - Read via `getErrorLog(limit?)`; clear via `clearErrorLog()`.
+//   - Read via `getErrorLog(limit?)`; clear via `clearErrorLog()` (both
+//     writers serialize on the same lock).
 //   - The Options page hosts a card showing recent entries + filter.
 //
 // Source codes are domain-prefixed strings ('sync:push', 'classify:api',
@@ -100,5 +101,12 @@ export async function getErrorLog(limit?: number): Promise<ErrorLogEntry[]> {
 }
 
 export async function clearErrorLog(): Promise<void> {
-  await chrome.storage.local.remove(KEY)
+  // (2026-11-05) Take the append lock. A bare remove() landing between an
+  // in-flight logError's read and its set() was undone by that set(): the
+  // append re-wrote the whole pre-clear list plus its new entry, so the user's
+  // 「清除」 silently brought every old entry back. Same fix as clearRuleHistory
+  // (audit G2).
+  await withErrorLogLock(async () => {
+    await chrome.storage.local.remove(KEY)
+  })
 }

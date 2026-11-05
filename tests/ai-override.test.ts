@@ -391,3 +391,36 @@ describe('generateAiOverrideRules — audit trail', () => {
     expect(after).toBe(before)
   })
 })
+
+// ---- 2026-11-05 (item 12): override-minted rules respect the per-type cap.
+// This path wrote 0.95 straight through, above the sender (0.75) and
+// subject_keyword (0.9) ceilings every other write enforces.
+describe('generateAiOverrideRules — applyConfidenceCap', () => {
+  it('a sender rule is capped at 0.75', async () => {
+    const item = planItem({
+      emailFrom: 'andy@gmail.com', // generic provider → exact-sender signal
+      targetFolderPath: '03/Right',
+      aiOriginalAction: 'move',
+      aiOriginalTargetFolderPath: '03/Wrong',
+    })
+    const r = await generateAiOverrideRules([item], [result(item.emailId, 'moved')])
+    expect(r.added).toBe(1)
+    const [created] = await listRules()
+    expect(created!.type).toBe('sender')
+    expect(created!.confidence).toBe(0.75) // was 0.95
+  })
+
+  it('a court-case subject_keyword rule is capped at 0.9', async () => {
+    const item = planItem({
+      emailSubject: '112年度訴字第204號 開庭通知',
+      emailFrom: 'clerk', // no usable domain → P2 pure case-number rule
+      targetFolderPath: '03/Right',
+      aiOriginalAction: 'move',
+      aiOriginalTargetFolderPath: '03/Wrong',
+    })
+    await generateAiOverrideRules([item], [result(item.emailId, 'moved')])
+    const [created] = await listRules()
+    expect(created!.type).toBe('subject_keyword')
+    expect(created!.confidence).toBe(0.9)
+  })
+})

@@ -15,10 +15,16 @@ import {
   extractCourtCaseNumbers,
   extractDomain,
   isGenericProviderDomain,
+  isRevivableAutoDisabled,
   listRules,
   newRule,
+  normalizeSignal,
 } from '@/shared/rules'
-import { recordConversationFilings, recordSubjectFilings } from '@/shared/storage'
+import {
+  getMailboxIdentity,
+  recordConversationFilings,
+  recordSubjectFilings,
+} from '@/shared/storage'
 import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from '@/shared/normalize'
 import type { MailFolderNode, Rule } from '@/shared/types'
 import { holdKeepAlive, releaseKeepAlive } from './keep-alive'
@@ -180,8 +186,23 @@ export async function startInitialScan(opts: {
     if (!d) return false
     return internalDomainSet.has(d.toLowerCase())
   }
-  if (scanStartInFlight || (await isScanRunning())) throw new Error('已有掃描中的批次')
+  // Check AND set the guard synchronously, before the first await
+  // (2026-11-05, invariant 6). The old `scanStartInFlight || (await
+  // isScanRunning())` only flipped the flag AFTER the await, so two
+  // overlapping calls both read false and both started.
+  if (scanStartInFlight) throw new Error('已有掃描中的批次')
   scanStartInFlight = true
+  let running = false
+  try {
+    running = await isScanRunning()
+  } catch (e) {
+    scanStartInFlight = false
+    throw e
+  }
+  if (running) {
+    scanStartInFlight = false // we never started — release our claim
+    throw new Error('已有掃描中的批次')
+  }
 
   const flat = flattenFolderTree(tree)
   const targets = flat.filter((n) => {
@@ -292,26 +313,32 @@ export async function startInitialScan(opts: {
     await saveScanState(state)
 
     // Snapshot existing rules for dedup. Build a fast key set for O(1)
-    // lookups. Tracks domain / case_code / compound / subject_keyword so a
-    // follow-up scan doesn't produce duplicates for these auto-derived kinds.
+    // lookups so a follow-up scan doesn't produce duplicates for these
+    // auto-derived kinds. Keys use normalizeSignal (2026-11-05) — the same
+    // canonical identity addRulesFilteringTombstones dedups on — instead of
+    // per-type ad-hoc folding (raw compound JSON missed reordered or
+    // differently-spelled conditions).
+    //
+    // A rule the engine auto-disabled for a revivable reason ('superseded',
+    // 'override', 'high-error-rate'…) is NOT "known": the scan re-derives it
+    // and addRulesFilteringTombstones switches it back on (unless a live rule
+    // now routes the same signal elsewhere). Counting it as known left the
+    // revive branch unreachable (2026-11-05). User-disabled rules stay known.
     const existing = await listRules()
+    const scanKey = (type: Rule['type'], signal: string, folderId: string) =>
+      `${type}::${normalizeSignal(type, signal)}::${folderId}`
     const knownKeys = new Set<string>()
     for (const r of existing) {
-      if (r.type === 'domain') {
-        const dom = r.signal.toLowerCase().replace(/^@/, '')
-        knownKeys.add(`domain::${dom}::${r.targetFolderId}`)
-      } else if (r.type === 'case_code') {
-        knownKeys.add(`case_code::${r.signal.toUpperCase().trim()}::${r.targetFolderId}`)
-      } else if (r.type === 'compound') {
-        // Use the raw (canonical) signal string — encodeCompound produces a
-        // stable JSON serialization so it's safe to compare directly.
-        knownKeys.add(`compound::${r.signal}::${r.targetFolderId}`)
-      } else if (r.type === 'subject_keyword') {
-        knownKeys.add(`subject_keyword::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
-      } else if (r.type === 'sender') {
-        knownKeys.add(`sender::${r.signal.toLowerCase().trim()}::${r.targetFolderId}`)
-      }
+      if (isRevivableAutoDisabled(r)) continue
+      knownKeys.add(scanKey(r.type, r.signal, r.targetFolderId))
     }
+    // The signed-in mailbox's own domain is internal by definition
+    // (2026-11-05): with internalDomains empty (the default) the scan
+    // counted colleagues' mail filed into case folders and could mint
+    // `domain: <own domain>` — a rule the owner's address on To/Cc lets
+    // match nearly every inbound email. Treat it like internalDomains.
+    const identity = await getMailboxIdentity().catch(() => null)
+    if (identity?.domain) internalDomainSet.add(identity.domain)
 
     currentController = controller
     await holdKeepAlive()
@@ -447,7 +474,7 @@ export async function startInitialScan(opts: {
             reportedCaseCodes.push({ code, count, added: false })
             continue
           }
-          const key = `case_code::${code}::${node.id}`
+          const key = scanKey('case_code', code, node.id)
           if (knownKeys.has(key)) {
             reportedCaseCodes.push({ code, count, added: false })
             continue
@@ -476,7 +503,7 @@ export async function startInitialScan(opts: {
             { type: 'domain', value: domain },
             { type: 'subject_keyword', value: courtCase },
           ])
-          const key = `compound::${signal}::${node.id}`
+          const key = scanKey('compound', signal, node.id)
           if (knownKeys.has(key)) {
             reportedCompounds.push({ domain, courtCase, count, added: false })
             continue
@@ -630,7 +657,7 @@ export async function startInitialScan(opts: {
         if (isGenericProviderDomain(domain)) continue
         const cand = findUniqueFolderCandidate(domain, folderDomainSnap, MIN_COUNT)
         if (!cand) continue
-        const key = `domain::${domain}::${cand.folderId}`
+        const key = scanKey('domain', domain, cand.folderId)
         if (knownKeys.has(key)) continue
         // Confidence scales with count, capped at DOMAIN_MAX_CONFIDENCE
         // (0.65) — even folder-unique domains can hide same-client-
@@ -683,7 +710,7 @@ export async function startInitialScan(opts: {
       for (const address of allSenders) {
         const cand = findUniqueFolderCandidate(address, folderSenderSnap, MIN_COUNT_SENDER)
         if (!cand) continue
-        const key = `sender::${address}::${cand.folderId}`
+        const key = scanKey('sender', address, cand.folderId)
         if (knownKeys.has(key)) continue
         buffer.push(
           newRule({

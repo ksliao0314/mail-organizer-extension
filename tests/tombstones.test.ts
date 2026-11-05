@@ -276,10 +276,12 @@ describe('autoDisableStaleRules — high error rate branch', () => {
     })
   }
 
-  it('disables rule with matchCount ≥ 20 and overrideRate ≥ 0.5', async () => {
-    // Build a rule with 20 hits and 12 overrides (60% error)
+  it('disables rule with ≥ 20 fires and overrides ≥ 50% of them', async () => {
+    // 10 accepted hits + 12 overrides = 22 fires, 55% overridden. (Rates
+    // are over ALL fires since 2026-11-05 — the old fixture, 20 hits + 12
+    // overrides, is really 12/32 = 37.5% wrong and is now kept.)
     const r = staleRule({ signal: 'badroute.com' })
-    r.matchCount = 20
+    r.matchCount = 10
     r.overrideCount = 12
     await addRules([r])
 
@@ -318,11 +320,11 @@ describe('autoDisableStaleRules — high error rate branch', () => {
     expect(after?.enabled).toBe(true)
   })
 
-  it('requires minimum sample (20) before high-error-rate disable', async () => {
-    // 10 hits, 8 overrides (80% error but only 10 samples).
+  it('requires minimum sample (20 fires) before high-error-rate disable', async () => {
+    // 2 hits, 16 overrides (89% error but only 18 fires).
     const r = staleRule({ signal: 'newrule.com' })
-    r.matchCount = 10
-    r.overrideCount = 8
+    r.matchCount = 2
+    r.overrideCount = 16
     await addRules([r])
     await autoDisableStaleRules({ now: Date.now(), staleDays: 365 })
     const after = (await listRules()).find((rr) => rr.id === r.id)

@@ -1,10 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, type Mock } from 'vitest'
+import { clearErrorLog, getErrorLog, logError } from '@/shared/error-log'
 import {
   addFolderToCache,
   addToSkipHistory,
   getFolderActivity,
   getFolderCache,
   getSkipHistory,
+  getStorageTopKeys,
+  getStorageUsage,
   getSubjectMemory,
   mergeFolderActivityScan,
   recordFolderActivityFromBatch,
@@ -303,5 +306,102 @@ describe('folderActivity.latestMessage preservation', () => {
     const activity = await getFolderActivity()
     const row = activity.find((r) => r.folderId === 'f2')
     expect(row?.latestMessage?.subject).toBe('new subject')
+  })
+})
+
+// ---- error log: clear vs in-flight append (2026-11-05) ---------------------
+//
+// clearErrorLog did a bare remove() outside the append lock. A clear landing
+// between an in-flight logError's read and its set() was undone: the append
+// re-wrote the whole pre-clear list plus its new entry.
+describe('clearErrorLog takes the append lock', () => {
+  it('a clear issued while an append is mid read-modify-write is not undone', async () => {
+    await chrome.storage.local.set({
+      errorLog: [
+        { at: '2026-11-01T00:00:00.000Z', source: 'old:a', message: 'old A' },
+        { at: '2026-11-01T00:00:01.000Z', source: 'old:b', message: 'old B' },
+      ],
+    })
+    // Hold logError's read open so the clear lands between its read and set.
+    const get = chrome.storage.local.get as unknown as Mock<
+      (keys?: unknown) => Promise<Record<string, unknown>>
+    >
+    const realGet = get.getMockImplementation()!
+    let releaseRead!: () => void
+    const readGate = new Promise<void>((r) => {
+      releaseRead = r
+    })
+    let readStarted = false
+    get.mockImplementationOnce(async (keys) => {
+      readStarted = true
+      const v = await realGet(keys)
+      await readGate
+      return v
+    })
+    try {
+      const appending = logError('new:c', 'new C')
+      while (!readStarted) await new Promise((r) => setTimeout(r, 0))
+      const clearing = clearErrorLog()
+      releaseRead()
+      await Promise.all([appending, clearing])
+    } finally {
+      get.mockImplementation(realGet)
+    }
+    // The user's clear came after the append began → nothing survives, in
+    // particular not the pre-clear entries the append had already read.
+    expect(await getErrorLog()).toEqual([])
+  })
+})
+
+// ---- storage quota: read the real one (2026-11-05) -------------------------
+describe('getStorageUsage / getStorageTopKeys', () => {
+  type RuntimeStub = { getManifest?: () => { permissions?: string[] } }
+  const g = globalThis as unknown as { chrome: { runtime?: RuntimeStub } }
+
+  it('measures against chrome.storage.local.QUOTA_BYTES, not a hard-coded 5 MB', async () => {
+    const area = chrome.storage.local as unknown as { QUOTA_BYTES: number }
+    const saved = area.QUOTA_BYTES
+    area.QUOTA_BYTES = 10 * 1024 * 1024
+    try {
+      await chrome.storage.local.set({ blob: 'x'.repeat(5 * 1024 * 1024) })
+      const u = await getStorageUsage()
+      expect(u.quotaBytes).toBe(10 * 1024 * 1024)
+      // 5 MB of 10 MB: ~50%, NOT "100% / approaching" as the 5 MB constant said.
+      expect(u.percentUsed).toBeGreaterThan(0.49)
+      expect(u.percentUsed).toBeLessThan(0.51)
+      expect(u.approaching).toBe(false)
+
+      await chrome.storage.local.set({ blob2: 'y'.repeat(3.5 * 1024 * 1024) })
+      expect((await getStorageUsage()).approaching).toBe(true)
+    } finally {
+      area.QUOTA_BYTES = saved
+    }
+  })
+
+  it('reports no quota (and never warns) under unlimitedStorage', async () => {
+    const saved = g.chrome.runtime
+    g.chrome.runtime = { getManifest: () => ({ permissions: ['storage', 'unlimitedStorage'] }) }
+    try {
+      await chrome.storage.local.set({ blob: 'x'.repeat(200_000) })
+      const u = await getStorageUsage()
+      expect(u.quotaBytes).toBeNull()
+      expect(u.percentUsed).toBeNull()
+      expect(u.approaching).toBe(false)
+      expect(u.bytesInUse).toBeGreaterThan(200_000)
+    } finally {
+      g.chrome.runtime = saved
+    }
+  })
+
+  it('lists the biggest keys by name only, biggest first, capped', async () => {
+    await chrome.storage.local.set({
+      settings: { claudeApiKey: 'sk-ant-api03-SECRET' },
+      rules: Array.from({ length: 50 }, (_, i) => ({ id: `r${i}`, signal: 'x'.repeat(40) })),
+      metrics: { moved: 1 },
+    })
+    const top = await getStorageTopKeys(2)
+    expect(top.map((t) => t.key)).toEqual(['rules', 'settings'])
+    expect(top[0]!.bytes).toBeGreaterThan(top[1]!.bytes)
+    expect(JSON.stringify(await getStorageTopKeys())).not.toContain('sk-ant')
   })
 })

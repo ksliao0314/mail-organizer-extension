@@ -122,9 +122,31 @@ export type Rule = {
    *     rules, which stay soft-disabled forever. SYMMETRIC: moving the
    *     folder back OUT of the archive tree auto-re-enables the rule on
    *     the next preflight / sweep.
+   *   - 'override' (2026-11-05): one-strike disable of a structural rule
+   *     after the user re-targeted the mail it routed.
+   *   - 'superseded' (2026-11-05): a broad rule silenced because a narrower
+   *     rule now covers its traffic.
    * Cleared along with `autoDisabledAt` on user re-enable.
+   * Sync wire codes are append-only (sync-codec.ts REASON_TO_CODE).
    */
-  autoDisabledReason?: 'stale' | 'high-error-rate' | 'legacy_token' | 'case_closed'
+  autoDisabledReason?:
+    | 'stale'
+    | 'high-error-rate'
+    | 'legacy_token'
+    | 'case_closed'
+    | 'override'
+    | 'superseded'
+  /**
+   * Logical last-edit time (epoch ms) of this rule's SEMANTIC fields — type,
+   * signal, target, confidence, enabled, source, auto-disable state, orphaned
+   * (2026-11-05). Stamped ONLY by `mutateRules` (rules.ts) when one of those
+   * fields actually changes, or when the rule is new; hit counters
+   * (matchCount / overrideCount / lastUsedAt) never stamp it. Cross-machine
+   * sync merges per rule id by it: the copy with the newer editedAt supplies
+   * the semantic fields (tie → cloud), so a stale copy can no longer revert a
+   * newer edit. Absent on rules last written before v1.0.8 (treated as 0).
+   */
+  editedAt?: number
 }
 
 // Plan items ------------------------------------------------------------------
@@ -408,6 +430,14 @@ export type Metrics = {
 export type FolderCache = {
   updatedAt: string
   tree: MailFolderNode[]
+  /**
+   * Ids of the well-known folders (Deleted Items, Junk, Drafts, Outbox,
+   * Sent Items) whose subtrees fetchFolderTree left OUT of `tree`
+   * (2026-11-05). Execute refuses moves into them / their descendants.
+   * Absent on caches written before that change (execute then resolves the
+   * ids itself).
+   */
+  excludedFolderIds?: string[]
 }
 
 /**
@@ -536,11 +566,18 @@ export type ExecuteItemResult = {
   action: PlanAction
   status: ExecuteItemStatus
   message?: string
-  // Move / folder_created outcomes only. Outlook returns a NEW Id after
-  // the move; the undo snapshot needs this new Id.
+  // Move / folder_created / deleted outcomes. Outlook returns a NEW Id after
+  // the move (a delete is a move into Deleted Items since 2026-11-05); the
+  // undo snapshot needs this new Id.
   newMessageId?: string
   destinationFolderId?: string
   destinationFolderPath?: string
+  /**
+   * Outlook answered 404 ErrorItemNotFound — the id is provably dead
+   * (2026-11-05: persisted so SW-death recovery can replay the
+   * recentlyProcessed ledger for it exactly like the normal path).
+   */
+  alreadyGone?: boolean
 }
 
 export type ExecuteSummary = {
@@ -591,7 +628,9 @@ export type ExecuteState = {
 // surfaces a prompt to fill them in.
 export const DEFAULT_SETTINGS: Settings = {
   claudeApiKey: '',
-  claudeModel: 'claude-sonnet-4-6',
+  // New installs only (2026-11-05); a stored known id is never migrated.
+  // Keep in sync with DEFAULT_CLAUDE_MODEL in claude-models.ts.
+  claudeModel: 'claude-sonnet-5-5',
   batchSize: 50,
   excludeFolderPrefixes: [],
   closedCasePrefixes: [],
@@ -621,10 +660,17 @@ export const DEFAULT_METRICS: Metrics = {
 
 /**
  * Records what an execute batch moved so it can be reversed within a short
- * undo window. Captured after execute completes — only moves are recorded
- * because Outlook DELETE moves the message to Recoverable Items (the user
- * can restore those from Outlook itself if needed), and rolling back a
- * folder creation would be more disruptive than leaving an empty folder.
+ * undo window. Captured when the batch's bookkeeping runs — BEFORE the
+ * executeState flips to inProgress=false (2026-11-05), so the DoneScreen's
+ * one-shot snapshot read on mount always finds it.
+ *
+ * Deletes ARE recorded (2026-11-05): a delete is now a move into Deleted
+ * Items (POST /move, DestinationId 'DeletedItems' — it used to be
+ * DELETE /me/messages/{id}, which lands in Recoverable Items, not the
+ * 「已刪除的郵件」 folder the UI promised), so 撤回 moves them back to the
+ * Inbox like any other move; those entries carry `deleted: true`. Folder
+ * creations are still not rolled back (more disruptive than leaving an
+ * empty folder).
  *
  * Stored in chrome.storage.local with a chrome.alarms expiry — local
  * persistence is more robust than session storage if the SW restarts during
@@ -643,6 +689,8 @@ export type UndoSnapshot = {
     subject: string
     destinationFolderId: string
     destinationFolderPath?: string
+    /** True for a delete (moved into Deleted Items) — no learning to reverse. */
+    deleted?: true
     /**
      * Learning-reversal keys (H2). Captured from the plan item so 撤回 can
      * also revert what the batch TAUGHT the system — without these, the
@@ -660,8 +708,12 @@ export type UndoSnapshot = {
    * (with tombstones, so the same wrong mapping isn't auto-re-learned).
    */
   mintedRuleIds?: string[]
-  /** For user messaging only — these are NOT undoable from here. */
+  /**
+   * Deletes in the batch (user messaging). Since 2026-11-05 the ones with a
+   * known new id are ALSO in `moves` (deleted: true) and are undoable.
+   */
   deletedCount: number
+  /** Folders created by the batch — NOT rolled back by undo. */
   newFolderCount: number
 }
 

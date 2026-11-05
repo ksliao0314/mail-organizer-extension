@@ -335,7 +335,8 @@ describe('rule CRUD', () => {
 // with high overrideCount (user keeps disagreeing) would still climb to 1.0
 // raw confidence, misleading the UI even though effectiveConfidence at
 // match-time already demoted it. Now the promotion only fires when
-// errorRate (overrideCount / matchCount) ≤ 0.2.
+// errorRate ≤ 0.2 — measured over ALL fires, overrideCount / (matchCount +
+// overrideCount), since 2026-11-05 (overrides never bump matchCount).
 describe('bumpRuleHits errorRate gate', () => {
   it('promotes confidence on healthy rules (low error rate)', async () => {
     const r1 = await upsertRule(rule({ confidence: 0.55, source: 'auto_scan' }))
@@ -348,14 +349,22 @@ describe('bumpRuleHits errorRate gate', () => {
 
   it('blocks promotion when error rate exceeds 20%', async () => {
     const r1 = await upsertRule(rule({ confidence: 0.55, source: 'auto_scan' }))
-    // Seed 5 overrides first
-    await bumpRuleOverrides(new Map([[r1.id, 5]]))
-    // Then 20 hits — errorRate = 5/20 = 25% → should NOT promote.
+    // Seed 6 overrides first
+    await bumpRuleOverrides(new Map([[r1.id, 6]]))
+    // Then 20 hits — errorRate = 6 / 26 fires ≈ 23% → should NOT promote.
     await bumpRuleHits(new Map([[r1.id, 20]]))
     const all = await listRules()
     expect(all[0]!.confidence).toBe(0.55)
     expect(all[0]!.matchCount).toBe(20)
-    expect(all[0]!.overrideCount).toBe(5)
+    expect(all[0]!.overrideCount).toBe(6)
+  })
+
+  it('rates over all fires: 5 overrides + 20 hits is exactly 20% → still promotes', async () => {
+    // Under the old overrides/matchCount ratio this read as 25%.
+    const r1 = await upsertRule(rule({ confidence: 0.55, source: 'auto_scan' }))
+    await bumpRuleOverrides(new Map([[r1.id, 5]]))
+    await bumpRuleHits(new Map([[r1.id, 20]]))
+    expect((await listRules())[0]!.confidence).toBeGreaterThan(0.55)
   })
 
   it('user_manual rules never get auto-promoted regardless of error rate', async () => {
@@ -521,7 +530,8 @@ describe('ruleBeatsThread precedence', () => {
 //
 // Returns the entire normalized subject (reply/forward prefixes stripped,
 // lowercased, whitespace collapsed) as a routing signal — or '' when the
-// normalized result is below MIN_SUBJECT_SIGNAL_LEN (2 chars).
+// normalized result is below MIN_SUBJECT_SIGNAL_LEN (= MIN_NORMALIZED_
+// SUBJECT_LEN, 8 chars since 2026-11-05; it was 2).
 //
 // Design: same-domain + same-normalized-subject → same case (user
 // couldn't distinguish them either). So routing accuracy via exactness,
@@ -532,8 +542,8 @@ describe('extractSubjectSignal', () => {
   })
 
   it('strips reply / forward / system prefixes (normalizeSubject behavior)', () => {
-    expect(extractSubjectSignal('Re: [External] 甲公司 詢問')).toBe('甲公司 詢問')
-    expect(extractSubjectSignal('Re: Re: Fw: 通知')).toBe('通知')
+    expect(extractSubjectSignal('Re: [External] 甲公司股權移轉 詢問')).toBe('甲公司股權移轉 詢問')
+    expect(extractSubjectSignal('Re: Re: Fw: 第二次開庭通知書')).toBe('第二次開庭通知書')
   })
 
   it('lowercases Latin segments and collapses whitespace', () => {
@@ -559,10 +569,15 @@ describe('extractSubjectSignal', () => {
     expect(extractSubjectSignal('Re: [External]')).toBe('')
   })
 
-  it('accepts 2-char minimum (paired with domain in compound rule)', () => {
-    // The compound rule (domain + subject) provides disambiguation, so
-    // even short subjects like "通知" qualify when paired with a domain.
-    expect(extractSubjectSignal('通知')).toBe('通知')
+  it('rejects subjects shorter than MIN_NORMALIZED_SUBJECT_LEN (8) — 2026-11-05', () => {
+    // Was a 2-char minimum ("the domain anchor disambiguates"). It didn't:
+    // a 2–7 char condition minted on first sight, substring-matched
+    // unrelated mail of the same domain and, as a compound, beat thread
+    // memory. 8 is also thread memory's own floor.
+    expect(extractSubjectSignal('通知')).toBe('')
+    expect(extractSubjectSignal('Re: 請款通知')).toBe('')
+    expect(extractSubjectSignal('1234567')).toBe('')
+    expect(extractSubjectSignal('12345678')).toBe('12345678')
   })
 
   it('is deterministic — same input always yields same signal', () => {
@@ -574,8 +589,9 @@ describe('extractSubjectSignal', () => {
     // matchSubjectKeyword does case-insensitive `includes`. Signal is
     // already prefix-stripped + lowercased, so a raw subject with reply
     // prefix matches via substring.
-    const signal = extractSubjectSignal('Re: 關於甲公司詢問')
-    const rawIncoming = 'Re: Re: 關於甲公司詢問'
+    const signal = extractSubjectSignal('Re: 關於甲公司股權詢問')
+    expect(signal).toBe('關於甲公司股權詢問')
+    const rawIncoming = 'Re: Re: 關於甲公司股權詢問'
     expect(rawIncoming.toLowerCase().includes(signal)).toBe(true)
   })
 })

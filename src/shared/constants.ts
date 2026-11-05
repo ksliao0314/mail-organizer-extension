@@ -68,8 +68,41 @@ export const TOMBSTONE_SYNC_CAP = 500
 /** folderActivity sync cap — only the most-recent entries propagate. */
 export const FOLDER_ACTIVITY_SYNC_CAP = 20
 
-/** Schema version of the cloud envelope. Bump on breaking change. */
-export const SYNC_SCHEMA_VERSION = 3
+/**
+ * Schema version of the cloud envelope. Bump on breaking change.
+ * v4 (2026-11-05): per-rule editedAt, pushId-stamped chunks (torn-read
+ * detection), disabled-rule stubs, compact compound / tombstone rows, wipe
+ * ids. A v4 client READS v1–v4 and WRITES v4; v3 clients refuse a v4 cloud
+ * (their own downgrade protection), which is the intended upgrade prompt.
+ */
+export const SYNC_SCHEMA_VERSION = 4
+
+/** Oldest cloud schema a pull can still read (union-merged, then rewritten as current). */
+export const SYNC_MIN_READABLE_SCHEMA_VERSION = 1
+
+/**
+ * Tombstones' first claim on the sync byte budget, as a share of
+ * SYNC_TOTAL_BUDGET_BYTES (2026-11-05). Newest deletions go first; they may
+ * spill past this share only into budget the rules leave unused — so a big
+ * deletion history can never crowd rules out of the cloud again.
+ */
+export const SYNC_TOMBSTONE_BUDGET_SHARE = 0.15
+
+/** Torn-read retry: a push's chunks can land after its meta (2026-11-05). */
+export const SYNC_TORN_RETRY_BASE_MS = 2000
+export const SYNC_TORN_RETRY_MAX_MS = 60_000
+/** Consecutive torn reads before the failure is surfaced in lastError. */
+export const SYNC_TORN_RETRY_MAX_ATTEMPTS = 6
+
+/** Failed-push retry backoff (doubling from base, capped). */
+export const SYNC_PUSH_RETRY_BASE_MS = 30_000
+export const SYNC_PUSH_RETRY_MAX_MS = 30 * 60_000
+/** chrome.storage.sync write-rate limits: per-minute and per-hour buckets. */
+export const SYNC_RATE_LIMIT_MINUTE_RETRY_MS = 65_000
+export const SYNC_RATE_LIMIT_HOUR_RETRY_MS = 10 * 60_000
+
+/** Delay before retrying, after SW start, a push that failed in a previous SW lifetime. */
+export const SYNC_STARTUP_RECONCILE_DELAY_MS = 3000
 
 /** Local backup-snapshot rotation. */
 export const MAX_BACKUPS = 5
@@ -107,10 +140,18 @@ export const SWEEP_MIN_INTERVAL_MS = 20 * 60 * 60 * 1000 // 20 h
 
 // ---- storage --------------------------------------------------------------
 
-/** chrome.storage.local default quota. */
-export const LOCAL_STORAGE_QUOTA_BYTES = 5 * 1024 * 1024
-/** Warn at this fraction of LOCAL_STORAGE_QUOTA_BYTES. */
+/**
+ * chrome.storage.local quota FALLBACK — only used when the runtime doesn't
+ * expose `chrome.storage.local.QUOTA_BYTES` (2026-11-05). Chrome 114+ (and
+ * Chromium Edge) default to 10 MB; this used to say 5 MB, so the usage meter
+ * reported twice the real fill and warned at 4 MB. With the `unlimitedStorage`
+ * permission there is no enforced quota at all (getStorageUsage → null).
+ */
+export const LOCAL_STORAGE_QUOTA_BYTES = 10 * 1024 * 1024
+/** Warn at this fraction of the effective local quota. */
 export const LOCAL_STORAGE_WARN_THRESHOLD = 0.8
+/** How many of the largest chrome.storage.local keys getStorageUsage lists. */
+export const STORAGE_USAGE_TOP_KEYS = 10
 
 /** Max tombstones to keep locally before FIFO eviction. */
 export const TOMBSTONE_CAP = 2000
@@ -141,8 +182,10 @@ export const RECENTLY_PROCESSED_CAP = 2000
 // message id of every mail WE moved, so the manual-filing harvester can exclude
 // our own moves. Unlike recentlyProcessed (source-side ids, 15-min TTL to
 // outlast propagation), the harvester may run days after a batch, so this
-// keeps entries for weeks.
-export const MOVED_BY_US_LEDGER_TTL_MS = 21 * 24 * 60 * 60 * 1000 // 21 days
+// keeps entries for weeks. MUST be ≥ THREAD_MEMORY_MAX_AGE_MS (2026-11-05):
+// at 21 days a 22-day-old own move was re-harvested as a "manual filing"
+// against a thread-memory entry that was still alive (90 days).
+export const MOVED_BY_US_LEDGER_TTL_MS = 90 * 24 * 60 * 60 * 1000 // 90 days
 export const MOVED_BY_US_LEDGER_CAP = 5000
 
 /** Recent-activity panel data store cap. */
@@ -167,6 +210,15 @@ export const DECAY_AFTER_STABLE = 5
 
 /** Emails per Claude API call. */
 export const AI_CHUNK_SIZE = 25
+
+/**
+ * Valid range for settings.batchSize (2026-11-05: enforced in storage on every
+ * read AND every merged write, not just in the SW setSettings handler — sync
+ * pull / backup restore bypass the handler). 0 meant every batch came back
+ * empty. 200 is the ceiling the handler has always applied.
+ */
+export const BATCH_SIZE_MIN = 1
+export const BATCH_SIZE_MAX = 200
 
 // ---- folders --------------------------------------------------------------
 

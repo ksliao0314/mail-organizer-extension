@@ -5,7 +5,8 @@
 //
 // Per-item handling:
 //   move        → POST /messages/{id}/move (uses targetFolderId, or resolves from path)
-//   delete      → DELETE /messages/{id}
+//   delete      → POST /messages/{id}/move into Deleted Items (2026-11-05 —
+//                 was DELETE, which lands in Recoverable Items, not 已刪除的郵件)
 //   new_folder  → POST createChildFolder (or top) + POST /messages/{id}/move
 //   skip        → no-op
 //
@@ -15,10 +16,22 @@
 //     source: 'ai_confirmed') if no equivalent rule already covers it.
 //     Skips senders on settings.internalDomains (firm-internal mail —
 //     colleagues send across many cases; domain-routing is misleading).
+//
+// Post-loop bookkeeping (ledgers, thread memory, rule hits / overrides,
+// learning, skipHistory, metrics, undo) lives in finalizeExecuteBatch, which
+// the SW-death recovery path replays from the persisted plan + results
+// (2026-11-05).
 
-import { findFolderByPath, joinFolderPath, OutlookApi, OutlookError } from '@/shared/outlook-api'
+import {
+  findFolderByPath,
+  flattenFolderTree,
+  joinFolderPath,
+  OutlookApi,
+  OutlookError,
+} from '@/shared/outlook-api'
 import {
   addRulesFilteringTombstones,
+  applyConfidenceCap,
   bumpRuleHits,
   bumpRuleOverrides,
   caseSignalsForLearning,
@@ -28,11 +41,13 @@ import {
   encodeCompound,
   extractSubjectSignal,
   isGenericProviderDomain,
+  isRevivableAutoDisabled,
   listRules,
   mutateRules,
   newRule,
   normalizeSignal,
-  toggleRule,
+  revivedRule,
+  tombstoneKey,
 } from '@/shared/rules'
 import {
   addFolderToCache,
@@ -43,6 +58,9 @@ import {
   addToSkipHistory,
   bumpMetrics,
   clearUndoSnapshot,
+  getFolderCache,
+  getMailboxIdentity,
+  type MailboxIdentity,
   getRuleTombstones,
   getSettings,
   getSubjectMemory,
@@ -60,12 +78,14 @@ import {
   type ExecuteItemResult,
   type ExecuteItemStatus,
   type ExecuteState,
+  type MailFolder,
   type MailFolderNode,
   type PlanItem,
   type Rule,
   type RuleEvent,
   type RuleLearnedDetail,
   type RuleSnapshot,
+  type ThreadMemoryEntry,
   type UndoSnapshot,
   UNDO_WINDOW_MS,
 } from '@/shared/types'
@@ -79,6 +99,26 @@ function isAbortError(e: unknown): boolean {
 // single service-worker lifetime; SW restart kills both the execute Promise
 // AND this controller together, so no consistency issue.
 let currentController: AbortController | null = null
+
+// The live batch's state object + its throttled writer (2026-11-05). The
+// loop reads the cancel flag from memory instead of re-reading storage per
+// item; requestCancel flips it here AND persists it.
+let runningState: ExecuteState | null = null
+let runningWriter: ExecuteStateWriter | null = null
+
+// Synchronous start guard (2026-11-05, CLAUDE.md invariant 6). The old
+// `await isExecuteRunning()` check-then-act let two overlapping starts both
+// pass before either persisted inProgress — repro: a 3-item plan sent 6
+// POST /move and ended "moved 0, skipped 3". Set before the first await; SW
+// idle-kill resets it, which is fine — the persisted inProgress flag (plus
+// recoverStaleExecuteState) covers restarts.
+let executeClaimed = false
+// Same idea for 撤回: a double trigger (click + `u` key) must not move the
+// snapshot's messages twice, and undo must not interleave with a batch.
+let undoInFlight = false
+// Concurrent recovery calls (module load + onInstalled/onStartup) share one
+// run — replaying the bookkeeping twice would double-count rule hits.
+let recoveryInFlight: Promise<{ recovered: boolean; stuck: number }> | null = null
 
 // Local helper type — not part of the persisted ExecuteState, just an
 // internal carrier for the result of executing one item.
@@ -121,7 +161,63 @@ async function saveExecuteState(state: ExecuteState): Promise<void> {
 }
 
 export async function clearExecuteState(): Promise<void> {
-  await chrome.storage.session.remove(STATE_KEY)
+  await chrome.storage.session.remove([STATE_KEY, FINALIZE_KEY])
+}
+
+// Throttled executeState persistence (2026-11-05). The loop used to do one
+// session read + two whole-state writes PER ITEM, each re-serialising the
+// full plan — O(n²) bytes per batch. Now writes are coalesced to at most one
+// per STATE_WRITE_INTERVAL_MS (trailing edge, so a long item still gets its
+// 'processing' row out within the interval) plus explicit flushes at the
+// points that matter (start, loop end, final). Field names are unchanged, so
+// getExecuteState consumers see the same shape.
+const STATE_WRITE_INTERVAL_MS = 500
+
+class ExecuteStateWriter {
+  private lastWriteAt = 0
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private chain: Promise<void> = Promise.resolve()
+
+  constructor(private readonly state: ExecuteState) {}
+
+  /** Ask for a write soon (throttled, trailing edge). */
+  touch(): void {
+    if (this.timer) return
+    const wait = this.lastWriteAt + STATE_WRITE_INTERVAL_MS - Date.now()
+    if (wait <= 0) {
+      void this.flush().catch((e) =>
+        console.warn('[mail-organizer] executeState write failed (non-fatal)', e),
+      )
+      return
+    }
+    this.timer = setTimeout(() => {
+      this.timer = null
+      void this.flush().catch((e) =>
+        console.warn('[mail-organizer] executeState write failed (non-fatal)', e),
+      )
+    }, wait)
+  }
+
+  /** Write now (after any write already in flight); rejects on failure. */
+  flush(): Promise<void> {
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
+    this.lastWriteAt = Date.now()
+    // Writes are chained so they land in order; each serialises the state as
+    // of when it actually runs (chrome.storage snapshots at call time).
+    const write = this.chain.then(() => saveExecuteState(this.state))
+    this.chain = write.catch(() => {})
+    return write
+  }
+
+  dispose(): void {
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
+  }
 }
 
 /**
@@ -131,10 +227,29 @@ export async function clearExecuteState(): Promise<void> {
  * applied server-side); items in `queued` become `cancelled` (never started,
  * shouldn't be counted as a failure). Without this, `isExecuteRunning()`
  * would block the next batch forever.
+ *
+ * 2026-11-05: the dead batch's post-loop bookkeeping (recentlyProcessed +
+ * moved-by-us ledgers, thread memory, rule hits / overrides, learning,
+ * skipHistory, folder activity, metrics, active day, undo snapshot) is now
+ * replayed through the SAME finalizeExecuteBatch the normal path uses, from
+ * the persisted plan + results (which carry newMessageId / destination).
+ * Previously only recentlyProcessed, metrics and the active day survived an
+ * idle-kill.
  */
-export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; stuck: number }> {
+export function recoverStaleExecuteState(): Promise<{ recovered: boolean; stuck: number }> {
+  if (!recoveryInFlight) {
+    recoveryInFlight = doRecoverStaleExecuteState().finally(() => {
+      recoveryInFlight = null
+    })
+  }
+  return recoveryInFlight
+}
+
+async function doRecoverStaleExecuteState(): Promise<{ recovered: boolean; stuck: number }> {
+  // A batch running in THIS worker is alive, not stale.
+  if (executeClaimed) return { recovered: false, stuck: 0 }
   const state = await getExecuteState()
-  if (!state?.inProgress) return { recovered: false, stuck: 0 }
+  if (!state?.inProgress || executeClaimed) return { recovered: false, stuck: 0 }
 
   let cancelledCount = 0
   let errorCount = 0
@@ -150,61 +265,35 @@ export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; 
     return r
   })
   const stuck = errorCount + cancelledCount
-
-  // Audit G4: the per-batch recentlyProcessed flush runs ONLY after the item
-  // loop completes (in startExecute). If the SW was idle-killed mid-batch,
-  // the emails that DID move/delete before the death were persisted into
-  // state.results (saved each iteration) but never reached the ledger — so
-  // within Outlook's eventual-consistency window the next batch's inbox
-  // listing can still return them with now-dead ids and re-process them →
-  // 404 ghost loop. Replay the ledger from the rows that actually completed.
-  const recoveredProcessedIds = state.results
-    .filter(
-      (r) =>
-        r.status === 'moved' ||
-        r.status === 'deleted' ||
-        r.status === 'folder_created',
-    )
-    .map((r) => r.emailId)
-    .filter(Boolean)
-  if (recoveredProcessedIds.length > 0) {
-    await addToRecentlyProcessed(recoveredProcessedIds).catch((e) =>
-      console.warn('[mail-organizer] recovery recentlyProcessed replay failed (non-fatal)', e),
-    )
-    // The killed batch still ran the matcher over real mail → active day.
-    await recordActiveDay(state.startedAt ?? Date.now()).catch((e) =>
-      console.warn('[mail-organizer] recovery recordActiveDay failed (non-fatal)', e),
-    )
-  }
-
-  // Flush the killed batch's completed work into lifetime metrics (audit
-  // P3): the normal bumpMetrics runs only after the item loop completes,
-  // so a mid-batch SW death silently dropped every already-moved/deleted
-  // count from the dashboard and weekly digest. Safe against double-count:
-  // the normal path persists inProgress=false BEFORE bumping, and this
-  // recovery only fires on inProgress===true — the two sites are mutually
-  // exclusive per batch.
-  await bumpMetrics({
-    moved: state.summary.moved,
-    deleted: state.summary.deleted,
-    foldersCreated: state.summary.foldersCreated,
-    errors: state.summary.errors + errorCount,
-  }).catch((e) =>
-    console.warn('[mail-organizer] recovery metrics flush failed (non-fatal)', e),
-  )
-
-  await saveExecuteState({
+  const recovered: ExecuteState = {
     ...state,
-    inProgress: false,
     cancelRequested: false,
-    finishedAt: state.finishedAt ?? Date.now(),
     results,
     summary: {
       ...state.summary,
       cancelled: state.summary.cancelled + cancelledCount,
       errors: state.summary.errors + errorCount,
     },
+  }
+  const plan = Array.isArray(state.plan) ? state.plan : []
+
+  // Safe against double-apply: the normal path only flips inProgress=false
+  // AFTER finalizeExecuteBatch completes, each finished step is recorded in
+  // the finalize marker (so a death mid-bookkeeping replays only the rest),
+  // and this recovery only fires on inProgress===true.
+  try {
+    await finalizeExecuteBatch(recovered, plan)
+  } catch (e) {
+    // Never let a bookkeeping bug strand the executor in inProgress=true.
+    console.warn('[mail-organizer] recovery bookkeeping failed (non-fatal)', e)
+  }
+
+  await saveExecuteState({
+    ...recovered,
+    inProgress: false,
+    finishedAt: state.finishedAt ?? Date.now(),
   })
+  await clearFinalizeMarker(state.startedAt)
   console.warn(
     `[mail-organizer] recovered stuck executeState: ${errorCount} error, ${cancelledCount} cancelled`,
   )
@@ -212,24 +301,42 @@ export async function recoverStaleExecuteState(): Promise<{ recovered: boolean; 
 }
 
 export async function requestCancel(): Promise<void> {
-  // Two-step write was racy: between read and write, a new batch could start
-  // and our naive replace would clobber the new state. Now we re-read inside
-  // the write and only flip cancelRequested when the same batch is still
-  // running. The in-memory controller abort still fires unconditionally —
-  // worst case it's a no-op against a stale controller, which is safe.
-  const state = await getExecuteState()
-  if (state && state.inProgress) {
-    const cur = await getExecuteState()
-    if (cur && cur.inProgress && cur.startedAt === state.startedAt) {
-      await saveExecuteState({ ...cur, cancelRequested: true })
-    }
+  // In-memory first (2026-11-05): the loop checks this object's flag, so the
+  // cancel takes effect at the next item boundary without a storage read;
+  // the in-flight request aborts via the controller. Persisting through the
+  // batch's own writer keeps writes ordered (no stale write can land after).
+  const live = runningState
+  if (live && live.inProgress) {
+    live.cancelRequested = true
     currentController?.abort()
+    const writer = runningWriter
+    await (writer ? writer.flush() : saveExecuteState(live)).catch((e) =>
+      console.warn('[mail-organizer] persisting cancel flag failed (non-fatal)', e),
+    )
+    return
   }
+  // No batch in this worker: only touch a persisted state that still claims
+  // to run (a dead batch awaiting recovery) — never clobber anything else.
+  const cur = await getExecuteState()
+  if (cur && cur.inProgress) {
+    await saveExecuteState({ ...cur, cancelRequested: true })
+  }
+  currentController?.abort()
+}
+
+/**
+ * Synchronous: a batch / retry has claimed the executor, or a 撤回 is
+ * replaying, in THIS worker — startExecute would refuse right now.
+ */
+export function isExecuteBusy(): boolean {
+  return executeClaimed || undoInFlight
 }
 
 export async function isExecuteRunning(): Promise<boolean> {
+  if (executeClaimed) return true
   const state = await getExecuteState()
-  return !!state?.inProgress
+  // Re-check after the await — a start may have claimed meanwhile.
+  return executeClaimed || !!state?.inProgress
 }
 
 function initialState(plan: PlanItem[]): ExecuteState {
@@ -256,71 +363,123 @@ export async function startExecute(
   tree: MailFolderNode[],
   api: OutlookApi,
 ): Promise<void> {
-  if (await isExecuteRunning()) {
-    throw new Error('已有批次執行中')
+  // Claim synchronously, BEFORE the first await (invariant 6).
+  if (executeClaimed) throw new Error('已有批次執行中')
+  if (undoInFlight) throw new Error('撤回進行中,請稍候再執行')
+  executeClaimed = true
+  let handedOff = false
+  try {
+    // Storage check kept for the SW-restart case (a persisted inProgress
+    // from a previous worker that recovery hasn't swept yet).
+    if ((await getExecuteState())?.inProgress) throw new Error('已有批次執行中')
+    handedOff = true
+    await runClaimedExecute(plan, tree, api)
+  } finally {
+    if (!handedOff) executeClaimed = false
   }
+}
 
-  // Dismiss any still-unexpired undo snapshot from the PREVIOUS batch
-  // (audit P3): captureUndoSnapshot early-returns when the new batch has
-  // zero moves, so without this a quick zero-move follow-up batch left
-  // the old banner alive — and clicking 撤回 would revert the WRONG
-  // batch's moves. Mirrors retryFailed's existing dismissUndo rationale.
-  await dismissUndo().catch(() => {})
+export type RetryFailedOutcome =
+  | { ok: true; started: number }
+  | { ok: false; code: 'ALREADY_RUNNING' | 'NO_PREV' | 'NO_FAILED' | 'NO_TREE'; message: string }
 
-  const state = initialState(plan)
-  await saveExecuteState(state)
-
-  // Execute new_folder items before everything else. This lets the popup
-  // expose pending folders as targets for later `move` items in the same plan
-  // — by the time those moves run, the real folder has been spliced into the
-  // in-memory tree, so path-based resolution finds it.
-  // state.results stays in original index order so the UI is unaffected.
-  const indexOrder: number[] = []
-  for (let i = 0; i < plan.length; i++) {
-    if (plan[i]!.action === 'new_folder') indexOrder.push(i)
+/**
+ * 「重試失敗項目」(2026-11-05: moved here from the SW handler so the
+ * executor is claimed synchronously BEFORE the handler's first await — two
+ * overlapping retries used to both pass `isExecuteRunning()`, and the second
+ * one's clearExecuteState could wipe the first one's freshly started state).
+ * Resolves once the retry batch has STARTED (fire-and-forget, like
+ * startExecute from the SW); the popup polls getExecuteState.
+ */
+export async function startRetryFailed(
+  api: OutlookApi,
+  loadTree: () => Promise<MailFolderNode[] | undefined>,
+): Promise<RetryFailedOutcome> {
+  if (executeClaimed || undoInFlight) {
+    return { ok: false, code: 'ALREADY_RUNNING', message: '已有批次執行中' }
   }
-  for (let i = 0; i < plan.length; i++) {
-    if (plan[i]!.action !== 'new_folder') indexOrder.push(i)
+  executeClaimed = true
+  let handedOff = false
+  try {
+    const prev = await getExecuteState()
+    if (prev?.inProgress) {
+      return { ok: false, code: 'ALREADY_RUNNING', message: '已有批次執行中' }
+    }
+    if (!prev || !prev.plan) {
+      return { ok: false, code: 'NO_PREV', message: '沒有可重試的批次' }
+    }
+    const failedItems: PlanItem[] = []
+    for (let i = 0; i < prev.results.length; i++) {
+      if (prev.results[i]?.status === 'error' && prev.plan[i]) failedItems.push(prev.plan[i]!)
+    }
+    if (failedItems.length === 0) {
+      return { ok: false, code: 'NO_FAILED', message: '沒有失敗項目' }
+    }
+    const tree = await loadTree()
+    if (!tree) {
+      return { ok: false, code: 'NO_TREE', message: '資料夾樹不存在，請先重新分類' }
+    }
+    // Discard the pending undo snapshot — its emails belong to the previous
+    // batch. Otherwise the retry's DoneScreen could still expose the stale
+    // "撤回" link pointing at the wrong batch's moves.
+    await dismissUndo()
+    await clearExecuteState()
+    handedOff = true
+    void runClaimedExecute(failedItems, tree, api).catch((err) =>
+      console.error('[mail-organizer] retryFailed failed', err),
+    )
+    return { ok: true, started: failedItems.length }
+  } finally {
+    if (!handedOff) executeClaimed = false
   }
+}
 
+/**
+ * The batch itself. Caller MUST hold the executor claim; this releases it.
+ */
+async function runClaimedExecute(
+  plan: PlanItem[],
+  tree: MailFolderNode[],
+  api: OutlookApi,
+): Promise<void> {
   const controller = new AbortController()
   currentController = controller
-  await holdKeepAlive()
-
-  // Tally rule hits as they happen, flush once at end. Atomic write of the
-  // accumulated bumps avoids 50+ sequential read-modify-write cycles.
-  const ruleHitTally = new Map<string, number>()
-  // Ids that 404'd ErrorItemNotFound during this batch — provably dead,
-  // recorded into the recentlyProcessed ledger alongside the successful
-  // moves (see the post-loop write).
-  const alreadyGoneIds: string[] = []
-  // Rule overrides: a rule fired at classify time but the user edited
-  // the resulting PlanItem before execute (changed action / target).
-  // Detected via item.source !== 'rule' but item.originalRuleId still
-  // present (PlanRow.tsx preserves it on edit via {...item} spread).
-  // Bumped on the underlying rule's overrideCount so we can compute
-  // empirical accuracy.
-  const ruleOverrideTally = new Map<string, number>()
-  // Thread memory writes: every successful move/folder_created teaches
-  // us "this conversation / subject was filed here". Pre-filter step in
-  // classifyPreflight uses this to short-circuit AI on follow-up
-  // emails. Two tallies because subject map tracks conflictCount —
-  // recordSubjectFilings handles the conflict logic.
-  const convFilings: Array<{ convId: string; folderId: string; folderPath: string }> = []
-  const subjectFilings: Array<{
-    normalizedSubject: string
-    folderId: string
-    folderPath: string
-  }> = []
-  // Moved-by-us ledger entries (harvester provenance) — the DESTINATION-side
-  // new id of every mail we move, so the harvester can exclude our own moves.
-  const movedByUsEntries: MovedByUsEntry[] = []
+  const state = initialState(plan)
+  runningState = state
+  const writer = new ExecuteStateWriter(state)
+  runningWriter = writer
+  let held = false
 
   try {
+    // Dismiss any still-unexpired undo snapshot from the PREVIOUS batch
+    // (audit P3): captureUndoSnapshot early-returns when the new batch has
+    // zero moves, so without this a quick zero-move follow-up batch left
+    // the old banner alive — and clicking 撤回 would revert the WRONG
+    // batch's moves. Mirrors retryFailed's existing dismissUndo rationale.
+    await dismissUndo().catch(() => {})
+    await writer.flush()
+
+    // Execute new_folder items before everything else. This lets the popup
+    // expose pending folders as targets for later `move` items in the same plan
+    // — by the time those moves run, the real folder has been spliced into the
+    // in-memory tree, so path-based resolution finds it.
+    // state.results stays in original index order so the UI is unaffected.
+    const indexOrder: number[] = []
+    for (let i = 0; i < plan.length; i++) {
+      if (plan[i]!.action === 'new_folder') indexOrder.push(i)
+    }
+    for (let i = 0; i < plan.length; i++) {
+      if (plan[i]!.action !== 'new_folder') indexOrder.push(i)
+    }
+
+    await holdKeepAlive()
+    held = true
+    const guard = new DestinationGuard(tree, api)
+
     for (const i of indexOrder) {
-      // Cancellation check between items (also catches abort mid-call below)
-      const live = await getExecuteState()
-      if (live?.cancelRequested) {
+      // Cancellation check between items — in memory (2026-11-05); the
+      // in-flight call below is interrupted by the controller.
+      if (state.cancelRequested || controller.signal.aborted) {
         state.results[i] = { ...state.results[i]!, status: 'cancelled' }
         state.summary.cancelled++
         break
@@ -329,10 +488,10 @@ export async function startExecute(
       const item = plan[i]!
       state.current = i
       state.results[i] = { ...state.results[i]!, status: 'processing' }
-      await saveExecuteState(state)
+      writer.touch()
 
       try {
-        const outcome = await executeItem(item, tree, api, controller.signal)
+        const outcome = await executeItem(item, tree, api, controller.signal, guard)
         const { status, newMessageId, destinationFolderId, destinationFolderPath, message } = outcome
         state.results[i] = {
           ...state.results[i]!,
@@ -343,12 +502,12 @@ export async function startExecute(
           // Propagate the explanatory note (set on 404-as-skipped path,
           // possibly other graceful-degradation cases later).
           ...(message ? { message } : {}),
+          // 404 ErrorItemNotFound = positive confirmation this id is dead.
+          // Persisted (not just tallied) so both the normal bookkeeping and
+          // SW-death recovery feed it to the recentlyProcessed ledger —
+          // without that, a ghost entry Outlook keeps listing loops forever.
+          ...(outcome.alreadyGone ? { alreadyGone: true } : {}),
         }
-        // 404 ErrorItemNotFound = positive confirmation this id is dead.
-        // Collect for the recentlyProcessed ledger below — without this,
-        // a ghost entry that Outlook keeps listing would loop forever:
-        // 404 → soft-skip → never recorded → reappears next batch.
-        if (outcome.alreadyGone) alreadyGoneIds.push(item.emailId)
 
         if (status === 'moved') state.summary.moved++
         else if (status === 'deleted') state.summary.deleted++
@@ -356,117 +515,31 @@ export async function startExecute(
           state.summary.foldersCreated++
           state.summary.moved++ // also counts as a move
         } else if (status === 'skipped') state.summary.skipped++
-
-        if (
-          item.source === 'rule' &&
-          item.ruleId &&
-          (status === 'moved' || status === 'folder_created')
-        ) {
-          // Accumulate in-memory and flush once at batch end (see below).
-          // Previously each hit ran an isolated mutateRules() — for a 50-hit
-          // batch on a 1000-rule library that was 50 sequential storage
-          // write cycles, adding 5-10s to the batch.
-          ruleHitTally.set(item.ruleId, (ruleHitTally.get(item.ruleId) ?? 0) + 1)
-        } else if (
-          item.source !== 'rule' &&
-          item.originalRuleId &&
-          (status === 'moved' || status === 'folder_created' || status === 'deleted')
-        ) {
-          // The rule fired at classify time and the user then changed
-          // the action / target — count as an override against the
-          // originating rule. Status filter excludes skip (user opted
-          // out, not necessarily "rule was wrong") and execute errors.
-          ruleOverrideTally.set(
-            item.originalRuleId,
-            (ruleOverrideTally.get(item.originalRuleId) ?? 0) + 1,
-          )
-        }
-
-        // Thread-shadowed rule keep-alive (優化 2026-07). A broad rule that
-        // agreed with the thread route (agreeingRuleId) gets a hit credited
-        // — but only when the user DIDN'T edit the row (an edit means the
-        // rule/thread target was wrong, so don't reward it). Prevents the
-        // stale sweep from hard-deleting a silently-correct rule.
-        if (
-          item.source === 'thread' &&
-          item.agreeingRuleId &&
-          !item.userTouched &&
-          (status === 'moved' || status === 'folder_created')
-        ) {
-          ruleHitTally.set(
-            item.agreeingRuleId,
-            (ruleHitTally.get(item.agreeingRuleId) ?? 0) + 1,
-          )
-        }
-
-        // Thread memory writeback. Record convId + normalized subject
-        // for every successful move into a real folder. We do this even
-        // for thread-sourced rows so the entry's timesFiled keeps
-        // climbing (used by future tooling / debugging to spot strong
-        // patterns). destinationFolderId comes from the move result
-        // because Outlook assigns a NEW id after move — using
-        // item.targetFolderId would record the source-side id and
-        // pre-filter wouldn't match next batch.
-        if (
-          (status === 'moved' || status === 'folder_created') &&
-          destinationFolderId &&
-          destinationFolderPath
-        ) {
-          if (item.conversationId) {
-            convFilings.push({
-              convId: item.conversationId,
-              folderId: destinationFolderId,
-              folderPath: destinationFolderPath,
-            })
-          }
-          const normalized = normalizeSubject(item.emailSubject ?? '')
-          if (normalized.length >= MIN_NORMALIZED_SUBJECT_LEN) {
-            subjectFilings.push({
-              normalizedSubject: normalized,
-              folderId: destinationFolderId,
-              folderPath: destinationFolderPath,
-            })
-          }
-          // Ledger uses the DESTINATION-side new id (harvester scans the
-          // destination folder, so only the post-move id can match).
-          if (newMessageId) {
-            movedByUsEntries.push({
-              newMessageId,
-              destinationFolderId,
-              conversationId: item.conversationId,
-              normalizedSubject: normalized.length > 0 ? normalized : undefined,
-              movedAt: Date.now(),
-            })
-          }
-        }
       } catch (e) {
         if (isAbortError(e)) {
           state.results[i] = { ...state.results[i]!, status: 'cancelled' }
           state.summary.cancelled++
-          await saveExecuteState(state)
           break
         }
         // F5 (2026-06-03): a non-idempotent op (move/delete) that failed
         // with `uncertain` — the request reached Outlook and MAY have
         // committed server-side before the response was lost (network
-        // blip / 5xx). outlook-api deliberately does NOT retry these
-        // (retrying would 404 on the now-stale id). Marking them as a
-        // hard `error` is wrong: it shows a scary red row AND makes the
-        // item a 重試 candidate, reproducing the exact "已經移動成功卻叫我
-        //再歸檔" loop this whole fix targets. Treat as a soft skip with
-        // an honest "needs confirmation" note — the email is either at
-        // its destination (move succeeded) or still in inbox
-        // (re-classifiable next run); both are safe, neither warrants a
-        // failure tally or a retry.
+        // blip / 5xx / cancel while the POST was on the wire). outlook-api
+        // deliberately does NOT retry these (retrying would 404 on the
+        // now-stale id). Marking them as a hard `error` is wrong: it shows a
+        // scary red row AND makes the item a 重試 candidate; marking a
+        // mid-POST cancel 'cancelled' is wrong too when the move committed
+        // (2026-11-05). Soft skip with an honest "needs confirmation" note —
+        // the email is either at its destination or still in inbox
+        // (re-classifiable next run); both are safe.
         if (e instanceof OutlookError && e.uncertain) {
           state.results[i] = {
             ...state.results[i]!,
             status: 'skipped',
-            message:
-              '網路中斷,這封可能已成功移動、也可能仍在收件匣。請到 Outlook 確認;若仍在收件匣,下次歸類會再處理。',
+            message: uncertainOutcomeMessage(item, e),
           }
           state.summary.skipped++
-          await saveExecuteState(state)
+          writer.touch()
           continue
         }
         const message =
@@ -479,7 +552,7 @@ export async function startExecute(
         state.summary.errors++
       }
 
-      await saveExecuteState(state)
+      writer.touch()
     }
 
     // Mark any never-started items (after break) as cancelled
@@ -489,325 +562,581 @@ export async function startExecute(
         state.summary.cancelled++
       }
     }
+    // Persist the final per-item results BEFORE bookkeeping: if the worker
+    // dies during it, recovery replays from exactly these rows.
+    await writer.flush()
 
-    // F9 (2026-06-03): flush OVERRIDES before HITS. bumpRuleHits's
-    // confidence-promotion gate reads `overrideCount / matchCount` to
-    // decide whether a rule has earned a confidence bump. If hits flush
-    // first, that gate sees the pre-batch overrideCount and can promote
-    // a rule the user overrode in THIS very batch (its true post-batch
-    // error rate would exceed the gate). Applying overrides first means
-    // the promotion gate sees the up-to-date error rate. (Both write
-    // different fields on the same rule, so ordering is otherwise free.)
-    if (ruleOverrideTally.size > 0) {
-      try {
-        await bumpRuleOverrides(ruleOverrideTally)
-      } catch (e) {
-        console.warn('[mail-organizer] bumpRuleOverrides flush failed (non-fatal)', e)
-      }
-      // Fast structural-override recovery (優化 2026-07). A structural
-      // identifier (case_code, or a court-case-shaped subject/compound rule)
-      // can't legitimately map to two folders — so ONE user correction is
-      // sufficient evidence the rule's target is wrong. The normal
-      // overrideCount→effectiveConfidence demotion needs matchCount≥10 and
-      // auto-disable needs ≥20, which lets a freshly-wrong case rule keep
-      // winning for weeks (and, with first-sight minting now enabled, wrong
-      // structural rules are more reachable). Disable them immediately.
-      // user_manual rules are exempt (sacred). Matches the same axiom the
-      // conflict-gate already uses (execute.ts isConflictProneSignal).
-      try {
-        const snapshot = await listRules()
-        const byId = new Map(snapshot.map((r) => [r.id, r]))
-        for (const id of ruleOverrideTally.keys()) {
-          const r = byId.get(id)
-          if (!r || !r.enabled || r.source === 'user_manual') continue
-          const structural =
-            r.type === 'case_code' ||
-            ((r.type === 'subject_keyword' || r.type === 'compound') &&
-              isStructuralCourtCaseRule(r))
-          if (structural) {
-            await toggleRule(id, false, { actor: 'system' }).catch(() => {})
-          }
-        }
-      } catch (e) {
-        console.warn('[mail-organizer] structural override recovery failed (non-fatal)', e)
-      }
-    }
-    // Flush accumulated rule-hit bumps in a single atomic update.
-    if (ruleHitTally.size > 0) {
-      try {
-        await bumpRuleHits(ruleHitTally)
-      } catch (e) {
-        console.warn('[mail-organizer] bumpRuleHits flush failed (non-fatal)', e)
-      }
-    }
-    // Record the emails we actually moved/deleted into the recently-
-    // processed ledger so the NEXT batch's inbox fetch filters them out.
-    // Outlook's store is eventually consistent: for a short window after a
-    // move/delete the inbox listing can still return the just-handled email
-    // with its now-dead id, and the next batch would try to re-move it and
-    // hit 404 ErrorItemNotFound — which is exactly the "already-moved
-    // emails reappear in the continue list" bug. We record only DEFINITE
-    // outcomes (moved / deleted / folder_created); `skipped` (incl. the
-    // uncertain-network soft-skip) is left out so a genuinely-unmoved
-    // email can still be retried next batch.
-    const processedIds = [
-      ...state.results
-        .filter(
-          (r) =>
-            r.status === 'moved' ||
-            r.status === 'deleted' ||
-            r.status === 'folder_created',
-        )
-        .map((r) => r.emailId),
-      // Plus ids Outlook confirmed dead via 404 this batch (already
-      // moved/deleted earlier) — re-recording refreshes their TTL so a
-      // long-lagging listing keeps them excluded round after round.
-      ...alreadyGoneIds,
-    ].filter(Boolean)
-    if (processedIds.length > 0) {
-      try {
-        await addToRecentlyProcessed(processedIds)
-      } catch (e) {
-        console.warn('[mail-organizer] addToRecentlyProcessed failed (non-fatal)', e)
-      }
-    }
-    // Flush thread memory — conversation + normalized subject.
-    if (convFilings.length > 0) {
-      try {
-        await recordConversationFilings(convFilings)
-      } catch (e) {
-        console.warn('[mail-organizer] recordConversationFilings failed (non-fatal)', e)
-      }
-    }
-    if (subjectFilings.length > 0) {
-      try {
-        await recordSubjectFilings(subjectFilings)
-      } catch (e) {
-        console.warn('[mail-organizer] recordSubjectFilings failed (non-fatal)', e)
-      }
-    }
-    // Record our own moves so the manual-filing harvester can exclude them.
-    if (movedByUsEntries.length > 0) {
-      try {
-        await addToMovedByUsLedger(movedByUsEntries)
-      } catch (e) {
-        console.warn('[mail-organizer] addToMovedByUsLedger failed (non-fatal)', e)
-      }
-    }
-
-    // Generate ai_confirmed + ai_overridden rules from successful runs —
-    // both non-fatal. ai_confirmed captures "AI was right, lock it in";
-    // ai_overridden captures "user changed AI's verdict, learn the new
-    // mapping AND demote any existing rule that pointed to the wrong
-    // target". They're mutually exclusive per item via wasUserOverride.
-    let aiConfirmedAdded = 0
-    let aiOverriddenAdded = 0
-    // Rule ids minted by THIS batch's AI-confirmed learning — recorded in
-    // the undo snapshot so 撤回 can delete them (H2 learning reversal).
-    let mintedRuleIds: string[] = []
-    const learnedDetails: RuleLearnedDetail[] = []
-    try {
-      const gen = await generateAiConfirmedRules(plan, state.results)
-      aiConfirmedAdded = gen.added
-      mintedRuleIds = gen.addedIds
-      learnedDetails.push(...gen.details)
-    } catch (e) {
-      console.warn('[mail-organizer] generateAiConfirmedRules failed (non-fatal)', e)
-    }
-    try {
-      const r = await generateAiOverrideRules(plan, state.results)
-      aiOverriddenAdded = r.added
-      learnedDetails.push(...r.details)
-      if (r.disabled > 0) {
-        console.info(
-          `[mail-organizer] ai_overridden disabled ${r.disabled} stale rule(s) pointing at the AI's old wrong target`,
-        )
-      }
-    } catch (e) {
-      console.warn('[mail-organizer] generateAiOverrideRules failed (non-fatal)', e)
-    }
-    state.rulesAdded = aiConfirmedAdded + aiOverriddenAdded
-    state.rulesAddedDetail = learnedDetails
-
-    // Conflict prevention moved into chooseLearningSignal (2026-05-27
-    // redesign). When the user routes a same-domain email to a different
-    // folder than an existing plain-domain rule's target, the learning
-    // path upgrades to `compound (domain + 整段主旨)` and demotes the
-    // stale plain-domain rule synchronously. No post-batch sweep needed;
-    // conflicts can no longer accumulate via the normal learning flow.
-
-    // Remember which emails the user chose to keep in inbox — next classify
-    // pass auto-excludes them so they don't show up again to be re-decided.
-    //
-    // CRITICAL (audit G1): gate on the plan item's action === 'skip', NOT
-    // just status === 'skipped'. 'skipped' is overloaded: it also covers the
-    // uncertain-network soft-skip (execute.ts catch) and the 404 alreadyGone
-    // soft-skip. Those must NOT land in skipHistory's 60-day suppression — an
-    // uncertain move may have genuinely failed (email still in inbox), and
-    // its own row message promises "下次歸類會再處理". Only a deliberate
-    // action==='skip' is a real "user kept this in inbox" signal. (The dead
-    // ids are already handled by the 15-min recentlyProcessed ledger.)
-    // state.results is index-aligned with plan (initialState maps plan→results
-    // in order; the loop writes state.results[i]).
-    // Never-classified placeholders (Claude call failed / omitted the email)
-    // are NOT a keep decision unless the user explicitly chose 保留 on them —
-    // recording them hid transient-error mail for 60 days (2026-11-05).
-    const skippedIds = state.results
-      .filter((r, i) => {
-        const item = plan[i]
-        if (r.status !== 'skipped' || item?.action !== 'skip') return false
-        return !(item.unclassified === true && item.userTouched !== true)
-      })
-      .map((r) => r.emailId)
-      .filter((id) => id)
-    if (skippedIds.length > 0) {
-      await addToSkipHistory(skippedIds).catch((e) =>
-        console.warn('[mail-organizer] addToSkipHistory failed (non-fatal)', e),
-      )
-    }
-
-    // Tally per-folder mail counts from this batch and feed the IdleScreen's
-    // 「近日活動」quick-jump panel. Joins each result's emailId back to its
-    // plan item to pull the resolved target path/id (results carry status
-    // but not the target path).
-    try {
-      const batchAt = new Date().toISOString()
-      const folderTally = new Map<
-        string,
-        {
-          folderId: string
-          folderPath: string
-          count: number
-          latestMessage?: { subject: string; from: string; receivedAt: string }
-        }
-      >()
-      for (let i = 0; i < state.results.length; i++) {
-        const r = state.results[i]!
-        if (r.status !== 'moved' && r.status !== 'folder_created') continue
-        const planItem = plan[i]
-        if (!planItem) continue
-        const folderId = sanitizeRuleTargetFolderId(planItem.targetFolderId)
-        const folderPath = finalTargetPath(planItem)
-        if (!folderId || !folderPath) continue
-        const prev = folderTally.get(folderId)
-        // Capture the moved email's subject/from so the "近日活動" panel
-        // can show "what's the latest in this folder" without making the
-        // user click 重新整理 to fire a separate Graph API scan. Last
-        // result for the folder wins (plan iteration order is by index;
-        // for batches sorted newest-first this is the latest email, for
-        // oldest-first batches it'll be the most-recent one we moved
-        // either way — both are "latest user saw" in practice).
-        const latestMessage = {
-          subject: (planItem.emailSubject ?? '').slice(0, 120),
-          from: planItem.emailFrom ?? '',
-          receivedAt: batchAt,
-        }
-        if (prev) {
-          prev.count++
-          prev.latestMessage = latestMessage
-        } else {
-          folderTally.set(folderId, {
-            folderId,
-            folderPath,
-            count: 1,
-            latestMessage,
-          })
-        }
-      }
-      if (folderTally.size > 0) {
-        await recordFolderActivityFromBatch([...folderTally.values()], batchAt)
-      }
-    } catch (e) {
-      console.warn('[mail-organizer] folder activity record failed (non-fatal)', e)
-    }
+    // Everything the DoneScreen reads (learned-rule details, the undo
+    // snapshot, recentlyProcessed for peekNextBatch) is written BEFORE
+    // inProgress flips to false (2026-11-05): the popup switches to the
+    // DoneScreen on the first poll that sees inProgress=false and reads the
+    // undo snapshot exactly once on mount — the old order (flag first,
+    // snapshot ~last) made some batches show no 撤回 banner.
+    await finalizeExecuteBatch(state, plan)
 
     state.inProgress = false
     state.finishedAt = Date.now()
-    await saveExecuteState(state)
+    await writer.flush()
+    await clearFinalizeMarker(state.startedAt)
+  } catch (e) {
+    state.inProgress = false
+    state.finishedAt = Date.now()
+    await saveExecuteState(state).catch(() => {})
+    throw e
+  } finally {
+    writer.dispose()
+    currentController = null
+    runningState = null
+    runningWriter = null
+    executeClaimed = false
+    if (held) await releaseKeepAlive()
+  }
+}
 
+function uncertainOutcomeMessage(item: PlanItem, e: OutlookError): string {
+  const where = item.action === 'delete' ? '移到「已刪除的郵件」' : '移動'
+  const tail = '請到 Outlook 確認;若仍在收件匣,下次歸類會再處理。'
+  return e.aborted
+    ? `已取消,但取消時這封正在${where},可能已完成。${tail}`
+    : `網路中斷,這封可能已成功${where}、也可能仍在收件匣。${tail}`
+}
+
+// ---- Post-loop bookkeeping (shared by the normal path and recovery) ------
+//
+// Every step derives its input from (plan, results) alone, so recovery can
+// replay a killed batch exactly. Steps are non-fatal; each completed step is
+// recorded in a small session marker so a worker death DURING bookkeeping
+// replays only the remaining steps (no double-counted hits / filings / stats).
+
+type FinalizeStep =
+  | 'rules'
+  | 'ledgers'
+  | 'convMemory'
+  | 'subjectMemory'
+  | 'learning'
+  | 'skipHistory'
+  | 'folderActivity'
+  | 'metrics'
+  | 'undo'
+
+type LearnedOutput = { added: number; mintedRuleIds: string[]; details: RuleLearnedDetail[] }
+
+type FinalizeMarker = { startedAt: number; done: FinalizeStep[]; learned?: LearnedOutput }
+
+const FINALIZE_KEY = 'executeFinalize'
+
+async function readFinalizeMarker(startedAt: number): Promise<FinalizeMarker> {
+  try {
+    const r = await chrome.storage.session.get(FINALIZE_KEY)
+    const m = r[FINALIZE_KEY] as FinalizeMarker | undefined
+    if (m && m.startedAt === startedAt && Array.isArray(m.done)) {
+      return { startedAt, done: [...m.done], ...(m.learned ? { learned: m.learned } : {}) }
+    }
+  } catch {
+    /* fall through to a fresh marker */
+  }
+  return { startedAt, done: [] }
+}
+
+async function writeFinalizeMarker(marker: FinalizeMarker): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [FINALIZE_KEY]: marker })
+  } catch (e) {
+    console.warn('[mail-organizer] finalize marker write failed (non-fatal)', e)
+  }
+}
+
+async function clearFinalizeMarker(startedAt: number): Promise<void> {
+  try {
+    const r = await chrome.storage.session.get(FINALIZE_KEY)
+    const m = r[FINALIZE_KEY] as FinalizeMarker | undefined
+    if (m && m.startedAt === startedAt) await chrome.storage.session.remove(FINALIZE_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+function isFiled(r: ExecuteItemResult | undefined): boolean {
+  return r?.status === 'moved' || r?.status === 'folder_created'
+}
+
+async function finalizeExecuteBatch(state: ExecuteState, plan: PlanItem[]): Promise<void> {
+  const marker = await readFinalizeMarker(state.startedAt)
+  const done = new Set(marker.done)
+  const results = state.results
+  let mintedRuleIds = marker.learned?.mintedRuleIds ?? []
+  if (marker.learned) {
+    state.rulesAdded = marker.learned.added
+    state.rulesAddedDetail = marker.learned.details
+  }
+
+  const step = async (name: FinalizeStep, fn: () => Promise<void>): Promise<void> => {
+    if (done.has(name)) return
+    try {
+      await fn()
+    } catch (e) {
+      console.warn(`[mail-organizer] batch bookkeeping "${name}" failed (non-fatal)`, e)
+    }
+    done.add(name)
+    marker.done = [...done]
+    await writeFinalizeMarker(marker)
+  }
+
+  // Order matters: overrides before hits (F9, inside flushRuleFeedback);
+  // thread memory before learning (the birth gate reads this batch's filing).
+  await step('rules', () => flushRuleFeedback(plan, results))
+  await step('ledgers', () => flushLedgers(plan, results))
+  await step('convMemory', () => flushConversationMemory(plan, results))
+  // Birth gate (2026-11-05): generateAiConfirmedRules needs subject memory as
+  // it was BEFORE this batch's filings — snapshot it right before they are
+  // recorded (shallow copy: recordSubjectFilings must not alias it). On a
+  // crash-recovery replay where that step already ran, no faithful snapshot
+  // exists; leave it undefined and the learner reads the post-recording
+  // memory and subtracts this batch's own filings instead.
+  let priorSubjectMemory: SubjectMemoryMap | undefined
+  if (!done.has('subjectMemory')) {
+    priorSubjectMemory = await getSubjectMemory()
+      .then((m) => ({ ...m }))
+      .catch(() => undefined)
+  }
+  await step('subjectMemory', () => flushSubjectMemory(plan, results))
+  await step('learning', async () => {
+    const out = await runLearning(plan, results, priorSubjectMemory)
+    state.rulesAdded = out.added
+    state.rulesAddedDetail = out.details
+    mintedRuleIds = out.mintedRuleIds
+    marker.learned = out
+  })
+  await step('skipHistory', () => flushSkipHistory(plan, results))
+  await step('folderActivity', () => flushFolderActivity(plan, results))
+  await step('metrics', () => flushMetricsAndStats(state, plan))
+  // Capture undo snapshot — only when there's actually something to undo.
+  // Folder creates aren't reversed here (folder cleanup would amplify
+  // undo's blast radius beyond what users expect from "撤回").
+  await step('undo', () => captureUndoSnapshot(state, plan, mintedRuleIds))
+}
+
+/**
+ * Did the user send a rule-routed email to a DIFFERENT folder than the rule
+ * targets (2026-11-05)? Only that is evidence the rule was wrong. Deleting
+ * or keeping the email is not — the old tally counted deletes, and the
+ * one-strike structural recovery then disabled a case rule because the user
+ * deleted one notification it had routed.
+ */
+function isRetargetAwayFromRule(
+  rule: Rule | undefined,
+  item: PlanItem,
+  res: ExecuteItemResult,
+): boolean {
+  if (!rule) return false
+  const destId = res.destinationFolderId
+  const ruleTargetId = sanitizeRuleTargetFolderId(rule.targetFolderId)
+  if (destId && ruleTargetId) return destId !== ruleTargetId
+  const destPath = res.destinationFolderPath ?? finalTargetPath(item)
+  if (!destPath || !rule.targetFolderPath) return false // can't tell → no penalty
+  return destPath !== rule.targetFolderPath
+}
+
+function ruleOverrideCounts(
+  plan: PlanItem[],
+  results: ExecuteItemResult[],
+  rulesById: ReadonlyMap<string, Rule>,
+): Map<string, number> {
+  const overrides = new Map<string, number>()
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i]
+    const res = results[i]
+    if (!item || !res || !isFiled(res)) continue
+    if (item.source === 'rule' || !item.originalRuleId) continue
+    if (!isRetargetAwayFromRule(rulesById.get(item.originalRuleId), item, res)) continue
+    overrides.set(item.originalRuleId, (overrides.get(item.originalRuleId) ?? 0) + 1)
+  }
+  return overrides
+}
+
+async function flushRuleFeedback(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  const rules = await listRules()
+  const rulesById = new Map(rules.map((r) => [r.id, r]))
+  // Rule overrides: a rule fired at classify time but the user re-targeted
+  // the resulting PlanItem before execute. Detected via item.source !==
+  // 'rule' with item.originalRuleId still present (PlanRow.tsx preserves it
+  // on edit via {...item} spread). Feeds the rule's empirical accuracy.
+  const overrides = ruleOverrideCounts(plan, results, rulesById)
+  const hits = new Map<string, number>()
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i]
+    const res = results[i]
+    if (!item || !res || !isFiled(res)) continue
+    if (item.source === 'rule' && item.ruleId) {
+      // Accumulated and flushed once (one mutateRules for the whole batch).
+      hits.set(item.ruleId, (hits.get(item.ruleId) ?? 0) + 1)
+    }
+    // Thread-shadowed rule keep-alive (優化 2026-07). A broad rule that
+    // agreed with the thread route (agreeingRuleId) gets a hit credited
+    // — but only when the user DIDN'T edit the row (an edit means the
+    // rule/thread target was wrong, so don't reward it). Prevents the
+    // stale sweep from hard-deleting a silently-correct rule.
+    if (item.source === 'thread' && item.agreeingRuleId && !item.userTouched) {
+      hits.set(item.agreeingRuleId, (hits.get(item.agreeingRuleId) ?? 0) + 1)
+    }
+  }
+
+  // F9 (2026-06-03): flush OVERRIDES before HITS. bumpRuleHits's
+  // confidence-promotion gate reads `overrideCount / matchCount`; applying
+  // overrides first means the gate sees this batch's corrections.
+  if (overrides.size > 0) {
+    try {
+      await bumpRuleOverrides(overrides)
+    } catch (e) {
+      console.warn('[mail-organizer] bumpRuleOverrides flush failed (non-fatal)', e)
+    }
+    try {
+      await disableStructuralOverriddenRules([...overrides.keys()])
+    } catch (e) {
+      console.warn('[mail-organizer] structural override recovery failed (non-fatal)', e)
+    }
+  }
+  if (hits.size > 0) {
+    try {
+      await bumpRuleHits(hits)
+    } catch (e) {
+      console.warn('[mail-organizer] bumpRuleHits flush failed (non-fatal)', e)
+    }
+  }
+}
+
+/**
+ * Fast structural-override recovery (優化 2026-07). A structural identifier
+ * (case_code, or a court-case-shaped subject/compound rule) can't
+ * legitimately map to two folders — so ONE re-target is sufficient evidence
+ * the rule's target is wrong; disable it immediately. user_manual rules are
+ * exempt (sacred).
+ *
+ * 2026-11-05: written through mutateRules with autoDisabledReason 'override'
+ * + autoDisabledAt. The old reason-less toggleRule(false) looked exactly like
+ * a USER disable: it never revived and blocked relearning of the same case.
+ */
+async function disableStructuralOverriddenRules(ids: string[]): Promise<void> {
+  const idSet = new Set(ids)
+  const now = Date.now()
+  const events: RuleEvent[] = []
+  await mutateRules((rules) => {
+    let changed = false
+    const next = rules.map((r) => {
+      if (!idSet.has(r.id) || !r.enabled || r.source === 'user_manual') return r
+      const structural =
+        r.type === 'case_code' ||
+        ((r.type === 'subject_keyword' || r.type === 'compound') && isStructuralCourtCaseRule(r))
+      if (!structural) return r
+      changed = true
+      events.push({
+        kind: 'toggle',
+        ruleId: r.id,
+        at: now,
+        actor: 'system',
+        enabled: false,
+        type: r.type,
+        signal: r.signal,
+        targetFolderPath: r.targetFolderPath,
+      })
+      return {
+        ...r,
+        enabled: false,
+        autoDisabledReason: 'override' as const,
+        autoDisabledAt: new Date(now).toISOString(),
+      }
+    })
+    return { next: changed ? next : rules, result: undefined }
+  })
+  if (events.length > 0) {
+    await recordRuleEvents(events).catch((e) =>
+      console.warn('[mail-organizer] recordRuleEvents (override disable) failed', e),
+    )
+  }
+}
+
+async function flushLedgers(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  // Record the emails we actually moved/deleted into the recently-
+  // processed ledger so the NEXT batch's inbox fetch filters them out.
+  // Outlook's store is eventually consistent: for a short window after a
+  // move/delete the inbox listing can still return the just-handled email
+  // with its now-dead id, and the next batch would try to re-move it and
+  // hit 404 ErrorItemNotFound. We record only DEFINITE outcomes (moved /
+  // deleted / folder_created) plus ids Outlook confirmed dead via 404
+  // (alreadyGone — re-recording refreshes their TTL so a long-lagging
+  // listing keeps them excluded). The uncertain-network soft-skip is left
+  // out so a genuinely-unmoved email can still be retried next batch.
+  const processedIds = results
+    .filter(
+      (r) =>
+        r.status === 'moved' ||
+        r.status === 'deleted' ||
+        r.status === 'folder_created' ||
+        r.alreadyGone === true,
+    )
+    .map((r) => r.emailId)
+    .filter(Boolean)
+  if (processedIds.length > 0) {
+    try {
+      await addToRecentlyProcessed(processedIds)
+    } catch (e) {
+      console.warn('[mail-organizer] addToRecentlyProcessed failed (non-fatal)', e)
+    }
+  }
+
+  // Moved-by-us ledger (harvester provenance): the DESTINATION-side new id
+  // of every mail we filed. Only while the harvester is enabled (2026-11-05)
+  // — it's the ledger's only reader, and at a 90-day TTL it is not small.
+  let harvestEnabled = false
+  try {
+    harvestEnabled = (await getSettings()).harvestEnabled === true
+  } catch {
+    /* treat as disabled */
+  }
+  if (!harvestEnabled) return
+  const movedAt = Date.now()
+  const entries: MovedByUsEntry[] = []
+  for (let i = 0; i < plan.length; i++) {
+    const res = results[i]
+    if (!isFiled(res) || !res!.newMessageId || !res!.destinationFolderId) continue
+    entries.push({
+      newMessageId: res!.newMessageId,
+      destinationFolderId: res!.destinationFolderId,
+      conversationId: plan[i]?.conversationId,
+      movedAt,
+    })
+  }
+  if (entries.length > 0) {
+    try {
+      await addToMovedByUsLedger(entries)
+    } catch (e) {
+      console.warn('[mail-organizer] addToMovedByUsLedger failed (non-fatal)', e)
+    }
+  }
+}
+
+// Thread memory writeback. Record convId + normalized subject for every
+// successful move into a real folder. We do this even for thread-sourced
+// rows so the entry's timesFiled keeps climbing. destinationFolderId comes
+// from the move result because Outlook assigns a NEW id after move — using
+// item.targetFolderId would record the source-side id and pre-filter
+// wouldn't match next batch.
+async function flushConversationMemory(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  const filings: Array<{ convId: string; folderId: string; folderPath: string }> = []
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i]
+    const res = results[i]
+    if (!item?.conversationId || !isFiled(res)) continue
+    if (!res!.destinationFolderId || !res!.destinationFolderPath) continue
+    filings.push({
+      convId: item.conversationId,
+      folderId: res!.destinationFolderId,
+      folderPath: res!.destinationFolderPath,
+    })
+  }
+  if (filings.length > 0) await recordConversationFilings(filings)
+}
+
+async function flushSubjectMemory(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  const filings: Array<{ normalizedSubject: string; folderId: string; folderPath: string }> = []
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i]
+    const res = results[i]
+    if (!item || !isFiled(res)) continue
+    if (!res!.destinationFolderId || !res!.destinationFolderPath) continue
+    const normalized = normalizeSubject(item.emailSubject ?? '')
+    if (normalized.length < MIN_NORMALIZED_SUBJECT_LEN) continue
+    filings.push({
+      normalizedSubject: normalized,
+      folderId: res!.destinationFolderId,
+      folderPath: res!.destinationFolderPath,
+    })
+  }
+  if (filings.length > 0) await recordSubjectFilings(filings)
+}
+
+// Generate ai_confirmed + ai_overridden rules from successful runs —
+// both non-fatal. ai_confirmed captures "AI was right, lock it in";
+// ai_overridden captures "user changed AI's verdict, learn the new
+// mapping AND demote any existing rule that pointed to the wrong
+// target". They're mutually exclusive per item via wasUserOverride.
+// Conflict prevention lives in chooseLearningSignal (2026-05-27 redesign).
+async function runLearning(
+  plan: PlanItem[],
+  results: ExecuteItemResult[],
+  priorSubjectMemory?: SubjectMemoryMap,
+): Promise<LearnedOutput> {
+  let added = 0
+  // Rule ids minted by THIS batch's AI-confirmed learning — recorded in
+  // the undo snapshot so 撤回 can delete them (H2 learning reversal).
+  let mintedRuleIds: string[] = []
+  const details: RuleLearnedDetail[] = []
+  try {
+    const gen = await generateAiConfirmedRules(plan, results, { priorSubjectMemory })
+    added += gen.added
+    mintedRuleIds = gen.addedIds
+    details.push(...gen.details)
+  } catch (e) {
+    console.warn('[mail-organizer] generateAiConfirmedRules failed (non-fatal)', e)
+  }
+  try {
+    const r = await generateAiOverrideRules(plan, results)
+    added += r.added
+    details.push(...r.details)
+    if (r.disabled > 0) {
+      console.info(
+        `[mail-organizer] ai_overridden disabled ${r.disabled} stale rule(s) pointing at the AI's old wrong target`,
+      )
+    }
+  } catch (e) {
+    console.warn('[mail-organizer] generateAiOverrideRules failed (non-fatal)', e)
+  }
+  return { added, mintedRuleIds, details }
+}
+
+async function flushSkipHistory(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  // Remember which emails the user chose to keep in inbox — next classify
+  // pass auto-excludes them so they don't show up again to be re-decided.
+  //
+  // CRITICAL (audit G1): gate on the plan item's action === 'skip', NOT
+  // just status === 'skipped'. 'skipped' is overloaded: it also covers the
+  // uncertain-network soft-skip and the 404 alreadyGone soft-skip. Those
+  // must NOT land in skipHistory's 60-day suppression. Only a deliberate
+  // action==='skip' is a real "user kept this in inbox" signal.
+  // Never-classified placeholders (Claude call failed / omitted the email)
+  // are NOT a keep decision unless the user explicitly chose 保留 on them —
+  // recording them hid transient-error mail for 60 days (2026-11-05).
+  const skippedIds = results
+    .filter((r, i) => {
+      const item = plan[i]
+      if (r.status !== 'skipped' || item?.action !== 'skip') return false
+      return !(item.unclassified === true && item.userTouched !== true)
+    })
+    .map((r) => r.emailId)
+    .filter((id) => id)
+  if (skippedIds.length > 0) await addToSkipHistory(skippedIds)
+}
+
+async function flushFolderActivity(plan: PlanItem[], results: ExecuteItemResult[]): Promise<void> {
+  // Tally per-folder mail counts from this batch and feed the IdleScreen's
+  // 「近日活動」quick-jump panel.
+  const batchAt = new Date().toISOString()
+  const folderTally = new Map<
+    string,
+    {
+      folderId: string
+      folderPath: string
+      count: number
+      latestMessage?: { subject: string; from: string; receivedAt: string }
+    }
+  >()
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i]!
+    if (!isFiled(r)) continue
+    const planItem = plan[i]
+    if (!planItem) continue
+    // Prefer the move result's resolved destination (covers pending:
+    // targets and in-batch created folders); fall back to the plan.
+    const folderId =
+      sanitizeRuleTargetFolderId(r.destinationFolderId) ||
+      sanitizeRuleTargetFolderId(planItem.targetFolderId)
+    const folderPath = r.destinationFolderPath ?? finalTargetPath(planItem)
+    if (!folderId || !folderPath) continue
+    const prev = folderTally.get(folderId)
+    const latestMessage = {
+      subject: (planItem.emailSubject ?? '').slice(0, 120),
+      from: planItem.emailFrom ?? '',
+      receivedAt: batchAt,
+    }
+    if (prev) {
+      prev.count++
+      prev.latestMessage = latestMessage
+    } else {
+      folderTally.set(folderId, { folderId, folderPath, count: 1, latestMessage })
+    }
+  }
+  if (folderTally.size > 0) {
+    await recordFolderActivityFromBatch([...folderTally.values()], batchAt)
+  }
+}
+
+async function flushMetricsAndStats(state: ExecuteState, plan: PlanItem[]): Promise<void> {
+  try {
     await bumpMetrics({
       moved: state.summary.moved,
       deleted: state.summary.deleted,
       foldersCreated: state.summary.foldersCreated,
       errors: state.summary.errors,
     })
-
-    // Stale-sweep clock (2026-11-05): today counts as an ACTIVE day — the
-    // matcher ran over real inbox mail, so rules that didn't fire today have
-    // genuinely aged one day. Idle calendar days never reach this ledger.
-    if (plan.length > 0) {
-      await recordActiveDay().catch((e) =>
-        console.warn('[mail-organizer] recordActiveDay failed (non-fatal)', e),
-      )
-    }
-
-    // Per-source stats ledger (優化 2026-07) — the instrument for telling
-    // WHICH axis (rule / AI / thread) is erring over time. All derivable
-    // from plan + results here; previously computed and discarded.
-    try {
-      const planned = { rule: 0, thread: 0, ai: 0, unresolved: 0 }
-      const overrides = { rule: 0, ai: 0, thread: 0 }
-      let gateResolved = 0
-      for (let i = 0; i < plan.length; i++) {
-        const item = plan[i]!
-        const res = state.results[i]
-        const terminal =
-          res?.status === 'moved' || res?.status === 'deleted' || res?.status === 'folder_created'
-        // planned: bucket by how the ITEM was sourced when the plan was built.
-        // A user edit flips a rule/thread item's source to 'ai', so this
-        // counts post-edit source — which is what "how many did the human
-        // end up treating as AI-level decisions" should reflect.
-        if (item.source === 'rule') planned.rule++
-        else if (item.source === 'thread') planned.thread++
-        else if (item.source === 'unresolved') planned.unresolved++
-        else planned.ai++
-        if (!terminal) continue
-        // overrides.rule: a rule fired but the user changed action/target.
-        if (item.source !== 'rule' && item.originalRuleId) overrides.rule++
-        // overrides.ai: user changed the AI's own verdict.
-        if (item.source === 'ai' && wasUserOverride(item)) overrides.ai++
-        // overrides.thread: user re-targeted away from the thread's home.
-        if (
-          item.source === 'thread' &&
-          item.userTouched &&
-          item.threadMatch &&
-          finalTargetPath(item) !== item.threadMatch.previousFolderPath
-        ) {
-          overrides.thread++
-        }
-        // gateResolved: AI had an answer that the confidence gate demoted to
-        // unresolved, and the user resolved it (aiOriginalAction survives).
-        if (item.source === 'unresolved' && item.aiOriginalAction !== undefined) gateResolved++
-      }
-      await appendBatchStat({
-        at: new Date(state.finishedAt ?? Date.now()).toISOString(),
-        planned,
-        moved: state.summary.moved,
-        deleted: state.summary.deleted,
-        overrides,
-        gateResolved,
-      })
-    } catch (e) {
-      console.warn('[mail-organizer] batch stats ledger failed (non-fatal)', e)
-    }
-
-    // Capture undo snapshot — only when there's actually something to undo.
-    // Deletes and folder creates aren't reversed here (delete is recoverable
-    // via Outlook's own Deleted Items; folder cleanup would amplify undo's
-    // blast radius beyond what users expect from "撤回").
-    try {
-      await captureUndoSnapshot(state, plan, mintedRuleIds)
-    } catch (e) {
-      console.warn('[mail-organizer] captureUndoSnapshot failed (non-fatal)', e)
-    }
   } catch (e) {
-    state.inProgress = false
-    state.finishedAt = Date.now()
-    await saveExecuteState(state)
-    throw e
-  } finally {
-    currentController = null
-    await releaseKeepAlive()
+    console.warn('[mail-organizer] metrics flush failed (non-fatal)', e)
+  }
+
+  // Stale-sweep clock (2026-11-05): the batch's day counts as an ACTIVE
+  // day — the matcher ran over real inbox mail, so rules that didn't fire
+  // have genuinely aged one day. Idle calendar days never reach this ledger.
+  if (plan.length > 0) {
+    await recordActiveDay(state.startedAt).catch((e) =>
+      console.warn('[mail-organizer] recordActiveDay failed (non-fatal)', e),
+    )
+  }
+
+  // Per-source stats ledger (優化 2026-07) — the instrument for telling
+  // WHICH axis (rule / AI / thread) is erring over time.
+  try {
+    const rulesById = new Map((await listRules()).map((r) => [r.id, r]))
+    const planned = { rule: 0, thread: 0, ai: 0, unresolved: 0 }
+    const overrides = { rule: 0, ai: 0, thread: 0 }
+    let gateResolved = 0
+    for (let i = 0; i < plan.length; i++) {
+      const item = plan[i]!
+      const res = state.results[i]
+      const terminal =
+        res?.status === 'moved' || res?.status === 'deleted' || res?.status === 'folder_created'
+      // planned: bucket by how the ITEM was sourced when the plan was built.
+      // A user edit flips a rule/thread item's source to 'ai', so this
+      // counts post-edit source.
+      if (item.source === 'rule') planned.rule++
+      else if (item.source === 'thread') planned.thread++
+      else if (item.source === 'unresolved') planned.unresolved++
+      else planned.ai++
+      if (!terminal) continue
+      // overrides.rule: a rule fired and the user re-targeted it to a
+      // different folder — same definition the override tally uses
+      // (2026-11-05; deletes no longer count as rule errors).
+      if (
+        item.source !== 'rule' &&
+        item.originalRuleId &&
+        isFiled(res) &&
+        isRetargetAwayFromRule(rulesById.get(item.originalRuleId), item, res!)
+      ) {
+        overrides.rule++
+      }
+      // overrides.ai: user changed the AI's own verdict.
+      if (item.source === 'ai' && wasUserOverride(item)) overrides.ai++
+      // overrides.thread: user re-targeted away from the thread's home.
+      if (
+        item.source === 'thread' &&
+        item.userTouched &&
+        item.threadMatch &&
+        finalTargetPath(item) !== item.threadMatch.previousFolderPath
+      ) {
+        overrides.thread++
+      }
+      // gateResolved: AI had an answer that the confidence gate demoted to
+      // unresolved, and the user resolved it (aiOriginalAction survives).
+      if (item.source === 'unresolved' && item.aiOriginalAction !== undefined) gateResolved++
+    }
+    await appendBatchStat({
+      at: new Date(state.finishedAt ?? Date.now()).toISOString(),
+      planned,
+      moved: state.summary.moved,
+      deleted: state.summary.deleted,
+      overrides,
+      gateResolved,
+    })
+  } catch (e) {
+    console.warn('[mail-organizer] batch stats ledger failed (non-fatal)', e)
   }
 }
 
@@ -830,6 +1159,9 @@ export async function startExecute(
  * Treat these as `skipped` with an explanatory message so the UI shows
  * a soft "noted, moved on" rather than a red error inviting another
  * retry — which is the user-visible loop that prompted this fix.
+ *
+ * (2026-11-05) A move to a PURGED destination can produce the same 404 — the
+ * caller verifies the destination still exists before soft-skipping.
  */
 export function isAlreadyMovedError(e: unknown): boolean {
   if (!(e instanceof OutlookError)) return false
@@ -844,11 +1176,150 @@ export function isAlreadyMovedError(e: unknown): boolean {
 const ALREADY_MOVED_MESSAGE =
   '訊息已不在原位置(可能已成功移動、或被其他規則 / 帳號處理過)'
 
+const DESTINATION_GONE_MESSAGE =
+  '目標資料夾已不存在(可能已被刪除或清空)——這封信沒有移動、仍在收件匣。請重新選擇資料夾。'
+
+const EXCLUDED_DESTINATION_MESSAGE =
+  '目標資料夾位於「已刪除的郵件 / 垃圾郵件 / 草稿 / 寄件匣 / 寄件備份」之下,不能當歸檔目標(可能已被刪除)——這封信沒有移動。請重新選擇資料夾。'
+
+/**
+ * Refuses filing moves into the well-known non-filing folders (Deleted
+ * Items, Junk, Drafts, Outbox, Sent Items) and their subtrees (2026-11-05).
+ * Deleting case folder 案件/甲 in OWA re-parents it under Deleted Items with
+ * the SAME id, so an old cache, a resumed plan or a stale target id could
+ * otherwise keep filing new mail into the trash. Cheap path: the in-memory
+ * tree (zero requests); a target missing from the tree gets a short remote
+ * parent walk. Every lookup is defensive — failing to verify never blocks a
+ * move; only a POSITIVE finding does.
+ */
+class DestinationGuard {
+  private excludedPromise: Promise<Set<string>> | null = null
+  private index: Map<string, MailFolderNode> | null = null
+
+  constructor(
+    private readonly tree: MailFolderNode[],
+    private readonly api: OutlookApi,
+  ) {}
+
+  private excludedIds(): Promise<Set<string>> {
+    if (!this.excludedPromise) {
+      this.excludedPromise = (async () => {
+        const ids = new Set<string>()
+        try {
+          for (const id of (await getFolderCache())?.excludedFolderIds ?? []) ids.add(id)
+        } catch {
+          /* ignore */
+        }
+        // Cache written before the exclusion existed → resolve once per batch.
+        if (ids.size === 0 && typeof this.api.getWellKnownFolderIds === 'function') {
+          try {
+            for (const id of (await this.api.getWellKnownFolderIds()).values()) ids.add(id)
+          } catch {
+            /* unknown → no positive finding possible */
+          }
+        }
+        return ids
+      })()
+    }
+    return this.excludedPromise
+  }
+
+  /** Lookup by id; rebuilds once on a miss (new_folder splices mid-batch). */
+  lookup(id: string, rebuildOnMiss = true): MailFolderNode | undefined {
+    if (!this.index || (rebuildOnMiss && !this.index.has(id))) {
+      this.index = new Map(flattenFolderTree(this.tree).map((n) => [n.id, n]))
+    }
+    return this.index.get(id)
+  }
+
+  /** True when the node or one of its in-tree ancestors is excluded. */
+  private underExcludedInTree(node: MailFolderNode, excluded: ReadonlySet<string>): boolean {
+    let cur: MailFolderNode | undefined = node
+    for (let hops = 0; cur && hops < 64; hops++) {
+      if (excluded.has(cur.id)) return true
+      if (!cur.parentFolderId) return false
+      if (excluded.has(cur.parentFolderId)) return true
+      cur = this.lookup(cur.parentFolderId, false)
+    }
+    return false
+  }
+
+  async assertFilingTarget(folderId: string, signal: AbortSignal): Promise<void> {
+    const excluded = await this.excludedIds()
+    if (excluded.has(folderId)) throw new Error(EXCLUDED_DESTINATION_MESSAGE)
+    const node = this.lookup(folderId)
+    if (node) {
+      if (this.underExcludedInTree(node, excluded)) throw new Error(EXCLUDED_DESTINATION_MESSAGE)
+      return
+    }
+    // Not in the tree: walk the live parent chain (bounded).
+    if (typeof this.api.getFolder !== 'function') return
+    let id = folderId
+    for (let hop = 0; hop < 6; hop++) {
+      let f: MailFolder
+      try {
+        f = await this.api.getFolder(id, signal)
+      } catch (e) {
+        if (isAbortError(e)) throw e
+        if (hop === 0 && e instanceof OutlookError && e.status === 404) {
+          throw new Error(DESTINATION_GONE_MESSAGE)
+        }
+        return
+      }
+      const parent = f.ParentFolderId
+      if (!parent) return
+      if (excluded.has(parent)) throw new Error(EXCLUDED_DESTINATION_MESSAGE)
+      const parentNode = this.lookup(parent, false)
+      if (parentNode) {
+        if (this.underExcludedInTree(parentNode, excluded)) {
+          throw new Error(EXCLUDED_DESTINATION_MESSAGE)
+        }
+        return
+      }
+      id = parent
+    }
+  }
+
+  /** Positive (404) confirmation that a folder no longer exists. */
+  async isFolderGone(folderId: string, signal: AbortSignal): Promise<boolean> {
+    if (typeof this.api.getFolder !== 'function') return false
+    try {
+      await this.api.getFolder(folderId, signal)
+      return false
+    } catch (e) {
+      if (isAbortError(e)) throw e
+      return e instanceof OutlookError && e.status === 404
+    }
+  }
+}
+
+/**
+ * A move answered 404 ErrorItemNotFound. Usually the MESSAGE is gone
+ * (already moved — soft skip). But a move into a purged destination folder
+ * probably answers the same (2026-11-05), and soft-skipping that left the
+ * mail in the inbox labelled "already moved". Verify the destination first.
+ */
+async function alreadyMovedOrDestinationGone(
+  folderId: string,
+  guard: DestinationGuard,
+  signal: AbortSignal,
+  extra: Partial<ItemOutcome> = {},
+): Promise<ItemOutcome> {
+  if (await guard.isFolderGone(folderId, signal)) throw new Error(DESTINATION_GONE_MESSAGE)
+  return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true, ...extra }
+}
+
+/** Exchange folder names are case-insensitive (and we trim like the UI). */
+function sameFolderName(a: string | undefined, b: string): boolean {
+  return (a ?? '').trim().toLowerCase() === b.trim().toLowerCase()
+}
+
 async function executeItem(
   item: PlanItem,
   tree: MailFolderNode[],
   api: OutlookApi,
   signal: AbortSignal,
+  guard: DestinationGuard,
 ): Promise<ItemOutcome> {
   // Each network sub-call checks signal first. new_folder does
   // create + move (sometimes also list-siblings on 409) — without these
@@ -860,13 +1331,20 @@ async function executeItem(
 
   if (item.action === 'delete') {
     try {
-      await api.deleteMessage(item.emailId, signal)
-      return { status: 'deleted' }
+      // A move into Deleted Items (2026-11-05), so it shows up in OWA's
+      // 已刪除的郵件 and 撤回 can bring it back.
+      const res = await api.moveToDeletedItems(item.emailId, signal)
+      return {
+        status: 'deleted',
+        newMessageId: res.Id,
+        destinationFolderId: res.ParentFolderId || 'deleteditems',
+      }
     } catch (e) {
       if (isAlreadyMovedError(e)) {
         // Delete target gone = deletion's already done by something
         // else (or by an earlier lost-response delete from us). Soft
-        // success — don't surface as red error.
+        // success — don't surface as red error. (The destination is the
+        // well-known Deleted Items, which can't be purged away.)
         return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
       }
       throw e
@@ -876,18 +1354,17 @@ async function executeItem(
   if (item.action === 'move') {
     const targetId = resolveTargetFolderId(item, tree)
     if (!targetId) throw new Error('目標資料夾未指定或無法在資料夾樹中找到')
+    await guard.assertFilingTarget(targetId, signal)
     try {
       const res = await api.moveMessage(item.emailId, targetId, signal)
       return {
         status: 'moved',
         newMessageId: res.Id,
         destinationFolderId: targetId,
-        destinationFolderPath: item.targetFolderPath,
+        destinationFolderPath: item.targetFolderPath ?? guard.lookup(targetId)?.path,
       }
     } catch (e) {
-      if (isAlreadyMovedError(e)) {
-        return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
-      }
+      if (isAlreadyMovedError(e)) return alreadyMovedOrDestinationGone(targetId, guard, signal)
       throw e
     }
   }
@@ -896,16 +1373,21 @@ async function executeItem(
     const name = item.suggestedFolderName?.trim()
     if (!name) throw new Error('未指定新資料夾名稱')
     let parentId: string | undefined
+    let siblingsInTree: MailFolderNode[] = tree
     if (item.suggestedParentPath) {
       const parent = findFolderByPath(tree, item.suggestedParentPath)
-      if (parent) parentId = parent.id
-      else throw new Error(`找不到父資料夾「${item.suggestedParentPath}」`)
+      if (parent) {
+        parentId = parent.id
+        siblingsInTree = parent.children
+      } else throw new Error(`找不到父資料夾「${item.suggestedParentPath}」`)
+      await guard.assertFilingTarget(parentId, signal)
     }
 
     // In-batch dedup: prior new_folder items have already created what's
-    // needed. Reorder above guarantees those run first.
-    const fullPath = joinFolderPath(item.suggestedParentPath, name)
-    const existing = findFolderByPath(tree, fullPath)
+    // needed (reorder above guarantees those run first). Case-insensitive
+    // (2026-11-05) — Exchange treats "ACME Corp" and "Acme Corp" as the
+    // same name, so creating it would just 409.
+    const existing = siblingsInTree.find((n) => sameFolderName(n.displayName, name))
     if (existing) {
       signal.throwIfAborted()
       try {
@@ -914,12 +1396,10 @@ async function executeItem(
           status: 'moved',
           newMessageId: res.Id,
           destinationFolderId: existing.id,
-          destinationFolderPath: fullPath,
+          destinationFolderPath: existing.path,
         }
       } catch (e) {
-        if (isAlreadyMovedError(e)) {
-          return { status: 'skipped', message: ALREADY_MOVED_MESSAGE, alreadyGone: true }
-        }
+        if (isAlreadyMovedError(e)) return alreadyMovedOrDestinationGone(existing.id, guard, signal)
         throw e
       }
     }
@@ -933,22 +1413,49 @@ async function executeItem(
         : await api.createTopFolder(name, signal)
     } catch (e) {
       if (isAbortError(e)) throw e
-      if (e instanceof OutlookError && e.status === 409) {
-        console.warn(`[mail-organizer] createFolder 409 for ${fullPath}; recovering via listChildFolders`)
-        signal.throwIfAborted()
+      const conflict = e instanceof OutlookError && e.status === 409
+      // uncertain = our POST may have created the folder before its
+      // response was lost (network / 5xx / cancel mid-POST) (2026-11-05).
+      const lost = e instanceof OutlookError && e.uncertain
+      if (!conflict && !lost) throw e
+      console.warn(
+        `[mail-organizer] createFolder ${conflict ? '409' : 'response lost'} for ${name}; re-listing siblings`,
+      )
+      // Cancel mid-create: the mail was never moved → plain 'cancelled'.
+      signal.throwIfAborted()
+      let match: MailFolder | undefined
+      try {
+        // Paged listing (2026-11-05) — the old single page missed siblings 201+.
         const siblings = parentId
-          ? await api.listChildFolders(parentId)
-          : await api.listTopFolders()
-        const match = siblings.find((f) => f.DisplayName === name)
-        if (!match) {
-          throw new Error(`Outlook 回 409 但 listChildFolders 找不到同名「${name}」資料夾`)
-        }
-        created = match
-        recoveredFromExisting = true
-      } else {
-        throw e
+          ? await api.listChildFolders(parentId, signal)
+          : await api.listTopFolders(signal)
+        match = siblings.find((f) => sameFolderName(f.DisplayName, name))
+      } catch (listErr) {
+        if (isAbortError(listErr)) throw listErr
+        throw new Error(
+          conflict
+            ? `Outlook 回 409(同名資料夾已存在)但無法列出同層資料夾:${listErr instanceof Error ? listErr.message : String(listErr)}`
+            : `建立資料夾「${name}」時網路中斷,也無法確認是否已建立;這封信沒有移動、仍在收件匣,可重試。`,
+        )
       }
+      if (!match) {
+        // The create definitely didn't take (or it's a different 409) —
+        // and the mail was never moved: the move is only issued after a
+        // folder id is in hand. So never say "may have moved" here.
+        throw new Error(
+          conflict
+            ? `Outlook 回 409 但同層找不到「${name}」資料夾`
+            : `建立資料夾「${name}」時網路中斷,資料夾未建立;這封信沒有移動、仍在收件匣,可重試。`,
+        )
+      }
+      created = match
+      // Found after a lost response → most likely OUR create; report it so.
+      recoveredFromExisting = conflict
     }
+
+    // Use the folder's real DisplayName for the path (a case-insensitive 409
+    // recovery may differ in casing from the suggested name).
+    const createdPath = joinFolderPath(item.suggestedParentPath, created.DisplayName || name)
 
     // Splice into in-memory tree + persist (idempotent)
     spliceFolderIntoTree(tree, created, parentId)
@@ -963,7 +1470,7 @@ async function executeItem(
         status: recoveredFromExisting ? 'moved' : 'folder_created',
         newMessageId: res.Id,
         destinationFolderId: created.Id,
-        destinationFolderPath: fullPath,
+        destinationFolderPath: createdPath,
       }
     } catch (e) {
       if (isAlreadyMovedError(e)) {
@@ -971,16 +1478,12 @@ async function executeItem(
         // bookkeeping stands. We just couldn't deposit this particular
         // message because its source Id is no longer valid. Tag the
         // outcome as skipped so the row doesn't appear as a hard error.
-        return {
-          status: 'skipped',
-          message: ALREADY_MOVED_MESSAGE,
-          alreadyGone: true,
-          // Keep the folder we created visible to downstream code (so
-          // sibling items in the same batch can use it as a target via
-          // the spliced-into-tree path lookup).
+        // Keep the folder visible to downstream code (sibling items in
+        // the same batch can use it via the spliced-into-tree path).
+        return alreadyMovedOrDestinationGone(created.Id, guard, signal, {
           destinationFolderId: created.Id,
-          destinationFolderPath: fullPath,
-        }
+          destinationFolderPath: createdPath,
+        })
       }
       throw e
     }
@@ -1114,19 +1617,13 @@ export function wasUserOverride(item: PlanItem): boolean {
  *      Court case numbers are globally unique per court; safe.
  *   3. Latin case code alone → case_code
  *      Structurally unique within a firm's internal coding system.
- *   4. domain + subject feature → compound  (NEW 2026-05-22)
- *      e.g. `telco.example + 甲公司` — generic noun-phrase routing.
- *      Feature = a Chinese 4-12 char or Latin 6-12 char proper
- *      noun-ish token from the subject, excluding stopwords and
- *      Taiwan-legal patterns (those have their own slots above).
- *   5. subject feature alone → subject_keyword  (NEW 2026-05-22)
- *      Lower confidence than court-case because the feature heuristic
- *      is noisier; `bumpRuleHits` errorRate gate demotes bad features
- *      over time.
- *   6. usable domain (non-generic-provider, non-internal) → domain
- *   7. generic-provider sender → sender (exact email address)
+ *   4. usable domain (non-generic-provider, non-internal, non-own) → domain,
+ *      upgraded to compound (domain + 整段主旨) on a conflict
+ *   5. generic-provider sender → sender (exact email address), upgraded
+ *      to compound (sender + 整段主旨) on a conflict
  *      gmail.com / yahoo.com etc. as a domain is useless; a specific
  *      address like andy@gmail.com IS a precise routing signal.
+ *   6. internal / own-domain sender → compound (sender + 整段主旨)
  *
  * The `featureKind` discriminator on compound / subject_keyword variants
  * lets `generateAiConfirmedRules` apply differentiated confidence:
@@ -1153,8 +1650,8 @@ export function wasUserOverride(item: PlanItem): boolean {
  * `demoteOnly` flag — set when chooseLearningSignal detected a domain /
  * sender conflict with an existing rule but couldn't extract any subject
  * to upgrade with. The override pipeline still uses this signal to
- * DEMOTE the stale rule, but SKIPS creating a new rule. Rare path —
- * fires for empty / single-char subjects only.
+ * DEMOTE the stale rule, but SKIPS creating a new rule. Fires for
+ * subjects too short to learn (< MIN_NORMALIZED_SUBJECT_LEN, 2026-11-05).
  *
  * `featureKind` on subject_keyword / compound variants distinguishes:
  *   - 'court_case': signal is a Taiwan court case number — structural,
@@ -1172,23 +1669,73 @@ type LearningSignal =
   | { type: 'domain'; signal: string; descr: string; demoteOnly?: boolean }
   | { type: 'sender'; signal: string; descr: string; demoteOnly?: boolean }
 
+/** `${type}::${normalizeSignal}` — key of LearningLookup.bySignal. */
+function signalKey(type: Rule['type'], signal: string): string {
+  return `${type}::${normalizeSignal(type, signal)}`
+}
+
 /**
- * Existing rules passed alongside the email being learned-from. Used by
- * the domain (P4) and sender (P5) branches to detect whether the email
- * would create a conflict with a stored same-signal-different-target
- * rule — that's the moment when "先廣後窄" upgrades to compound.
+ * Every stored rule bucketed by (type, normalized signal), built once per
+ * learning pass (2026-11-05). Replaces the per-item `existing.some(…
+ * normalizeSignal …)` scans — several per item, each JSON-parsing every
+ * compound rule (≈30k normalizations per 50-item batch on a 300-rule
+ * library).
+ */
+type LearningLookup = ReadonlyMap<string, readonly Rule[]>
+
+function buildLearningLookup(rules: readonly Rule[]): LearningLookup {
+  const bySignal = new Map<string, Rule[]>()
+  for (const r of rules) {
+    const key = signalKey(r.type, r.signal)
+    const bucket = bySignal.get(key)
+    if (bucket) bucket.push(r)
+    else bySignal.set(key, [r])
+  }
+  return bySignal
+}
+
+/**
+ * Domains the learners must never mint a domain rule for: the configured
+ * internal domains plus the signed-in mailbox's own domain (2026-11-05).
+ * With internalDomains empty (the default), the first AI filing of a
+ * colleague's mail learned `domain: <own domain>` — and since the owner is
+ * on To/Cc of every inbound mail, that rule claimed nearly the whole inbox.
+ */
+function learningExclusionDomains(
+  internalDomains: readonly string[],
+  identity: MailboxIdentity | null,
+): Set<string> {
+  const out = new Set(internalDomains.map((d) => d.trim().toLowerCase().replace(/^@/, '')))
+  if (identity?.domain) out.add(identity.domain)
+  out.delete('')
+  return out
+}
+
+/**
+ * Existing rules (bucketed by signal) passed alongside the email being
+ * learned-from. Used by the domain (P4) and sender (P5) branches to detect
+ * whether the email would create a conflict with a stored
+ * same-signal-different-target rule — that's the moment when "先廣後窄"
+ * upgrades to compound.
  *
  * When the user just routed an email and the existing broad rule was
  * about to fire elsewhere, that's the signal "the broad rule isn't
  * enough anymore". We use THIS email's subject to build a precise
  * compound rule, demoting the broad rule via the override pipeline.
+ *
+ * `correction` (2026-11-05): the item is an explicit correction of the rule
+ * that routed it (ruleCorrectionOf). That rule pointed this very email
+ * elsewhere, so the conflict exists by definition — whatever its type —
+ * and P4 / P5 upgrade straight to the narrow form.
  */
 function chooseLearningSignal(
   item: PlanItem,
   internalDomainSet: ReadonlySet<string>,
-  existingRules: Rule[],
+  lookup: LearningLookup,
+  opts: { correction?: boolean } = {},
 ): LearningSignal | null {
   const subject = item.emailSubject ?? ''
+  const target = finalTargetPath(item)
   // Case identifiers via the shared gate (batch-3): subject-first, body only
   // as a single-distinct fallback. `fromBody` flows into the confidence and
   // source gate downstream. An ambiguous body (>1 distinct) yields no case
@@ -1198,8 +1745,8 @@ function chooseLearningSignal(
   const cc = fromBody && caseGate.bodyAmbiguous ? undefined : caseGate.courtCases[0]
   const codeAlpha = fromBody && caseGate.bodyAmbiguous ? undefined : caseGate.caseCodes[0]
   // Normalized full subject (reply/forward prefixes stripped, lower-
-  // cased, whitespace collapsed). Returns '' for empty / single-char
-  // subjects below MIN_SUBJECT_SIGNAL_LEN.
+  // cased, whitespace collapsed). Returns '' for subjects too short to
+  // learn (< MIN_NORMALIZED_SUBJECT_LEN since 2026-11-05).
   const subjectSignal = extractSubjectSignal(subject)
 
   const fromAddr = item.emailFrom ?? ''
@@ -1207,10 +1754,16 @@ function chooseLearningSignal(
   const domain =
     at >= 0 ? fromAddr.slice(at + 1).toLowerCase().trim() : ''
   // "Usable" excludes internal domains (configurable via
-  // settings.internalDomains) — colleagues forwarding multi-case mail
-  // should not produce per-folder domain rules. Empty internalDomainSet
-  // means solo mode, every external domain is usable.
+  // settings.internalDomains) and the mailbox's own domain — colleagues
+  // forwarding multi-case mail should not produce per-folder domain rules.
+  // An empty set means solo mode, every external domain is usable.
   const usableDomain = domain && !internalDomainSet.has(domain) ? domain : ''
+  // A same-signal rule that is live and routes elsewhere.
+  const conflictsWith = (type: 'domain' | 'sender', value: string): boolean =>
+    opts.correction === true ||
+    (lookup.get(signalKey(type, value)) ?? []).some(
+      (r) => r.enabled && !r.orphaned && r.targetFolderPath !== target,
+    )
 
   // ---- Priority 1: compound with court case (structural ID fast-path)
   // Court case numbers are unique per case → no bloat risk. Build
@@ -1264,20 +1817,10 @@ function chooseLearningSignal(
   // compound (domain + 整段主旨), encoding what made the user pick THIS
   // folder over the existing one.
   if (usableDomain && !isGenericProviderDomain(usableDomain)) {
-    // Compare via normalizeSignal so a stored rule signal of `@company-b.example`
-    // (legitimate when entered through certain manual flows / import
-    // sources) matches `company-b.example` from extractDomain. Direct
-    // `.toLowerCase()` compare was missing the `@`-prefix case and the
-    // trim-whitespace case, leaving conflicting domain rules undetected.
-    const conflictExists = existingRules.some(
-      (r) =>
-        r.type === 'domain' &&
-        normalizeSignal('domain', r.signal) === usableDomain &&
-        r.enabled &&
-        !r.orphaned &&
-        r.targetFolderPath !== item.targetFolderPath,
-    )
-    if (conflictExists) {
+    // Compared via normalizeSignal (the lookup key) so a stored rule
+    // signal of `@company-b.example` or ` company-b.example ` (manual /
+    // import paths) still matches `company-b.example` from the address.
+    if (conflictsWith('domain', usableDomain)) {
       // Upgrade path: this email's normalized subject becomes the
       // discriminator. The override pipeline will also demote the
       // stale plain-domain rule, so future mail of this domain whose
@@ -1316,17 +1859,7 @@ function chooseLearningSignal(
   if (fromAddr && usableDomain && isGenericProviderDomain(usableDomain)) {
     const normalized = fromAddr.toLowerCase().trim()
     if (normalized) {
-      // normalizeSignal mirrors what storage / index lookup uses so a
-      // sender stored as `User@Gmail.com` matches `user@gmail.com` here.
-      const conflictExists = existingRules.some(
-        (r) =>
-          r.type === 'sender' &&
-          normalizeSignal('sender', r.signal) === normalized &&
-          r.enabled &&
-          !r.orphaned &&
-          r.targetFolderPath !== item.targetFolderPath,
-      )
-      if (conflictExists) {
+      if (conflictsWith('sender', normalized)) {
         if (subjectSignal) {
           const signal = encodeCompound([
             { type: 'sender', value: normalized },
@@ -1356,8 +1889,9 @@ function chooseLearningSignal(
   // ---- Priority 6: internal-domain fallback (subject anchored on sender)
   //
   // Reached when there's no usable domain (internal forwarding from
-  // colleagues, anonymous From, etc.). Domain rule isn't appropriate
-  // here — internal colleagues mail about many cases.
+  // colleagues — including the mailbox's own domain — anonymous From,
+  // etc.). Domain rule isn't appropriate here — internal colleagues mail
+  // about many cases.
   //
   // Subject alone is also dangerous: a bare `subject_keyword: 「請審閱
   // 三井租賃合約」` rule would substring-match an external client's reply
@@ -1393,8 +1927,101 @@ function chooseLearningSignal(
   return null
 }
 
-function ruleNormSignal(r: Pick<Rule, 'type' | 'signal'>): string {
-  return normalizeSignal(r.type, r.signal)
+/**
+ * The rule a plan item EXPLICITLY corrected, or null (2026-11-05).
+ *
+ * A rule-routed row the user re-targeted reaches execute as source 'ai' with
+ * originalRuleId + userTouched but no aiOriginalAction (PlanRow flips the
+ * source when the row is edited and the rule never produced an AI verdict).
+ * wasUserOverride() therefore says "no", so the correction was treated as a
+ * passive AI confirmation: the birth gate held it back, and
+ * generateAiOverrideRules skipped it — nothing was learned and the broad
+ * rule kept misrouting (correcting client.example→A to B: 0 added, 0
+ * disabled). It is a correction only when the originating rule still exists
+ * and pointed somewhere other than where the user sent the mail.
+ * Auto-propagated siblings (no userTouched) are not corrections.
+ */
+export function ruleCorrectionOf(
+  item: PlanItem,
+  rulesById: ReadonlyMap<string, Rule>,
+): Rule | null {
+  if (!item.originalRuleId || item.userTouched !== true || item.source === 'rule') return null
+  if (item.action !== 'move' && item.action !== 'new_folder') return null
+  const rule = rulesById.get(item.originalRuleId)
+  if (!rule) return null
+  const target = finalTargetPath(item)
+  if (!target || target === rule.targetFolderPath) return null
+  return rule
+}
+
+type SubjectMemoryMap = Record<string, ThreadMemoryEntry>
+
+/**
+ * Birth-gate evidence for a full_subject signal (2026-11-05): has this
+ * normalized subject been filed to the same folder BEFORE — by a real
+ * (plan-reviewed, non-harvested) filing, with no conflict — or, inside this
+ * batch, by a different conversation?
+ *
+ * `prior` is subject memory as it was BEFORE this batch's filings were
+ * recorded (startExecute snapshots it). Reading it afterwards — the old
+ * behaviour — saw the current filing already counted and, worse, a
+ * harvested-only entry with its `harvested` flag already cleared by that
+ * very filing, so the harvested check was dead. Without a snapshot (older
+ * callers) the post-recording map is used with this batch's own filings
+ * subtracted from timesFiled; that fallback cannot recover the cleared
+ * harvested flag.
+ */
+function makeObservationCheck(
+  plan: readonly PlanItem[],
+  results: readonly ExecuteItemResult[],
+  prior: SubjectMemoryMap | undefined,
+  postRecording: SubjectMemoryMap | undefined,
+): (index: number, key: string, targetPath: string) => boolean {
+  // This batch's successful filings by normalized subject — the same
+  // eligibility execute uses when it records subject filings.
+  const batch = new Map<string, Array<{ index: number; target: string; convId?: string }>>()
+  for (let i = 0; i < plan.length; i++) {
+    const status = results[i]?.status
+    if (status !== 'moved' && status !== 'folder_created') continue
+    const item = plan[i]!
+    const key = normalizeSubject(item.emailSubject ?? '')
+    const target = finalTargetPath(item)
+    if (key.length < MIN_NORMALIZED_SUBJECT_LEN || !target) continue
+    const list = batch.get(key) ?? []
+    list.push({ index: i, target, convId: item.conversationId })
+    batch.set(key, list)
+  }
+  return (index, key, targetPath) => {
+    if (key.length < MIN_NORMALIZED_SUBJECT_LEN) return false
+    const item = plan[index]!
+    const entry = prior ? prior[key] : postRecording?.[key]
+    if (entry) {
+      const priorFilings = prior
+        ? entry.timesFiled
+        : entry.timesFiled - (batch.get(key)?.length ?? 0)
+      const sameFolder =
+        entry.folderPath === targetPath ||
+        (!!entry.folderId && entry.folderId === item.targetFolderId)
+      if (
+        priorFilings >= 1 &&
+        sameFolder &&
+        // 主旨曾在資料夾間搖擺 → 壞規則候選，比照 matchThreadMemory 的
+        // auto-route 門檻: 無衝突且非 harvested-only 才信任。
+        (entry.conflictCount ?? 0) === 0 &&
+        entry.harvested !== true
+      ) {
+        return true
+      }
+    }
+    // Cross-thread recurrence inside this batch: another conversation with
+    // the same subject went to the same folder. Same-conversation replies
+    // don't count — they are one thread (thread memory's job).
+    const self = item.conversationId
+    if (!self) return false
+    return (batch.get(key) ?? []).some(
+      (o) => o.index !== index && o.target === targetPath && !!o.convId && o.convId !== self,
+    )
+  }
 }
 
 /**
@@ -1418,34 +2045,39 @@ function isStructuralCourtCaseRule(r: Rule): boolean {
 export async function generateAiConfirmedRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
-): Promise<{ added: number; addedIds: string[]; details: RuleLearnedDetail[] }> {
-  // Snapshot of currently-enabled rules — only used for dedup checks.
+  opts: {
+    /** Subject memory BEFORE this batch's filings were recorded (birth gate). */
+    priorSubjectMemory?: SubjectMemoryMap
+  } = {},
+): Promise<{ added: number; addedIds: string[]; details: RuleLearnedDetail[]; revived: number }> {
+  // Snapshot of current rules — only used for dedup / conflict checks.
   // The atomic addRulesFilteringTombstones call below ensures we don't
   // clobber concurrent writers and respects user tombstones.
-  // subjectMemory: read AFTER this batch's recordSubjectFilings flush (the
-  // execute pipeline records filings before calling us), so the current
-  // filing is already counted — the birth gate below reads timesFiled ≥ 2
-  // as "at least one PRIOR filing".
-  const [existing, settings, subjectMemory] = await Promise.all([
+  const [existing, settings, identity, postRecording] = await Promise.all([
     listRules(),
     getSettings(),
-    getSubjectMemory(),
+    getMailboxIdentity().catch(() => null),
+    opts.priorSubjectMemory ? Promise.resolve(undefined) : getSubjectMemory(),
   ])
-  const internalDomainSet = new Set(
-    settings.internalDomains.map((d) => d.toLowerCase()),
-  )
+  const internalDomainSet = learningExclusionDomains(settings.internalDomains, identity)
+  const lookup = buildLearningLookup(existing)
+  const rulesById = new Map(existing.map((r) => [r.id, r]))
+  const observedBefore = makeObservationCheck(plan, results, opts.priorSubjectMemory, postRecording)
   const newRules: Rule[] = []
+  const newKeys = new Set<string>()
 
   for (let i = 0; i < plan.length; i++) {
     const item = plan[i]!
     const result = results[i]!
     if (result.status !== 'moved' && result.status !== 'folder_created') continue
     if (item.action !== 'move' && item.action !== 'new_folder') continue
-    // User overrode the AI's verdict — handled by generateAiOverrideRules.
-    // Skip here so we don't mis-attribute the user's choice to AI confidence.
-    if (wasUserOverride(item)) continue
+    // User overrode the AI's verdict, or explicitly corrected the rule that
+    // routed the row — handled by generateAiOverrideRules. Skip here so we
+    // don't mis-attribute the user's choice to AI confidence (and so the
+    // birth gate can't swallow a correction, 2026-11-05).
+    if (wasUserOverride(item) || ruleCorrectionOf(item, rulesById)) continue
 
-    const sig = chooseLearningSignal(item, internalDomainSet, existing)
+    const sig = chooseLearningSignal(item, internalDomainSet, lookup)
     if (!sig) continue
 
     // Structural unique identifier = court case number or Latin case code.
@@ -1459,21 +2091,34 @@ export async function generateAiConfirmedRules(
     // rule/thread bypass below — bodies quote other parties' cases. Only a
     // SUBJECT structural id keeps the "first-sight learn from any route" power.
     const structuralTrusted = isStructural && !('fromBody' in sig && sig.fromBody)
+    const fullSubject = 'featureKind' in sig && sig.featureKind === 'full_subject'
+    // Thread-routed SUBJECT repeat (2026-11-05): subject memory routed this
+    // row because the same normalized subject was filed here before, and the
+    // user let it stand — that IS the second observation the birth gate
+    // waits for. The source gate used to drop every thread-routed
+    // non-structural row, and the second same-subject email is exactly what
+    // thread memory routes — so in normal flow the gate never opened and
+    // passive full_subject rules could not be minted at all. convId repeats
+    // stay excluded: a reply in the same conversation is the same thread.
+    const threadSubjectRepeat =
+      item.source === 'thread' && item.threadMatch?.kind === 'subject' && item.userTouched !== true
 
     // Source gate:
     //   - ai / unresolved: always eligible (AI was confident & accepted, or
     //     the user resolved it — human-validated intent).
-    //   - rule / thread: eligible ONLY for SUBJECT structural IDs. This lets a
+    //   - rule / thread: eligible for SUBJECT structural IDs. This lets a
     //     case number routed by thread memory (or by a DIFFERENT rule, e.g. a
     //     plain-domain rule) mint a durable, syncable, cross-sender case
     //     rule — closing the thread-memory learning dead-end. Non-structural
     //     and body-derived rule/thread hits stay excluded (they'd overfit a
     //     broad subject, or trust a noisy body citation from an unvalidated
-    //     route).
+    //     route) — except the thread-subject repeat above, which still has
+    //     to pass the birth gate.
     if (
       item.source !== 'ai' &&
       item.source !== 'unresolved' &&
-      !structuralTrusted
+      !structuralTrusted &&
+      !(threadSubjectRepeat && fullSubject)
     ) {
       continue
     }
@@ -1489,56 +2134,34 @@ export async function generateAiConfirmedRules(
     // 兩次觀察出生閘門 (2026-07-16): full_subject 訊號不再首見即鑄。
     // 實測 325 條規則庫中 73% 是 compound/full_subject、其中 71% 從未
     // 命中過 — 大多數主旨一輩子只出現一次，同 thread 的回信本來就由
-    // thread memory 接住。改為: SubjectMemory 中同主旨已有至少一次
-    // 「先前的」真實歸檔到同一資料夾才鑄永久規則 (timesFiled ≥ 2 —
-    // recordSubjectFilings 在本函式之前已記下本次，見上方註解)。
-    // 第一與第二次之間的跨 thread 同主旨信多花一次 AI 呼叫，屬預期成本。
+    // thread memory 接住。改為: 本批「之前」SubjectMemory 中同主旨已有
+    // 至少一次真實歸檔到同一資料夾（或本批內另一個對話的同主旨信）才鑄
+    // 永久規則（見 makeObservationCheck）。第一與第二次之間的跨 thread
+    // 同主旨信多花一次 AI 呼叫，屬預期成本。
     //
-    // 範圍: 只擋被動 AI 確認 (source === 'ai')。使用者主動解決
-    // (unresolved) 與 override 路徑 (generateAiOverrideRules) 表達了
-    // 明確人為意圖，維持立即學習。結構化案號 (court_case / case_code)
-    // 不是 full_subject、不受影響。
-    if (item.source === 'ai' && 'featureKind' in sig && sig.featureKind === 'full_subject') {
+    // 範圍: 被動 AI 確認 (source === 'ai') 與 thread 主旨重複。使用者主動
+    // 解決 (unresolved) 與 override / 更正路徑 (generateAiOverrideRules)
+    // 表達了明確人為意圖，維持立即學習。結構化案號 (court_case /
+    // case_code) 不是 full_subject、不受影響。full_subject 訊號必然 ≥
+    // MIN_NORMALIZED_SUBJECT_LEN（extractSubjectSignal 的門檻，2026-11-05
+    // 起與 SubjectMemory 一致），所以閘門對每個訊號都可運作、不會無限封鎖。
+    if ((item.source === 'ai' || item.source === 'thread') && fullSubject) {
       const key = normalizeSubject(item.emailSubject ?? '')
-      // 閘門只在「兩次觀察機制實際可運作」時生效: SubjectMemory 的所有
-      // 寫入端都以 MIN_NORMALIZED_SUBJECT_LEN(8) 為門檻，2–7 字的短主旨
-      // 永遠不會被記錄 — 對它們套閘門不是延後一輪、是無限封鎖。短主旨
-      // 類維持原本的首見即鑄（量少、且 compound 有寄件人錨定）。
-      //
-      // 已知且接受的邊界: 同一批含 2+ 封同主旨信（同 thread 的回信一起
-      // 進批次）時，本批的 recordSubjectFilings 一次灌成 timesFiled=2，
-      // 閘門會放行 — 首見即鑄。方向是 wrongly-kept（便宜），且該主旨至少
-      // 展現過批內重複，不值得為它引入跨批次的觀察記帳。
-      if (key.length >= MIN_NORMALIZED_SUBJECT_LEN) {
-        const entry = subjectMemory[key]
-        const observedBefore =
-          !!entry &&
-          entry.folderPath === targetPath &&
-          entry.timesFiled >= 2 &&
-          // 主旨曾在資料夾間搖擺 → 壞規則候選，比照 matchThreadMemory
-          // 的 auto-route 門檻: 無衝突且非 harvested-only 才信任。
-          (entry.conflictCount ?? 0) === 0 &&
-          entry.harvested !== true
-        if (!observedBefore) continue
-      }
+      if (!observedBefore(i, key, targetPath)) continue
     }
 
-    // Dedup against ALL rules (including disabled). Previously we only checked
-    // enabled rules, which let AI-confirmed creation keep regenerating
-    // identical disabled rules — they'd pile up forever after a user disables.
-    const sigNorm = normalizeSignal(sig.type, sig.signal)
+    // Dedup against ALL rules: an enabled twin, or a twin the USER disabled
+    // (or one parked as case_closed / legacy_token), covers this triple. A
+    // twin the engine auto-disabled for a revivable reason does NOT — the
+    // candidate goes on to addRulesFilteringTombstones, which switches that
+    // twin back on instead of adding a row (2026-11-05: treating every
+    // disabled copy as covered made the revive branch unreachable).
+    const sameSignal = lookup.get(signalKey(sig.type, sig.signal)) ?? []
+    const tripleKey = `${signalKey(sig.type, sig.signal)}::${targetPath}`
     const alreadyCovered =
-      existing.some(
-        (r) =>
-          r.type === sig.type &&
-          ruleNormSignal(r) === sigNorm &&
-          r.targetFolderPath === targetPath,
-      ) ||
-      newRules.some(
-        (r) =>
-          r.type === sig.type &&
-          ruleNormSignal(r) === sigNorm &&
-          r.targetFolderPath === targetPath,
+      newKeys.has(tripleKey) ||
+      sameSignal.some(
+        (r) => r.targetFolderPath === targetPath && !isRevivableAutoDisabled(r),
       )
     if (alreadyCovered) continue
 
@@ -1555,20 +2178,16 @@ export async function generateAiConfirmedRules(
     //
     // NOT applied to court_case / case_code variants — those are
     // structurally unique identifiers (an entire court case number
-    // can't legitimately route to multiple folders).
+    // can't legitimately route to multiple folders). (Reviving a dormant
+    // twin into a conflict is refused centrally in
+    // addRulesFilteringTombstones, for every signal type.)
     const isConflictProneSignal =
       sig.type === 'domain' ||
       sig.type === 'sender' ||
       (sig.type === 'subject_keyword' && sig.featureKind === 'full_subject') ||
       (sig.type === 'compound' && sig.featureKind === 'full_subject')
     if (isConflictProneSignal) {
-      const hasConflict = existing.some(
-        (r) =>
-          r.type === sig.type &&
-          r.enabled &&
-          ruleNormSignal(r) === sigNorm &&
-          r.targetFolderPath !== targetPath,
-      )
+      const hasConflict = sameSignal.some((r) => r.enabled && r.targetFolderPath !== targetPath)
       if (hasConflict) continue
     }
 
@@ -1628,6 +2247,7 @@ export async function generateAiConfirmedRules(
     const confidence =
       (userResolved ? Math.min(0.95, baseConfidence + 0.05) : baseConfidence) - bodyPenalty
 
+    newKeys.add(tripleKey)
     newRules.push(
       newRule({
         type: sig.type,
@@ -1653,8 +2273,10 @@ export async function generateAiConfirmedRules(
 
   // Filter against tombstones + write atomically. Closes the race where
   // a concurrent deleteRule could land between filter and write, letting
-  // us auto-resurrect a rule the user just deleted.
-  const { added } = await addRulesFilteringTombstones(newRules)
+  // us auto-resurrect a rule the user just deleted. Revived twins are
+  // reported separately and are NOT in addedIds: undo deletes (and
+  // tombstones) addedIds, which must never hit a rule older than the batch.
+  const { added, reEnabled } = await addRulesFilteringTombstones(newRules)
   // Ids are threaded into the undo snapshot (H2) so 撤回 can delete the
   // rules this batch just minted — otherwise the reverted misfiling is
   // deterministically re-proposed next batch. `details` feed the DoneScreen
@@ -1663,6 +2285,7 @@ export async function generateAiConfirmedRules(
     added: added.length,
     addedIds: added.map((r) => r.id),
     details: added.map((r) => ruleLearnedDetail(r)),
+    revived: reEnabled.length,
   }
 }
 
@@ -1681,13 +2304,17 @@ function ruleLearnedDetail(r: Rule): RuleLearnedDetail {
  * Mirror of generateAiConfirmedRules for the "user disagreed" case.
  *
  * When the AI suggested move/new_folder → A but the user changed it to B and
- * the move to B executed successfully, the user has just taught us something
- * concrete about emails from that sender domain. We:
- *   1. Add a new ai_overridden rule (confidence 0.8 — higher than 0.7 used
- *      by ai_confirmed because user-validated > AI-validated).
+ * the move to B executed successfully — or the user re-targeted a row a RULE
+ * had routed to A (ruleCorrectionOf, 2026-11-05) — the user has just taught
+ * us something concrete. We:
+ *   1. Add a new ai_overridden rule (confidence 0.95, capped per type —
+ *      user-validated > AI-validated), or switch an auto-disabled twin of it
+ *      back on.
  *   2. Disable any *non-user_manual* existing rule that points the same
- *      (type, signal) at a different target. This stops the AI from getting
- *      tugged back toward the wrong answer on the next batch.
+ *      (type, signal) at a different target, and — on a "先廣後窄" compound
+ *      upgrade — the broad plain-domain / plain-sender rule it narrows,
+ *      recording autoDisabledReason 'superseded' (or 'override' when nothing
+ *      replaces it) so the rule can revive / be purged later.
  *
  * User_manual rules are sacred — never auto-disable them; the user knew what
  * they wanted when they hand-built that rule.
@@ -1695,7 +2322,7 @@ function ruleLearnedDetail(r: Rule): RuleLearnedDetail {
 export async function generateAiOverrideRules(
   plan: PlanItem[],
   results: ExecuteItemResult[],
-): Promise<{ added: number; disabled: number; details: RuleLearnedDetail[] }> {
+): Promise<{ added: number; disabled: number; details: RuleLearnedDetail[]; revived: number }> {
   type Override = {
     type: LearningSignal['type']
     signal: string
@@ -1711,29 +2338,46 @@ export async function generateAiOverrideRules(
     // batch-3: structural id came from the body, not the subject → mint at a
     // lower confidence even on the (user-validated) override path.
     fromBody: boolean
+    // Plain anchors of a compound signal (decoded ONCE here instead of per
+    // rule inside the demote scan — 2026-11-05).
+    anchors: Array<{ type: 'domain' | 'sender'; norm: string }>
   }
   const overrides: Override[] = []
   // Existing rules needed for chooseLearningSignal's conflict-prevention
-  // check (priority 6 / 7) — if learning a plain-domain rule would
+  // check (priority 4 / 5) — if learning a plain-domain rule would
   // collide with an existing different-target rule, force compound.
-  const [existing, settings] = await Promise.all([listRules(), getSettings()])
-  const internalDomainSet = new Set(
-    settings.internalDomains.map((d) => d.toLowerCase()),
-  )
+  const [existing, settings, identity] = await Promise.all([
+    listRules(),
+    getSettings(),
+    getMailboxIdentity().catch(() => null),
+  ])
+  const internalDomainSet = learningExclusionDomains(settings.internalDomains, identity)
+  const lookup = buildLearningLookup(existing)
+  const rulesById = new Map(existing.map((r) => [r.id, r]))
 
   for (let i = 0; i < plan.length; i++) {
     const item = plan[i]!
     const result = results[i]!
     if (result.status !== 'moved' && result.status !== 'folder_created') continue
-    if (!wasUserOverride(item)) continue
+    const aiOverride = wasUserOverride(item)
+    const correction = !aiOverride && ruleCorrectionOf(item, rulesById) !== null
+    if (!aiOverride && !correction) continue
     // We can only codify move-style overrides as rules. delete / skip are
     // valid user decisions but our Rule type has no action field — a rule
     // always means "move to target".
     if (item.action !== 'move' && item.action !== 'new_folder') continue
-    const sig = chooseLearningSignal(item, internalDomainSet, existing)
+    const sig = chooseLearningSignal(item, internalDomainSet, lookup, { correction })
     if (!sig) continue
     const target = finalTargetPath(item)
     if (!target) continue
+    const anchors: Override['anchors'] = []
+    if (sig.type === 'compound') {
+      for (const c of decodeCompound(sig.signal)?.conditions ?? []) {
+        if (c.type === 'domain' || c.type === 'sender') {
+          anchors.push({ type: c.type, norm: normalizeSignal(c.type, c.value) })
+        }
+      }
+    }
     overrides.push({
       type: sig.type,
       signal: sig.signal,
@@ -1745,9 +2389,12 @@ export async function generateAiOverrideRules(
       demoteOnly:
         (sig.type === 'domain' || sig.type === 'sender') && sig.demoteOnly === true,
       fromBody: 'fromBody' in sig && sig.fromBody === true,
+      anchors,
     })
   }
-  if (overrides.length === 0) return { added: 0, disabled: 0, details: [] as RuleLearnedDetail[] }
+  if (overrides.length === 0) {
+    return { added: 0, disabled: 0, details: [] as RuleLearnedDetail[], revived: 0 }
+  }
 
   // Track the mutations so we can record audit events AFTER the mutex
   // releases. Doing it inside mutateRules would mean nested storage writes
@@ -1769,73 +2416,56 @@ export async function generateAiOverrideRules(
   const outcome = await mutateRules(async (rules) => {
     // Tombstone read INSIDE the rules lock — closes the race where a
     // concurrent deleteRule could write a tombstone between our read
-    // and our write, letting us auto-resurrect the deleted rule.
-    const tombKeys = new Set(
-      (await getRuleTombstones()).map(
-        (t) => `${t.type}::${t.signalNorm}::${t.targetFolderPath}`,
-      ),
-    )
+    // and our write, letting us auto-resurrect the deleted rule. Keys are
+    // canonical (tombstoneKey) so tombstones from older builds still block.
+    const tombKeys = new Set((await getRuleTombstones()).map(tombstoneKey))
     const allowedOverrides = overrides.filter(
       (o) => !tombKeys.has(`${o.type}::${o.signalNorm}::${o.targetPath}`),
     )
     if (allowedOverrides.length === 0) {
-      return { next: rules, result: { added: 0, disabled: 0 } }
+      return { next: rules, result: { added: 0, disabled: 0, revived: 0 } }
     }
     let added = 0
     let disabled = 0
+    let revived = 0
     const next = [...rules]
+    // Normalized once per rule (2026-11-05) — the scan below runs per
+    // override, and compound normalization is a JSON parse.
+    const norms = next.map((r) => normalizeSignal(r.type, r.signal))
     const now = Date.now()
+    const nowIso = new Date(now).toISOString()
 
     for (const o of allowedOverrides) {
-      const sameTypeSignalMatches = (r: Rule): boolean => {
-        if (r.type !== o.type) return false
-        return ruleNormSignal(r) === o.signalNorm
-      }
-      // "先廣後窄" upgrade demotion: when learning a compound rule built
-      // from a conflict-upgrade (e.g. compound: vendor.com + 請款通知),
-      // ALSO retire any enabled plain-domain (or plain-sender) rule for
-      // the same anchor that points to a different folder. Reason: the
-      // user's mental model is "the domain rule wasn't enough anymore",
-      // so the broad rule should step aside. Future mail of this domain
-      // whose subject doesn't match either compound rule falls back to
-      // AI / conversation memory, which is the correct behavior.
-      const isStalePlainRuleForCompoundUpgrade = (r: Rule): boolean => {
-        if (o.type !== 'compound') return false
-        const parsed = decodeCompound(o.signal)
-        if (!parsed) return false
-        for (const cond of parsed.conditions) {
-          if (
-            cond.type === 'domain' &&
-            r.type === 'domain' &&
-            ruleNormSignal(r) === normalizeSignal('domain', cond.value)
-          ) {
-            return true
-          }
-          if (
-            cond.type === 'sender' &&
-            r.type === 'sender' &&
-            ruleNormSignal(r) === normalizeSignal('sender', cond.value)
-          ) {
-            return true
-          }
-        }
-        return false
-      }
-      // If a rule for (type, signal, target) already exists, the user's
-      // preferred mapping is already represented — still demote competitors.
-      const alreadyCovered = next.some(
-        (r) => sameTypeSignalMatches(r) && r.targetFolderPath === o.targetPath,
-      )
       // Demote sibling rules with same (type, signal) but different target —
-      // they're the "AI's wrong answer" we want to retire. user_manual is
-      // sacred — the user knew what they were doing when they handbuilt it.
+      // they're the "AI's wrong answer" we want to retire — and, on a
+      // "先廣後窄" compound upgrade (e.g. compound: vendor.com + 請款通知單),
+      // any enabled plain-domain (or plain-sender) rule for the same anchor
+      // that points elsewhere: the user's mental model is "the domain rule
+      // wasn't enough anymore", so the broad rule should step aside. Future
+      // mail of this domain whose subject doesn't match either compound rule
+      // falls back to AI / conversation memory, which is the correct
+      // behavior. user_manual is sacred — the user knew what they were
+      // doing when they handbuilt it.
+      //
+      // Reason (2026-11-05): 'superseded' when a narrower / replacement rule
+      // takes over, 'override' for a demoteOnly correction with nothing to
+      // replace it. Either way it is an AUTO disable: revivable by learning,
+      // purged after DORMANT_PURGE_ACTIVE_DAYS — before, the bare
+      // enabled=false read as user-disabled and blocked the triple forever.
       for (let i = 0; i < next.length; i++) {
         const r = next[i]!
-        if (!sameTypeSignalMatches(r) && !isStalePlainRuleForCompoundUpgrade(r)) continue
+        const sameSignal = r.type === o.type && norms[i] === o.signalNorm
+        const narrowedAnchor = o.anchors.some((a) => a.type === r.type && a.norm === norms[i])
+        if (!sameSignal && !narrowedAnchor) continue
         if (r.targetFolderPath === o.targetPath) continue
         if (r.source === 'user_manual') continue
         if (!r.enabled) continue
-        next[i] = { ...r, enabled: false }
+        next[i] = {
+          ...r,
+          enabled: false,
+          autoDisabledAt: nowIso,
+          autoDisabledReason: o.demoteOnly ? 'override' : 'superseded',
+        }
         disabled++
         auditEvents.push({
           kind: 'toggle',
@@ -1848,37 +2478,76 @@ export async function generateAiOverrideRules(
           targetFolderPath: r.targetFolderPath,
         })
       }
-      if (alreadyCovered) continue
+      // Is the user's preferred mapping already represented? An enabled
+      // twin covers it; a twin the user disabled (or one parked as
+      // case_closed / legacy) still blocks it.
+      let revivableAt = -1
+      let covered = false
+      for (let i = 0; i < next.length; i++) {
+        const r = next[i]!
+        if (r.type !== o.type || norms[i] !== o.signalNorm || r.targetFolderPath !== o.targetPath) {
+          continue
+        }
+        if (isRevivableAutoDisabled(r)) {
+          if (revivableAt < 0) revivableAt = i
+        } else {
+          covered = true
+        }
+      }
+      if (covered) continue
       // Gate: don't auto-create plain-domain rules from a single user
       // override. Same domain often serves multiple cases — one override
       // isn't enough evidence to reroute every email from this domain.
       // Sender rules (specific From address) DO pass through: one
       // human-validated routing for an exact address is strong signal.
       if (o.type === 'domain') continue
-      // demoteOnly: chooseLearningSignal detected a conflict but couldn't
-      // extract a subject feature even with the lenient extractor. We
-      // already demoted the stale rule above; creating a new rule for
-      // the same plain signal would just re-create the same conflict
-      // pattern next batch. Applies to sender variant (domain already
-      // skipped above).
+      // demoteOnly: chooseLearningSignal detected a conflict but the
+      // subject is too short to learn. We already demoted the stale rule
+      // above; creating (or reviving) a rule for the same plain signal
+      // would just re-create the same conflict pattern next batch. Applies
+      // to the sender variant (domain already skipped above).
       if (o.demoteOnly) continue
-      const created = newRule({
-        type: o.type,
-        signal: o.signal,
-        targetFolderId: o.targetId,
-        targetFolderPath: o.targetPath,
-        // User-validated → higher confidence than ai_confirmed. Domain
-        // rule creation is blocked above so we only get here for
-        // compound / case_code / subject_keyword / sender — all of which
-        // either uniquely identify a case or pinpoint a specific human.
-        // A body-derived case id (batch-3) is docked to 0.85 even here: the
-        // user validated the DESTINATION, but the body citation itself is
-        // noisier than a subject one, so let the error-rate gate cull it
-        // sooner if it misfires.
-        confidence: o.fromBody ? 0.85 : 0.95,
-        source: 'ai_overridden',
-      })
+      if (revivableAt >= 0) {
+        // The engine had auto-disabled exactly this mapping (one-strike
+        // 'override', 'superseded' …) and the user now chose it explicitly:
+        // switch it back on rather than minting a twin (2026-11-05).
+        const r = next[revivableAt]!
+        next[revivableAt] = revivedRule(r, nowIso)
+        revived++
+        auditEvents.push({
+          kind: 'toggle',
+          ruleId: r.id,
+          at: now,
+          actor: 'system',
+          enabled: true,
+          signal: r.signal,
+          type: r.type,
+          targetFolderPath: r.targetFolderPath,
+        })
+        continue
+      }
+      // User-validated → higher confidence than ai_confirmed. Domain
+      // rule creation is blocked above so we only get here for
+      // compound / case_code / subject_keyword / sender — all of which
+      // either uniquely identify a case or pinpoint a specific human.
+      // A body-derived case id (batch-3) is docked to 0.85 even here: the
+      // user validated the DESTINATION, but the body citation itself is
+      // noisier than a subject one, so let the error-rate gate cull it
+      // sooner if it misfires. applyConfidenceCap (2026-11-05): this path
+      // used to write 0.95 straight through — above the sender (0.75) and
+      // subject_keyword (0.9) ceilings every other write enforces.
+      const created = applyConfidenceCap(
+        newRule({
+          type: o.type,
+          signal: o.signal,
+          targetFolderId: o.targetId,
+          targetFolderPath: o.targetPath,
+          confidence: o.fromBody ? 0.85 : 0.95,
+          source: 'ai_overridden',
+        }),
+      )
       next.push(created)
+      norms.push(o.signalNorm)
       createdRules.push(created)
       auditEvents.push({
         kind: 'create',
@@ -1890,7 +2559,10 @@ export async function generateAiOverrideRules(
       added++
     }
 
-    return { next, result: { added, disabled } }
+    if (added === 0 && disabled === 0 && revived === 0) {
+      return { next: rules, result: { added, disabled, revived } }
+    }
+    return { next, result: { added, disabled, revived } }
   })
   if (auditEvents.length > 0) {
     await recordRuleEvents(auditEvents).catch((e) =>
@@ -1915,6 +2587,17 @@ async function captureUndoSnapshot(
   const moves: UndoSnapshot['moves'] = []
   for (let i = 0; i < state.results.length; i++) {
     const r = state.results[i]!
+    // Deletes are moves into Deleted Items now (2026-11-05) → undoable.
+    // No learning keys: a delete teaches nothing (no hits, no thread memory).
+    if (r.status === 'deleted' && r.newMessageId) {
+      moves.push({
+        newMessageId: r.newMessageId,
+        subject: r.subject,
+        destinationFolderId: r.destinationFolderId ?? 'deleteditems',
+        deleted: true,
+      })
+      continue
+    }
     if (
       (r.status !== 'moved' && r.status !== 'folder_created') ||
       !r.newMessageId ||
@@ -1980,12 +2663,28 @@ export type UndoResult = {
 }
 
 /**
- * Reverse the most-recent batch's moves by moving each message back to inbox.
+ * Reverse the most-recent batch's moves — and, since 2026-11-05, its deletes
+ * (moves into Deleted Items) — by moving each message back to inbox.
  * No-op if snapshot is missing/expired. Clears the snapshot on completion
  * (including partial failures — a follow-up retry would address pre-moved
  * messages a second time, which Outlook rejects with 404).
  */
 export async function executeUndo(api: OutlookApi): Promise<UndoResult> {
+  // Synchronous guards before the first await (2026-11-05, invariant 6): a
+  // double trigger (button + `u` key) used to replay every move of the
+  // snapshot twice, and an undo racing a batch start could move mail the
+  // new batch was about to process.
+  if (undoInFlight) throw new Error('撤回進行中')
+  if (executeClaimed) throw new Error('批次執行中,無法撤回')
+  undoInFlight = true
+  try {
+    return await runUndo(api)
+  } finally {
+    undoInFlight = false
+  }
+}
+
+async function runUndo(api: OutlookApi): Promise<UndoResult> {
   const snap = await getUndoSnapshot()
   if (!snap) return { attempted: 0, restored: 0, failed: 0, errors: [] }
 
@@ -2018,12 +2717,15 @@ export async function executeUndo(api: OutlookApi): Promise<UndoResult> {
     // got STICKIER each cycle. Reverse it for the moves that actually
     // restored; skip entirely when nothing came back (the mailbox still
     // matches what was learned). Each step is independent + non-fatal.
-    if (restoredMoves.length > 0) {
+    // Restored DELETES (2026-11-05) taught nothing, so they don't count:
+    // un-deleting alone must not delete the batch's minted rules.
+    const restoredFilings = restoredMoves.filter((m) => !m.deleted)
+    if (restoredFilings.length > 0) {
       // (a) Undo counts as an override against the driving rules — feeds
       //     the empirical-accuracy demotion (high error rate → auto
       //     disable), same as editing the row before execute would have.
       const overrideTally = new Map<string, number>()
-      for (const m of restoredMoves) {
+      for (const m of restoredFilings) {
         if (m.ruleId) overrideTally.set(m.ruleId, (overrideTally.get(m.ruleId) ?? 0) + 1)
       }
       if (overrideTally.size > 0) {

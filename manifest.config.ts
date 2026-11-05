@@ -7,7 +7,11 @@ export default defineManifest({
   version: pkg.version,
   description: pkg.description,
 
-  permissions: ['storage', 'activeTab', 'scripting', 'downloads', 'alarms'],
+  // activeTab removed (2026-11-05): host_permissions already cover every page we act on.
+  // scripting: re-injects the token reader into OWA tabs orphaned by an extension update.
+  // unlimitedStorage: rules + thread memory + ledgers + sync backups can exceed the 10 MB
+  // default; once over quota EVERY storage write fails (rule edits, learning).
+  permissions: ['storage', 'unlimitedStorage', 'scripting', 'downloads', 'alarms'],
   host_permissions: [
     'https://outlook.office.com/*',
     'https://outlook.office365.com/*',

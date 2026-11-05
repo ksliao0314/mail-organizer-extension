@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { MOVED_BY_US_LEDGER_TTL_MS, THREAD_MEMORY_MAX_AGE_MS } from '@/shared/constants'
 import { addToMovedByUsLedger, getMovedByUsLedger } from '@/shared/storage'
 
 const DAY = 24 * 60 * 60 * 1000
@@ -41,9 +42,34 @@ describe('movedByUsLedger', () => {
     expect(ledger.map((e) => e.newMessageId)).toEqual(['keep'])
   })
 
-  it('drops entries past the 21-day TTL on write', async () => {
-    await addToMovedByUsLedger([entry({ newMessageId: 'stale', movedAt: Date.now() - 22 * DAY })])
+  it('drops entries past the TTL on write (TTL = thread-memory max age, 2026-11-05)', async () => {
+    await addToMovedByUsLedger([
+      entry({ newMessageId: 'stale', movedAt: Date.now() - THREAD_MEMORY_MAX_AGE_MS - DAY }),
+    ])
     expect(await getMovedByUsLedger()).toHaveLength(0)
+  })
+
+  it('keeps a 22-day-old own move (was dropped at the old 21-day TTL → re-harvested)', async () => {
+    await addToMovedByUsLedger([entry({ newMessageId: 'old-own-move', movedAt: Date.now() - 22 * DAY })])
+    expect((await getMovedByUsLedger()).map((e) => e.newMessageId)).toEqual(['old-own-move'])
+  })
+
+  it('ledger TTL never falls below the thread-memory retention it protects', () => {
+    expect(MOVED_BY_US_LEDGER_TTL_MS).toBeGreaterThanOrEqual(THREAD_MEMORY_MAX_AGE_MS)
+  })
+
+  it('stores slim entries — normalizedSubject (never read by the harvester) is dropped', async () => {
+    await addToMovedByUsLedger([
+      { ...entry({ newMessageId: 'slim' }), normalizedSubject: '112訴204 開庭' } as never,
+    ])
+    const [stored] = await getMovedByUsLedger()
+    expect(stored).toEqual({
+      newMessageId: 'slim',
+      destinationFolderId: 'fid1',
+      conversationId: 'conv1',
+      movedAt: expect.any(Number),
+    })
+    expect(stored).not.toHaveProperty('normalizedSubject')
   })
 
   it('is a no-op on empty input', async () => {

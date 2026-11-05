@@ -1,4 +1,4 @@
-// Compact wire codec for chrome.storage.sync (schemaVersion 3).
+// Compact wire codec for chrome.storage.sync (schemaVersion 3 + 4).
 //
 // Why: the dominant cost in a synced rule library is the folder reference.
 // A Graph folder Id is ~125 bytes and every rule carries one; with 174
@@ -8,14 +8,28 @@
 // omitted defaults) roughly halves the bytes — the difference between fitting
 // the 100 KB sync quota and blowing past it.
 //
+// v4 (2026-11-05) on top of v3:
+//   - `ea` editedAt per row (sync merges per rule by it — see types.ts).
+//   - compound signals as [kindCode, value] pairs instead of the escaped
+//     `{"conditions":[{"type":…,"value":…}]}` JSON string (~82 B/row; compounds
+//     are ~73% of a real library). Same for compound tombstone keys.
+//   - canonical ISO timestamps as epoch-ms numbers (~13 B each).
+//   - disabled-rule STUBS ([id, editedAt, reason, disabledAt]) so a disable
+//     propagates even when the budget can't fit the rule's full row.
+//   - compact tombstone rows [type, signalNorm, path, deletedAt].
+//   Every compaction is applied only when it round-trips BYTE-EXACTLY, so a
+//   decoded rule compares equal to the encoded one (no spurious edits).
+//
 // This module is PURE (Rule[] ↔ wire objects). No storage I/O — the sync
-// engine chunks the output and writes it. All decode paths are defensive:
-// malformed rows are skipped, unknown enum codes fall back to safe defaults,
-// and a missing folder resolves to empty strings rather than corrupting
-// neighbouring rules (folders are addressed by an explicit index, never by
-// array position, so a dropped folder chunk can't shift the mapping).
+// engine chunks the output and writes it. All decode paths are defensive and
+// SKIP what they cannot represent faithfully: a row with an unknown type /
+// source / compound-kind code, or whose folder reference has no dictionary
+// entry, is dropped rather than coerced (coercion used to turn unknown types
+// into subject_keyword rules and dangling folders into EMPTY targets that
+// replaced good local copies and re-spread on the next push). An unknown
+// reason code keeps the rule and drops only the reason.
 
-import type { Rule, RuleSource, RuleType } from './types'
+import type { Rule, RuleSource, RuleTombstone, RuleType } from './types'
 
 // --- Enum codes -------------------------------------------------------------
 // APPEND-ONLY. A code is a wire value shared across machines; never renumber
@@ -51,7 +65,7 @@ const CODE_TO_SOURCE: readonly RuleSource[] = [
   'user_manual',
 ]
 
-type DisabledReason = NonNullable<Rule['autoDisabledReason']>
+export type DisabledReason = NonNullable<Rule['autoDisabledReason']>
 // RELEASE DISCIPLINE: a new reason code must ship in the SAME release as
 // its first writer. A build that writes code N while another machine's
 // build lacks entry N would silently strip the reason on decode and
@@ -62,13 +76,31 @@ const REASON_TO_CODE: Record<DisabledReason, number> = {
   'high-error-rate': 1,
   legacy_token: 2,
   case_closed: 3,
+  override: 4, // 2026-11-05: one-strike disable after a user re-target
+  superseded: 5, // 2026-11-05: broad rule silenced by a narrower one
 }
 const CODE_TO_REASON: readonly DisabledReason[] = [
   'stale',
   'high-error-rate',
   'legacy_token',
   'case_closed',
+  'override',
+  'superseded',
 ]
+
+type CompoundKind = 'domain' | 'subject_keyword' | 'sender'
+const KIND_TO_CODE: Record<CompoundKind, number> = {
+  domain: 0,
+  subject_keyword: 1,
+  sender: 2,
+}
+const CODE_TO_KIND: readonly CompoundKind[] = ['domain', 'subject_keyword', 'sender']
+
+function codeLookup<T>(table: readonly T[], code: unknown): T | undefined {
+  return typeof code === 'number' && Number.isInteger(code) && code >= 0 && code < table.length
+    ? table[code]
+    : undefined
+}
 
 // --- Wire shapes ------------------------------------------------------------
 
@@ -89,6 +121,72 @@ export type FolderDictEntry = {
   p: string
 }
 
+/** ISO timestamp, or (v4) its epoch-ms when that round-trips exactly. */
+export type CompactTime = string | number
+
+/** v4 compound conditions: [kindCode, value] per condition, in order. */
+export type CompactCompound = Array<[number, string]>
+
+/**
+ * A rule as stored on the wire. Short keys; default-valued fields omitted
+ * (enabled=true, matchCount=0, overrideCount=0, and all optionals). `f`
+ * indexes into the folder dictionary.
+ */
+export type CompactRuleRow = {
+  i: string // id
+  t: number // type code
+  s: string | CompactCompound // signal (v4: compact pairs for exact-round-trip compounds)
+  f: string // folder reference (FolderDictEntry.x)
+  c: number // confidence
+  r: number // source code (r = "role/source"; s is taken by signal)
+  ca: CompactTime // createdAt
+  m?: number // matchCount (omit if 0)
+  o?: number // overrideCount (omit if 0 / undefined)
+  e?: 0 // enabled: omit if true, store 0 if false
+  lu?: CompactTime // lastUsedAt (omit if absent)
+  da?: CompactTime // autoDisabledAt (omit if absent)
+  dr?: number // autoDisabledReason code (omit if absent)
+  ea?: number // v4: editedAt epoch ms (omit if absent)
+}
+
+/**
+ * v4 disabled-state stub: `[id, editedAt|0, reasonCode|-1, autoDisabledAt]`
+ * (trailing entries omitted when absent). Sent for a disabled rule whose full
+ * row did not fit the byte budget, so the disable still propagates — before
+ * v4 the budget dropped disabled rules first and the other machine's enabled
+ * copy then re-enabled the rule everywhere. A stub never creates a rule; it
+ * only updates one the receiver already has (by id).
+ */
+export type DisabledStub = [string, number, number?, CompactTime?]
+
+/** One entry of the v4 row chunks: a full row or a disabled stub. */
+export type WireRuleEntry = CompactRuleRow | DisabledStub
+
+/** v4 tombstone row: [typeCode, signalNorm (compact for compounds), path, deletedAt]. */
+export type CompactTombstone = [number, string | CompactCompound, string, number]
+
+export type EncodedRules = {
+  folders: FolderDictEntry[]
+  rows: WireRuleEntry[]
+}
+
+/** A decoded disabled stub (see DisabledStub). */
+export type DecodedStub = {
+  id: string
+  editedAt?: number
+  autoDisabledReason?: DisabledReason
+  autoDisabledAt?: string
+}
+
+export type DecodedRulePayload = {
+  rules: Rule[]
+  stubs: DecodedStub[]
+  /** Rows dropped because they could not be decoded faithfully. */
+  skipped: number
+}
+
+// --- helpers ----------------------------------------------------------------
+
 /**
  * FNV-1a 64-bit hash → base36. Intrinsic to the folder key, so a folder's
  * reference is stable across pushes regardless of what other folders exist.
@@ -104,29 +202,23 @@ function hashFolderKey(key: string): string {
 }
 
 /**
- * A rule as stored on the wire. Short keys; default-valued fields omitted
- * (enabled=true, matchCount=0, overrideCount=0, and all optionals). `f`
- * indexes into the folder dictionary.
+ * Fast 53-bit content hash (cyrb53) → base36. Used for the push's
+ * content fingerprint (meta.contentHash): identical payloads must hash
+ * identically within one build so a no-op push can be skipped.
  */
-export type CompactRuleRow = {
-  i: string // id
-  t: number // type code
-  s: string // signal
-  f: string // folder reference (FolderDictEntry.x)
-  c: number // confidence
-  r: number // source code (r = "role/source"; s is taken by signal)
-  ca: string // createdAt (ISO)
-  m?: number // matchCount (omit if 0)
-  o?: number // overrideCount (omit if 0 / undefined)
-  e?: 0 // enabled: omit if true, store 0 if false
-  lu?: string // lastUsedAt (omit if absent)
-  da?: string // autoDisabledAt (omit if absent)
-  dr?: number // autoDisabledReason code (omit if absent)
-}
-
-export type EncodedRules = {
-  folders: FolderDictEntry[]
-  rows: CompactRuleRow[]
+export function contentHash(s: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507)
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507)
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
 }
 
 function folderKey(id: string, p: string): string {
@@ -134,20 +226,110 @@ function folderKey(id: string, p: string): string {
   return `${id}\u0000${p}`
 }
 
+function isoOf(ms: number): string | undefined {
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return undefined
+  return new Date(ms).toISOString()
+}
+
+/** ISO → epoch-ms only when `new Date(ms).toISOString()` reproduces it exactly. */
+export function compactTime(iso: string): CompactTime {
+  const ms = Date.parse(iso)
+  return Number.isFinite(ms) && isoOf(ms) === iso ? ms : iso
+}
+
+/** Inverse of compactTime; undefined for anything that isn't a time. */
+export function expandTime(v: unknown): string | undefined {
+  if (typeof v === 'string') return v
+  if (typeof v === 'number') return isoOf(v)
+  return undefined
+}
+
+function isPlainCondition(c: unknown): c is { type: CompoundKind; value: string } {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false
+  const o = c as Record<string, unknown>
+  return (
+    Object.keys(o).length === 2 &&
+    typeof o.type === 'string' &&
+    Object.prototype.hasOwnProperty.call(KIND_TO_CODE, o.type) &&
+    typeof o.value === 'string'
+  )
+}
+
+function expandConditions(c: unknown): Array<{ type: CompoundKind; value: string }> | null {
+  if (!Array.isArray(c)) return null
+  const out: Array<{ type: CompoundKind; value: string }> = []
+  for (const e of c) {
+    if (!Array.isArray(e) || e.length !== 2) return null
+    const kind = codeLookup(CODE_TO_KIND, e[0])
+    if (!kind || typeof e[1] !== 'string') return null
+    out.push({ type: kind, value: e[1] })
+  }
+  return out
+}
+
+/** Rule.signal of a compound rule (`{"conditions":[…]}`) → compact pairs, or null. */
+export function compactCompoundSignal(signal: string): CompactCompound | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(signal)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const o = parsed as Record<string, unknown>
+  if (Object.keys(o).length !== 1 || !Array.isArray(o.conditions)) return null
+  if (!o.conditions.every(isPlainCondition)) return null
+  const out: CompactCompound = (o.conditions as Array<{ type: CompoundKind; value: string }>).map(
+    (c) => [KIND_TO_CODE[c.type], c.value],
+  )
+  // Only when the expansion reproduces the stored string byte-for-byte.
+  return expandCompoundSignal(out) === signal ? out : null
+}
+
+export function expandCompoundSignal(c: unknown): string | null {
+  const conds = expandConditions(c)
+  return conds ? JSON.stringify({ conditions: conds }) : null
+}
+
+/** normalizeSignal('compound', …) output (a bare `[{type,value}]` array) → compact. */
+export function compactCompoundNorm(norm: string): CompactCompound | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(norm)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isPlainCondition)) return null
+  const out: CompactCompound = (parsed as Array<{ type: CompoundKind; value: string }>).map(
+    (c) => [KIND_TO_CODE[c.type], c.value],
+  )
+  return expandCompoundNorm(out) === norm ? out : null
+}
+
+export function expandCompoundNorm(c: unknown): string | null {
+  const conds = expandConditions(c)
+  return conds ? JSON.stringify(conds) : null
+}
+
+// --- rule encode ------------------------------------------------------------
+
 /**
- * Rule[] → { folders, rows }. Deterministic: folders are sorted by
- * (id,path) and assigned indices in that order, so the same library always
- * produces the same dictionary (stable chunk membership → no write-quota
- * churn). Rows preserve the input order of `rules`.
+ * Folder dictionary for `rules`. Deterministic: folders are sorted by
+ * (id,path) and assigned hash references in that order, so the same library
+ * always produces the same dictionary (stable chunk membership → no
+ * write-quota churn).
  */
-export function encodeRulesForSync(rules: Rule[]): EncodedRules {
+export function buildFolderDict(rules: Rule[]): {
+  folders: FolderDictEntry[]
+  refOf: (r: Pick<Rule, 'targetFolderId' | 'targetFolderPath'>) => string
+} {
   const seen = new Map<string, { id: string; p: string }>()
   for (const r of rules) {
     const k = folderKey(r.targetFolderId, r.targetFolderPath)
     if (!seen.has(k)) seen.set(k, { id: r.targetFolderId, p: r.targetFolderPath })
   }
   const sortedKeys = [...seen.keys()].sort((a, b) => a.localeCompare(b))
-  const indexOf = new Map<string, string>()
+  const refByKey = new Map<string, string>()
   const usedX = new Map<string, string>() // x → folderKey, for collision detection
   const folders: FolderDictEntry[] = []
   for (const k of sortedKeys) {
@@ -159,77 +341,238 @@ export function encodeRulesForSync(rules: Rule[]): EncodedRules {
     let probe = 0
     while (usedX.has(x) && usedX.get(x) !== k) x = `${hashFolderKey(k)}.${++probe}`
     usedX.set(x, k)
-    indexOf.set(k, x)
+    refByKey.set(k, x)
     const f = seen.get(k)!
     folders.push({ x, id: f.id, p: f.p })
   }
+  return {
+    folders,
+    refOf: (r) => refByKey.get(folderKey(r.targetFolderId, r.targetFolderPath)) ?? '',
+  }
+}
 
-  const rows: CompactRuleRow[] = rules.map((r) => {
-    const row: CompactRuleRow = {
-      i: r.id,
-      t: TYPE_TO_CODE[r.type] ?? TYPE_TO_CODE.subject_keyword,
-      s: r.signal,
-      f: indexOf.get(folderKey(r.targetFolderId, r.targetFolderPath)) ?? '',
-      c: r.confidence,
-      r: SOURCE_TO_CODE[r.source] ?? SOURCE_TO_CODE.ai_confirmed,
-      ca: r.createdAt,
-    }
-    if (r.matchCount) row.m = r.matchCount
-    if (r.overrideCount) row.o = r.overrideCount
-    if (r.enabled === false) row.e = 0
-    if (r.lastUsedAt) row.lu = r.lastUsedAt
-    if (r.autoDisabledAt) row.da = r.autoDisabledAt
-    if (r.autoDisabledReason) row.dr = REASON_TO_CODE[r.autoDisabledReason]
-    return row
-  })
+/** Full v4 row for `r`, or null when its type/source has no wire code. */
+export function encodeRuleRow(r: Rule, folderRef: string): CompactRuleRow | null {
+  const t = TYPE_TO_CODE[r.type]
+  const src = SOURCE_TO_CODE[r.source]
+  if (t === undefined || src === undefined) return null
+  const row: CompactRuleRow = {
+    i: r.id,
+    t,
+    s: (r.type === 'compound' && compactCompoundSignal(r.signal)) || r.signal,
+    f: folderRef,
+    c: r.confidence,
+    r: src,
+    ca: compactTime(r.createdAt),
+  }
+  if (r.matchCount) row.m = r.matchCount
+  if (r.overrideCount) row.o = r.overrideCount
+  if (r.enabled === false) row.e = 0
+  if (r.lastUsedAt) row.lu = compactTime(r.lastUsedAt)
+  if (r.autoDisabledAt) row.da = compactTime(r.autoDisabledAt)
+  if (r.autoDisabledReason) {
+    const code = REASON_TO_CODE[r.autoDisabledReason]
+    if (code !== undefined) row.dr = code
+  }
+  if (typeof r.editedAt === 'number' && r.editedAt > 0) row.ea = r.editedAt
+  return row
+}
 
-  return { folders, rows }
+/** Disabled-state stub for a disabled rule (see DisabledStub). */
+export function encodeDisabledStub(r: Rule): DisabledStub {
+  const out: Array<string | number> = [r.id, typeof r.editedAt === 'number' ? r.editedAt : 0]
+  const code = r.autoDisabledReason ? REASON_TO_CODE[r.autoDisabledReason] : undefined
+  if (code !== undefined || r.autoDisabledAt) {
+    out.push(code ?? -1)
+    if (r.autoDisabledAt) out.push(compactTime(r.autoDisabledAt))
+  }
+  return out as DisabledStub
 }
 
 /**
- * { folders, rows } → Rule[]. Fully defensive — this parses data that may
- * have been written by a different (newer/older/buggy) build, or arrive with
- * chunks missing:
- *   - rows without a string id are skipped (corrupt).
- *   - unknown type / source codes fall back to safe defaults.
- *   - a folder index with no dictionary entry resolves to empty strings
- *     (reconcileRulesAgainstTree will flag it orphaned on the next scan)
- *     rather than throwing or mis-pointing at another folder.
+ * Rule[] → { folders, rows } with a full row per rule (rows follow input
+ * order; rules with no wire code are omitted). The sync engine's budget
+ * planner (sync-chunks.ts) builds the real push payload — this is the
+ * straightforward whole-library encoding.
  */
-export function decodeRulesFromSync(enc: EncodedRules): Rule[] {
-  const rows = Array.isArray(enc?.rows) ? enc.rows : []
+export function encodeRulesForSync(rules: Rule[]): EncodedRules {
+  const { folders, refOf } = buildFolderDict(rules)
+  const rows: WireRuleEntry[] = []
+  for (const r of rules) {
+    const row = encodeRuleRow(r, refOf(r))
+    if (row) rows.push(row)
+  }
+  return { folders, rows }
+}
+
+// --- rule decode ------------------------------------------------------------
+
+function decodeFullRow(
+  row: Record<string, unknown>,
+  folderMap: Map<string, FolderDictEntry>,
+): Rule | null {
+  if (typeof row.i !== 'string' || row.i === '') return null
+  const type = codeLookup(CODE_TO_TYPE, row.t)
+  const source = codeLookup(CODE_TO_SOURCE, row.r)
+  if (!type || !source) return null // unknown code → skip, never coerce
+  let signal: string
+  if (typeof row.s === 'string') signal = row.s
+  else if (type === 'compound') {
+    const s = expandCompoundSignal(row.s)
+    if (s === null) return null
+    signal = s
+  } else return null
+  // Item 4 (2026-11-05): an unresolved folder reference means the dictionary
+  // chunk is missing or from another push. Decoding it to an EMPTY target
+  // replaced the good local copy and re-spread on the next push — skip.
+  const folder = typeof row.f === 'string' ? folderMap.get(row.f) : undefined
+  if (!folder) return null
+  const rule: Rule = {
+    id: row.i,
+    type,
+    signal,
+    targetFolderId: folder.id,
+    targetFolderPath: folder.p,
+    confidence: typeof row.c === 'number' && Number.isFinite(row.c) ? row.c : 0.7,
+    matchCount: typeof row.m === 'number' && row.m > 0 ? row.m : 0,
+    enabled: row.e !== 0,
+    createdAt: expandTime(row.ca) ?? '',
+    source,
+  }
+  if (typeof row.o === 'number' && row.o > 0) rule.overrideCount = row.o
+  const lu = expandTime(row.lu)
+  if (lu !== undefined) rule.lastUsedAt = lu
+  const da = expandTime(row.da)
+  if (da !== undefined) rule.autoDisabledAt = da
+  const reason = codeLookup(CODE_TO_REASON, row.dr)
+  if (reason) rule.autoDisabledReason = reason // unknown code → drop the reason only
+  if (typeof row.ea === 'number' && Number.isFinite(row.ea) && row.ea > 0) rule.editedAt = row.ea
+  return rule
+}
+
+function decodeStub(row: unknown[]): DecodedStub | null {
+  if (typeof row[0] !== 'string' || row[0] === '') return null
+  const stub: DecodedStub = { id: row[0] }
+  if (typeof row[1] === 'number' && Number.isFinite(row[1]) && row[1] > 0) stub.editedAt = row[1]
+  const reason = codeLookup(CODE_TO_REASON, row[2])
+  if (reason) stub.autoDisabledReason = reason
+  const da = expandTime(row[3])
+  if (da !== undefined) stub.autoDisabledAt = da
+  return stub
+}
+
+/**
+ * { folders, rows } → rules + disabled stubs. Reads v3 rows (string signals,
+ * ISO times) and v4 rows alike. Fully defensive — this parses data that may
+ * have been written by a different (newer/older/buggy) build:
+ *   - rows without a string id, with an unknown type / source / compound-kind
+ *     code, or with an unresolved folder reference are SKIPPED (counted).
+ *   - an unknown autoDisabledReason code keeps the rule, minus the reason.
+ */
+export function decodeRulePayload(enc: { folders?: unknown; rows?: unknown }): DecodedRulePayload {
+  const rows = Array.isArray(enc?.rows) ? (enc.rows as unknown[]) : []
   const folderMap = new Map<string, FolderDictEntry>()
   if (Array.isArray(enc?.folders)) {
-    for (const f of enc.folders) {
-      if (f && typeof f.x === 'string' && typeof f.id === 'string' && typeof f.p === 'string') {
-        folderMap.set(f.x, f)
+    for (const f of enc.folders as unknown[]) {
+      const e = f as FolderDictEntry | null
+      if (e && typeof e.x === 'string' && typeof e.id === 'string' && typeof e.p === 'string') {
+        folderMap.set(e.x, e)
       }
     }
   }
-
-  const out: Rule[] = []
+  const out: DecodedRulePayload = { rules: [], stubs: [], skipped: 0 }
   for (const row of rows) {
-    if (!row || typeof row.i !== 'string') continue
-    const folder = folderMap.get(row.f)
-    const rule: Rule = {
-      id: row.i,
-      type: CODE_TO_TYPE[row.t] ?? 'subject_keyword',
-      signal: typeof row.s === 'string' ? row.s : '',
-      targetFolderId: folder?.id ?? '',
-      targetFolderPath: folder?.p ?? '',
-      confidence: typeof row.c === 'number' ? row.c : 0.7,
-      matchCount: typeof row.m === 'number' ? row.m : 0,
-      enabled: row.e !== 0,
-      createdAt: typeof row.ca === 'string' ? row.ca : '',
-      source: CODE_TO_SOURCE[row.r] ?? 'ai_confirmed',
+    if (Array.isArray(row)) {
+      const stub = decodeStub(row)
+      if (stub) out.stubs.push(stub)
+      else out.skipped++
+      continue
     }
-    if (typeof row.o === 'number' && row.o > 0) rule.overrideCount = row.o
-    if (typeof row.lu === 'string') rule.lastUsedAt = row.lu
-    if (typeof row.da === 'string') rule.autoDisabledAt = row.da
-    if (typeof row.dr === 'number' && CODE_TO_REASON[row.dr]) {
-      rule.autoDisabledReason = CODE_TO_REASON[row.dr]
-    }
-    out.push(rule)
+    const rule =
+      row && typeof row === 'object' ? decodeFullRow(row as Record<string, unknown>, folderMap) : null
+    if (rule) out.rules.push(rule)
+    else out.skipped++
   }
   return out
+}
+
+/** Back-compat wrapper: full rules only (stubs / skip counts dropped). */
+export function decodeRulesFromSync(enc: { folders?: unknown; rows?: unknown }): Rule[] {
+  return decodeRulePayload(enc).rules
+}
+
+// --- tombstones -------------------------------------------------------------
+
+export function encodeTombstone(t: RuleTombstone): CompactTombstone | null {
+  const code = TYPE_TO_CODE[t.type]
+  if (code === undefined || typeof t.signalNorm !== 'string') return null
+  const s = t.type === 'compound' ? (compactCompoundNorm(t.signalNorm) ?? t.signalNorm) : t.signalNorm
+  return [code, s, t.targetFolderPath, t.deletedAt]
+}
+
+export function decodeTombstone(row: unknown): RuleTombstone | null {
+  if (!Array.isArray(row) || row.length < 4) return null
+  const type = codeLookup(CODE_TO_TYPE, row[0])
+  if (!type) return null
+  let signalNorm: string
+  if (typeof row[1] === 'string') signalNorm = row[1]
+  else if (type === 'compound') {
+    const s = expandCompoundNorm(row[1])
+    if (s === null) return null
+    signalNorm = s
+  } else return null
+  if (typeof row[2] !== 'string') return null
+  if (typeof row[3] !== 'number' || !Number.isFinite(row[3])) return null
+  return { type, signalNorm, targetFolderPath: row[2], deletedAt: row[3] }
+}
+
+// --- legacy (v1–v3) full-object readers ---------------------------------------
+
+const RULE_TYPES: ReadonlySet<string> = new Set(CODE_TO_TYPE)
+const RULE_SOURCES: ReadonlySet<string> = new Set(CODE_TO_SOURCE)
+const REASONS: ReadonlySet<string> = new Set(CODE_TO_REASON)
+
+/** v1–v3 tombstone object, validated. */
+export function sanitizeLegacyTombstone(raw: unknown): RuleTombstone | null {
+  if (!raw || typeof raw !== 'object') return null
+  const t = raw as Record<string, unknown>
+  if (typeof t.type !== 'string' || !RULE_TYPES.has(t.type)) return null
+  if (typeof t.signalNorm !== 'string' || typeof t.targetFolderPath !== 'string') return null
+  if (typeof t.deletedAt !== 'number' || !Number.isFinite(t.deletedAt)) return null
+  return {
+    type: t.type as RuleType,
+    signalNorm: t.signalNorm,
+    targetFolderPath: t.targetFolderPath,
+    deletedAt: t.deletedAt,
+  }
+}
+
+/** v1/v2 full Rule object (syncRules_N chunks), validated field by field. */
+export function sanitizeLegacyRule(raw: unknown): Rule | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  if (typeof r.id !== 'string' || r.id === '') return null
+  if (typeof r.type !== 'string' || !RULE_TYPES.has(r.type)) return null
+  if (typeof r.source !== 'string' || !RULE_SOURCES.has(r.source)) return null
+  if (typeof r.signal !== 'string') return null
+  if (typeof r.targetFolderId !== 'string' || typeof r.targetFolderPath !== 'string') return null
+  const rule: Rule = {
+    id: r.id,
+    type: r.type as RuleType,
+    signal: r.signal,
+    targetFolderId: r.targetFolderId,
+    targetFolderPath: r.targetFolderPath,
+    confidence: typeof r.confidence === 'number' && Number.isFinite(r.confidence) ? r.confidence : 0.7,
+    matchCount: typeof r.matchCount === 'number' && r.matchCount > 0 ? r.matchCount : 0,
+    enabled: r.enabled !== false,
+    createdAt: typeof r.createdAt === 'string' ? r.createdAt : '',
+    source: r.source as RuleSource,
+  }
+  if (typeof r.overrideCount === 'number' && r.overrideCount > 0) rule.overrideCount = r.overrideCount
+  if (typeof r.lastUsedAt === 'string') rule.lastUsedAt = r.lastUsedAt
+  if (typeof r.autoDisabledAt === 'string') rule.autoDisabledAt = r.autoDisabledAt
+  if (typeof r.autoDisabledReason === 'string' && REASONS.has(r.autoDisabledReason)) {
+    rule.autoDisabledReason = r.autoDisabledReason as DisabledReason
+  }
+  return rule
 }

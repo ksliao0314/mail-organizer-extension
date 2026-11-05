@@ -13,10 +13,12 @@
 //
 // Strategies on import:
 //   - 'replace' — clear all existing rules, write imported set verbatim
-//   - 'merge'   — keep existing rules; only add imported rules whose
-//                 (type, signal) does not already exist. Existing
+//   - 'merge'   — keep existing rules; only add imported rules whose id is
+//                 not already present AND whose (type, normalizeSignal,
+//                 target) triple is not already present. Existing
 //                 matchCount / lastUsedAt stay intact.
 
+import { decodeCompound, normalizeSignal } from './rules'
 import type { Rule, RuleSource, RuleTombstone, RuleType } from './types'
 
 export const RULE_PAYLOAD_TYPE = 'mail-organizer-rules' as const
@@ -153,7 +155,11 @@ export function parseRulesPayload(json: string): ParseRulesResult {
       if (typeof t.deletedAt !== 'number' || !Number.isFinite(t.deletedAt)) continue
       validTombstones.push({
         type: t.type as RuleType,
-        signalNorm: t.signalNorm,
+        // Re-canonicalize (2026-11-05): a backup from an older build stores
+        // signalNorm in its pre-canonical form (full-form court case,
+        // un-trimmed '@domain', raw compound values) — store the form
+        // today's rules normalize to, so the imported deletion still blocks.
+        signalNorm: normalizeSignal(t.type as RuleType, t.signalNorm) || t.signalNorm,
         targetFolderPath: t.targetFolderPath,
         deletedAt: t.deletedAt,
       })
@@ -191,6 +197,20 @@ function validateRule(r: Record<string, unknown> | null | undefined, idx: number
   }
   if (typeof r.signal !== 'string' || r.signal.length === 0) {
     return { ok: false, error: `${where('signal')} 必須是非空字串` }
+  }
+  // Compound structure (2026-11-05): `{"conditions":[{"type":"domain",
+  // "value":123}]}` used to import fine and then throw inside matching for
+  // EVERY email (and inside the sweep, whose catch silently skipped all
+  // cleanup). Reject anything decodeCompound — the matcher's own parser —
+  // wouldn't accept, plus the condition-less form that can never match.
+  if (r.type === 'compound') {
+    const decoded = decodeCompound(r.signal)
+    if (!decoded || decoded.conditions.length === 0) {
+      return {
+        ok: false,
+        error: `${where('signal')} 不是有效的組合條件(需為 {"conditions":[{"type","value"}…]},type 為 domain / subject_keyword / sender、value 為非空字串)`,
+      }
+    }
   }
   if (typeof r.targetFolderId !== 'string') {
     return { ok: false, error: `${where('targetFolderId')} 必須是字串(可為空字串)` }
@@ -269,7 +289,11 @@ function validateRule(r: Record<string, unknown> | null | undefined, idx: number
     // sweep's hard-delete predicate keys on this value — stripping it here
     // would leave the other machine's copy soft-disabled forever (never
     // purged) and break cross-machine convergence.
-    r.autoDisabledReason === 'case_closed'
+    r.autoDisabledReason === 'case_closed' ||
+    // Same for the 2026-11-05 reasons: the dormant purge and the learners'
+    // revive check key on them.
+    r.autoDisabledReason === 'superseded' ||
+    r.autoDisabledReason === 'override'
   ) {
     rule.autoDisabledReason = r.autoDisabledReason
   }
@@ -285,7 +309,9 @@ export type ImportStrategy = 'merge' | 'replace'
 
 export type ImportPreview = {
   totalToImport: number
-  /** Imported rules whose (type, signal) already exists in current store. */
+  /** Imported rules that 'merge' would skip: same id, or same (type,
+   *  normalized signal, target) as a rule already stored (or earlier in the
+   *  file). */
   duplicateCount: number
   /** Imported rules that would be added under 'merge'. */
   newCount: number
@@ -295,8 +321,31 @@ export type ImportPreview = {
   tombstoneCount: number
 }
 
-function ruleKey(r: Pick<Rule, 'type' | 'signal'>): string {
-  return `${r.type}::${r.signal}`
+function tripleKey(r: Pick<Rule, 'type' | 'signal' | 'targetFolderPath'>): string {
+  return `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
+}
+
+/**
+ * The imported rules 'merge' would add (2026-11-05). Keyed on id FIRST:
+ * re-importing an older backup of a rule edited since (new signal / target)
+ * used to pass the old raw (type, signal) check and land as a second row
+ * with the SAME id. Then on the canonical (type, normalized signal, target)
+ * triple — the identity dedupe / tombstones use — so `@x.com` vs `x.com` or
+ * full vs compact court-case forms count as the same rule. Also dedupes
+ * within the file itself.
+ */
+function importsToAdd(existing: readonly Rule[], imported: readonly Rule[]): Rule[] {
+  const ids = new Set(existing.map((r) => r.id))
+  const triples = new Set(existing.map(tripleKey))
+  const out: Rule[] = []
+  for (const r of imported) {
+    const triple = tripleKey(r)
+    if (ids.has(r.id) || triples.has(triple)) continue
+    ids.add(r.id)
+    triples.add(triple)
+    out.push(r)
+  }
+  return out
 }
 
 export function previewImport(
@@ -304,15 +353,11 @@ export function previewImport(
   imported: Rule[],
   tombstones: RuleTombstone[] = [],
 ): ImportPreview {
-  const existingKeys = new Set(existing.map(ruleKey))
-  let duplicateCount = 0
-  for (const r of imported) {
-    if (existingKeys.has(ruleKey(r))) duplicateCount++
-  }
+  const newCount = importsToAdd(existing, imported).length
   return {
     totalToImport: imported.length,
-    duplicateCount,
-    newCount: imported.length - duplicateCount,
+    duplicateCount: imported.length - newCount,
+    newCount,
     existingCount: existing.length,
     tombstoneCount: tombstones.length,
   }
@@ -323,10 +368,16 @@ export function applyImport(
   imported: Rule[],
   strategy: ImportStrategy,
 ): Rule[] {
-  if (strategy === 'replace') return [...imported]
-  // merge: keep existing rules for any (type, signal) collision so we don't
-  // wipe out their matchCount / lastUsedAt / user edits.
-  const existingKeys = new Set(existing.map(ruleKey))
-  const toAdd = imported.filter((r) => !existingKeys.has(ruleKey(r)))
-  return [...existing, ...toAdd]
+  // replace: the file IS the library — but never write two rows with one id.
+  if (strategy === 'replace') {
+    const seen = new Set<string>()
+    return imported.filter((r) => {
+      if (seen.has(r.id)) return false
+      seen.add(r.id)
+      return true
+    })
+  }
+  // merge: keep existing rules on any collision so we don't wipe out their
+  // matchCount / lastUsedAt / user edits.
+  return [...existing, ...importsToAdd(existing, imported)]
 }
