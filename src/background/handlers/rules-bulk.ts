@@ -13,24 +13,28 @@
 //   delete → tombstone (type, normalizeSignal, target) written INSIDE the rules
 //            lock, exactly like deleteRule — an auto-generator can't slip in
 //            between and resurrect the triple; history 'delete' + snapshot.
-//   enable → clears autoDisabledAt / autoDisabledReason (toggleRule).
-//   disable→ leaves any old auto-disable provenance alone (toggleRule).
+//   enable / disable → withToggle, the transition toggleRule and the rule
+//            form use (2026-11-06): enable clears the auto-disable provenance
+//            but keeps a 'case_closed' exemption marker; a user disable
+//            strips every auto reason.
 //   no-op toggles (already in the target state) write nothing and log nothing.
-//   add    → confidence-capped, matching tombstones cleared inside the lock
-//            (upsertRule's create path), history 'create'.
+//   add    → confidence-capped, matching tombstones (legacy-form ones too —
+//            clearTombstonesForRules) cleared inside the lock (upsertRule's
+//            create path), history 'create'.
 // Selection runs INSIDE the lock against the fresh library, so "every disabled
 // rule" / "the losers of this conflict" can't go stale between read and write.
 
 import type { PopupResponse } from '@/shared/messages'
 import {
   applyConfidenceCap,
+  clearTombstonesForRules,
   mutateRules,
   newRule,
-  normalizeSignal,
+  ruleTombstone,
   snapshotOf,
-  tombstoneDeletedAt,
+  withToggle,
 } from '@/shared/rules'
-import { addRuleTombstones, clearMatchingTombstones, recordRuleEvents } from '@/shared/storage'
+import { addRuleTombstones, recordRuleEvents } from '@/shared/storage'
 import type { Rule, RuleEvent } from '@/shared/types'
 
 type Actor = 'user' | 'system'
@@ -78,11 +82,7 @@ export async function applyRuleBatch<T>(
       }
       const want = toggle.get(r.id)
       if (want !== undefined && r.enabled !== want) {
-        const updated: Rule = {
-          ...r,
-          enabled: want,
-          ...(want ? { autoDisabledAt: undefined, autoDisabledReason: undefined } : {}),
-        }
+        const updated = withToggle(r, want)
         toggled.push(updated)
         next.push(updated)
         continue
@@ -90,25 +90,21 @@ export async function applyRuleBatch<T>(
       next.push(r)
     }
     if (deleted.length > 0) {
-      await addRuleTombstones(
-        deleted.map((r) => ({
-          type: r.type,
-          signalNorm: normalizeSignal(r.type, r.signal),
-          targetFolderPath: r.targetFolderPath,
-          deletedAt: tombstoneDeletedAt(r, at), // clock-skew safe (rules.ts)
-        })),
-      ).catch((e) => console.warn(`[mail-organizer] addRuleTombstones (${opts.label})`, e))
+      // Same tombstone as deleteRule (clock-skew-safe deletedAt + spelling,
+      // so a surviving canonical twin is not suppressed by it).
+      await addRuleTombstones(deleted.map((r) => ruleTombstone(r, at))).catch((e) =>
+        console.warn(`[mail-organizer] addRuleTombstones (${opts.label})`, e),
+      )
     }
     if (added.length > 0) {
       // After the tombstone write above: if a batch both deletes and re-adds
       // the same triple, the live rule must not be shadowed by its own ghost.
-      await clearMatchingTombstones(
-        added.map((r) => ({
-          type: r.type,
-          signalNorm: normalizeSignal(r.type, r.signal),
-          targetFolderPath: r.targetFolderPath,
-        })),
-      ).catch((e) => console.warn(`[mail-organizer] clearMatchingTombstones (${opts.label})`, e))
+      // Canonical clear (2026-11-06): a raw-key clear missed tombstones an
+      // older build wrote in a pre-canonical form, leaving the new rule's
+      // triple tombstoned.
+      await clearTombstonesForRules(added).catch((e) =>
+        console.warn(`[mail-organizer] clearTombstonesForRules (${opts.label})`, e),
+      )
       next.push(...added)
     }
     outcome = { deleted, toggled, added }

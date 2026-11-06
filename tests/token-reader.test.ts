@@ -92,6 +92,70 @@ describe('readOutlookTokenFromMsalCache', () => {
   })
 })
 
+// C1 (2026-11-06): v1.0.8 accepted only the outlook.office.com / office365.com
+// prefixes, so these working setups all became NO_TOKEN.
+describe('readOutlookTokenFromMsalCache audience ranking (C1)', () => {
+  beforeEach(() => localStorage.clear())
+
+  it.each([
+    ['outlook.cloud.microsoft (this user’s OWA)', 'https://outlook.cloud.microsoft/Mail.ReadWrite'],
+    ['an explicit :443, any case', 'HTTPS://Outlook.Office.com:443/Mail.ReadWrite'],
+    ['substrate.office.com', 'https://substrate.office.com/Mail.ReadWrite'],
+    ['the Exchange Online app-id form', '00000002-0000-0ff1-ce00-000000000000/Mail.ReadWrite'],
+  ])('accepts %s', (_label, target) => {
+    putToken('msal.only', { target: `${target} openid profile` })
+    expect(readOutlookTokenFromMsalCache()).toMatchObject({ ok: true, secret: 'SECRET-msal.only' })
+  })
+
+  it('a known Outlook REST resource beats a later-expiring other (non-Graph) resource', () => {
+    putToken('msal.cloud', { target: 'https://outlook.cloud.microsoft/Mail.ReadWrite', expiresOn: String(nowSec() + 600) })
+    putToken('msal.substrate', {
+      target: 'https://substrate.office.com/Mail.ReadWrite',
+      expiresOn: String(nowSec() + 3500),
+    })
+    expect(readOutlookTokenFromMsalCache()).toMatchObject({ ok: true, secret: 'SECRET-msal.cloud' })
+  })
+
+  it('…and the other resource is used when it is the only one left', () => {
+    putToken('msal.cloud-expired', {
+      target: 'https://outlook.cloud.microsoft/Mail.ReadWrite',
+      expiresOn: String(nowSec() - 7200),
+    })
+    putToken('msal.substrate', { target: 'https://substrate.office.com/Mail.ReadWrite' })
+    expect(readOutlookTokenFromMsalCache()).toMatchObject({ ok: true, secret: 'SECRET-msal.substrate' })
+  })
+
+  it('never picks Graph — national clouds, the Graph app id or a bare scope — and lists the origins it saw', () => {
+    putToken('msal.g1', { target: 'https://graph.microsoft.com/Mail.ReadWrite', expiresOn: String(nowSec() + 3599) })
+    putToken('msal.g2', { target: 'https://graph.microsoft.us/Mail.ReadWrite' })
+    putToken('msal.g3', { target: 'https://dod-graph.microsoft.us/Mail.ReadWrite' })
+    putToken('msal.g4', { target: 'https://microsoftgraph.chinacloudapi.cn/Mail.ReadWrite' })
+    putToken('msal.g5', { target: '00000003-0000-0000-c000-000000000000/Mail.ReadWrite' })
+    putToken('msal.g6', { target: 'Mail.ReadWrite User.Read' })
+    const r = readOutlookTokenFromMsalCache()
+    expect(r).toMatchObject({ ok: false, code: 'NO_TOKEN' })
+    if (r.ok) return
+    expect(r.message).toContain('非 Outlook 資源 6')
+    expect(r.message).toContain('https://graph.microsoft.com')
+    expect(r.message).toContain('https://graph.microsoft.us')
+    expect(r.message).toContain('(無資源前綴)')
+    expect(r.message).not.toContain('SECRET')
+  })
+
+  it('the multi-account guard counts every usable rank', () => {
+    putToken('msal.a', { homeAccountId: 'acct-A' })
+    putToken('msal.b', { homeAccountId: 'acct-B', target: 'https://substrate.office.com/Mail.ReadWrite' })
+    expect(readOutlookTokenFromMsalCache()).toMatchObject({ ok: false, code: 'MULTIPLE_ACCOUNTS' })
+  })
+
+  it('the ranked reader still runs standalone', () => {
+    putToken('msal.cloud', { target: 'https://outlook.cloud.microsoft:443/Mail.ReadWrite' })
+    const standalone = new Function(`return (${readOutlookTokenFromMsalCache.toString()})`)() as () => unknown
+    expect(standalone()).toEqual(readOutlookTokenFromMsalCache())
+    expect(standalone()).toMatchObject({ ok: true, secret: 'SECRET-msal.cloud' })
+  })
+})
+
 // ---- token.ts ---------------------------------------------------------------
 
 type Tab = Partial<chrome.tabs.Tab> & { id: number }
@@ -225,5 +289,57 @@ describe('getOwaToken pipeline', () => {
     ]
     sendMessage.mockImplementation(async (tabId: number) => okToken(tabId === 7 ? 'a' : 'b'))
     expect(await t.getOwaToken()).toMatchObject({ ok: true, secret: 'a' })
+  })
+
+  it('keeps the token’s account id in the cache (C10) and peeks it without a refresh', async () => {
+    const t = await loadToken()
+    sendMessage.mockResolvedValue(okToken('fresh', 3600, 'acct-9'))
+    expect(await t.getOwaToken()).toMatchObject({ ok: true, secret: 'fresh', accountId: 'acct-9' })
+    sendMessage.mockClear()
+    expect(await t.peekCachedTokenAccountId()).toBe('acct-9')
+    expect(await t.getOwaToken()).toMatchObject({ accountId: 'acct-9' })
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+})
+
+// C5 (2026-11-06): chrome.tabs.sendMessage has no timeout. A frozen tab left
+// the shared in-flight refresh — and so every Outlook request — pending forever.
+describe('token acquisition never hangs on a tab that does not answer (C5)', () => {
+  beforeEach(() => {
+    installChrome()
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+  const never = () => new Promise<never>(() => {})
+
+  it('a frozen tab on ANOTHER origin is "can’t tell": the token still arrives', async () => {
+    const t = await loadToken()
+    tabs = [
+      { id: 7, active: true, url: 'https://outlook.cloud.microsoft/mail/', status: 'complete' },
+      { id: 8, active: false, url: 'https://outlook.office.com/mail/', status: 'complete' },
+    ]
+    sendMessage.mockImplementation((tabId: number) => (tabId === 7 ? Promise.resolve(okToken('a')) : never()))
+    let settled: unknown = 'pending'
+    void t.getOwaToken().then((r) => (settled = r))
+    await vi.advanceTimersByTimeAsync(1_600)
+    expect(settled).toMatchObject({ ok: true, secret: 'a' })
+    // The coalesced refresh was released too: the next caller isn't stuck.
+    expect(await t.getOwaToken()).toMatchObject({ ok: true, secret: 'a' })
+  })
+
+  it('the chosen tab never answering → TAB_UNREACHABLE instead of hanging every caller', async () => {
+    const t = await loadToken()
+    tabs = [{ id: 7, active: true, url: 'https://outlook.office.com/mail/', status: 'complete' }]
+    sendMessage.mockImplementation(() => never())
+    const results: unknown[] = []
+    void t.getOwaToken().then((r) => results.push(r))
+    void t.getOwaToken({ force: true }).then((r) => results.push(r)) // coalesces onto the same refresh
+    await vi.advanceTimersByTimeAsync(10_500)
+    expect(results).toHaveLength(2)
+    expect(results[0]).toMatchObject({ ok: false, code: 'TAB_UNREACHABLE' })
+    expect(executeScript).not.toHaveBeenCalled() // an unresponsive tab isn't re-injected into
   })
 })

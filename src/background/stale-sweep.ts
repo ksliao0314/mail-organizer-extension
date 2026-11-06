@@ -36,7 +36,8 @@ const SWEEP_INTERVAL_MINUTES = 24 * 60 // daily
 
 export type SweepResult = {
   disabledCount: number
-  /** Rules hard-deleted as dead: stale + long-dormant auto-disabled ones. */
+  /** Rules hard-deleted as dead: stale + long-dormant auto-disabled ones +
+   *  ones learned on a pseudo case number (2026-11-06). */
   staleDeletedCount: number
   /** Of staleDeletedCount: auto-disabled rules purged after 60 active days (2026-11-05). */
   dormantPurgedCount?: number
@@ -138,7 +139,11 @@ async function sweepOnce(): Promise<SweepResult> {
     } catch (e) {
       console.warn('[mail-organizer] closed-case sweep skipped: settings unreadable (non-fatal)', e)
     }
-    const report = await runRuleSweepPass({ closedCasePrefixes })
+    // initCounterBaseline (2026-11-06): the first sweep on this machine
+    // starts the local counter baseline, so override counts from builds that
+    // counted deletes as overrides can't trip high-error-rate (rules.ts
+    // errorRateEvidence).
+    const report = await runRuleSweepPass({ closedCasePrefixes, initCounterBaseline: true })
     const { retirement, closedCasePurged } = report
     if (retirement.retired > 0 || retirement.revived > 0 || closedCasePurged > 0) {
       console.info(
@@ -162,7 +167,8 @@ async function sweepOnce(): Promise<SweepResult> {
     }
     return {
       disabledCount: disabled.length,
-      staleDeletedCount: byReason.stale + byReason.dormantPurged,
+      // Rules learned on a 年度 pseudo case number (2026-11-06) are dead too.
+      staleDeletedCount: byReason.stale + byReason.dormantPurged + report.pseudoCasePurged,
       dormantPurgedCount: byReason.dormantPurged,
     }
   } catch (e) {

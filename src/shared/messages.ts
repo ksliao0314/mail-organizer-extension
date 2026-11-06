@@ -23,6 +23,10 @@ export const SW_MESSAGE_TYPES = [
   // ---- content scripts (the ONLY types a non-extension-page sender may use;
   //      allowlist enforced in the dispatcher) ----
   'getOwaFabVisibility',
+  'issuePanelPairingNonce',
+
+  // ---- in-OWA panel bridge pairing (extension pages only; 2026-11-06) ----
+  'redeemPanelPairingNonce',
 
   // ---- status / navigation ----
   'getStatus',
@@ -49,6 +53,7 @@ export const SW_MESSAGE_TYPES = [
   'getAiClassifyProgress',
   'clearAiClassifyProgress',
   'cancelClassify',
+  'adoptClassifyRun',
   'getClassifyStage',
   'getFolderTree',
   'savePopupState',
@@ -125,7 +130,12 @@ export type MessageType = (typeof SW_MESSAGE_TYPES)[number]
  * it will be refused in production; tests/ui-sw-contract.test.ts scans the
  * content scripts to catch exactly that.
  */
-export const CONTENT_SCRIPT_MESSAGE_TYPES: readonly MessageType[] = ['getOwaFabVisibility']
+export const CONTENT_SCRIPT_MESSAGE_TYPES: readonly MessageType[] = [
+  'getOwaFabVisibility',
+  // One-time nonce the FAB puts in its iframe handshake (2026-11-06) — see
+  // background/handlers/panel-pairing.ts.
+  'issuePanelPairingNonce',
+]
 
 /** A request to the service worker. Handler-specific fields ride alongside `type`. */
 export type PopupRequest = { type: MessageType; [k: string]: unknown }

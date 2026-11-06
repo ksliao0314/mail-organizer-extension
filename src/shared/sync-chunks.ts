@@ -16,6 +16,8 @@ import {
   MAX_FOLDER_DICT_CHUNKS,
   MAX_RULE_CHUNKS,
   MAX_TOMBSTONE_CHUNKS,
+  SYNC_RECENT_TOMBSTONE_MS,
+  SYNC_STUB_RECENT_MS,
   TOMBSTONE_SYNC_CAP,
 } from './constants'
 import {
@@ -199,7 +201,11 @@ export function chunkFolderDict(
 }
 
 function compactTombstoneKey(t: CompactTombstone): string {
-  return `${t[0]}::${typeof t[1] === 'string' ? t[1] : JSON.stringify(t[1])}::${t[2]}`
+  // The spelling entry breaks ties between deletions of one triple (2026-11-06,
+  // round 3: one per spelling) behind a NUL, which sorts before any other
+  // character — rows of distinct triples keep their old relative order.
+  const base = `${t[0]}::${typeof t[1] === 'string' ? t[1] : JSON.stringify(t[1])}::${t[2]}`
+  return t.length > 4 ? `${base}\u0000${String(t[4])}` : base
 }
 
 /** Chunk v4 compact tombstone rows (keyed by triple for stable membership). */
@@ -279,10 +285,18 @@ export type SyncPlanInput = {
   budgetBytes: number
   /** Tombstones' first claim (they may exceed it only into leftover budget). */
   tombstoneShareBytes: number
+  /**
+   * Recent tombstones (SYNC_RECENT_TOMBSTONE_MS) may grow up to this share by
+   * displacing LOW-priority rule rows (see isCoreRule). Defaults to
+   * tombstoneShareBytes (no displacement).
+   */
+  recentTombstoneShareBytes?: number
+  /** Disabled rules edited within this window get a guaranteed stub (default SYNC_STUB_RECENT_MS). */
+  stubRecentMs?: number
   /** Stamped as `p` on every chunk. */
   pushId: string
   keyPrefix: { rows: string; folders: string; tombs: string }
-  /** For the "recent tombstone left out" count. */
+  /** For the "recent tombstone left out" count and the recency windows. */
   now: number
 }
 
@@ -298,7 +312,10 @@ export type SyncPayloadPlan = {
   bytes: number
   fullRowCount: number
   stubCount: number
-  /** Syncable rules with NO cloud representation (no full row, no stub). */
+  /**
+   * Syncable rules with NO cloud representation (no full row, no stub) —
+   * except long-settled disables, which are left out by design (2026-11-06).
+   */
   truncatedRuleCount: number
   /** Tombstones from the last 30 days that did not fit (older ones are left out by design). */
   truncatedTombstoneCount: number
@@ -308,7 +325,17 @@ export type SyncPayloadPlan = {
 
 // Leeway for JSON commas / chunk-boundary slack the item-cost model ignores.
 const PLAN_SAFETY_BYTES = 256
-const RECENT_TOMBSTONE_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Rules whose cloud row matters most: enabled hand-made / corrected rules and
+ * enabled auto rules with a track record. Always a PREFIX of the
+ * compareRuleSyncPriority order (enabled → source authority → matchCount).
+ * Never-matched auto rules and disabled rules are the low-priority tail that
+ * recent deletions may displace (2026-11-06).
+ */
+function isCoreRule(r: Rule): boolean {
+  return r.enabled && (r.source !== 'ai_confirmed' || (r.matchCount || 0) > 0)
+}
 
 /**
  * Select what fits the sync byte budget — ONE encoding pass plus a handful of
@@ -319,12 +346,18 @@ const RECENT_TOMBSTONE_MS = 30 * 24 * 60 * 60 * 1000
  *   1. Tombstones, NEWEST deletedAt first, up to `tombstoneShareBytes`. They
  *      used to be truncated by key order and charged before rules, so 300 old
  *      CJK tombstones crowded out the newest deletions AND ~69 rules.
- *   2. A stub for EVERY disabled syncable rule — never dropped (unless stubs
- *      alone overflow the whole budget, oldest edits dropped first). This is
- *      what makes disables propagate under budget pressure.
+ *   2. A stub for every disabled syncable rule edited within `stubRecentMs`
+ *      (2026-11-06: no longer EVERY disabled rule — long-settled disables
+ *      crowded enabled rows out; they now compete as ordinary low-priority
+ *      rows). Never dropped unless stubs alone overflow the whole budget
+ *      (oldest edits dropped first). This is what makes a fresh disable
+ *      propagate under budget pressure.
  *   3. Full rows in compareRuleSyncPriority order, largest prefix that fits
  *      (a disabled rule's full row replaces its stub, so it only costs the
- *      difference; a folder entry is charged on first use).
+ *      difference; a folder entry is charged on first use). When the prefix
+ *      reaches past the core rules (isCoreRule) while recent deletions were
+ *      left out, recent tombstones grow up to `recentTombstoneShareBytes` at
+ *      the expense of those low-priority rows only (2026-11-06).
  *   4. Leftover budget → more tombstones, still newest first.
  */
 export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
@@ -381,7 +414,9 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
       cmpStr(
         `${a.type}::${a.signalNorm}::${a.targetFolderPath}`,
         `${b.type}::${b.signalNorm}::${b.targetFolderPath}`,
-      ),
+      ) ||
+      // One triple, several spellings (round 3): still a total order.
+      cmpStr(a.spellingHash ?? '', b.spellingHash ?? ''),
   )) {
     if (tombEnc.length >= TOMBSTONE_SYNC_CAP) break
     const e = encodeTombstone(t)
@@ -404,15 +439,22 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
     return n
   }
 
+  // Newest first ⇒ the recent deletions are a prefix of tombEnc.
+  const recentCutoff = input.now - SYNC_RECENT_TOMBSTONE_MS
+  let recentTombN = 0
+  while (recentTombN < tombEnc.length && tombEnc[recentTombN]!.deletedAt >= recentCutoff) recentTombN++
+
   // 1. Tombstones inside their share.
   let tombN = tombPrefixWithin(Math.min(input.tombstoneShareBytes, budget))
   const tombBytesOf = (n: number) => tombEnc.slice(0, n).reduce((s, t) => s + t.cost, 0)
 
-  // 2. Stubs for every disabled rule (newest edit first if they overflow).
+  // 2. Stubs for recently edited disables (newest edit first if they overflow).
+  const stubCutoff = input.now - (input.stubRecentMs ?? SYNC_STUB_RECENT_MS)
+  const settledDisable = (r: Rule) => !r.enabled && (r.editedAt ?? 0) < stubCutoff
   const stubSet = new Set<string>()
   {
     const stubCands = cands
-      .filter((c) => c.stub)
+      .filter((c) => c.stub && !settledDisable(c.rule))
       .sort((a, b) => (b.rule.editedAt ?? 0) - (a.rule.editedAt ?? 0) || cmpStr(a.rule.id, b.rule.id))
     const room = budget - estimate(tombBytesOf(tombN), keyPrefix.tombs)
     let acc = 0
@@ -479,13 +521,14 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
     floor = materialize(0, tombN)
   }
 
-  // 3. Largest full-row prefix that fits: estimate from prefix sums, then
-  // correct with exact materialisations (each O(n); typically 2–3 of them).
-  let best: Mat | null = fits(floor) ? floor : null
-  if (best) {
-    let k = 0
+  // 3. Largest full-row prefix that fits (given nTombs), starting from a
+  // FITTING materialisation `start`: estimate from prefix sums, then correct
+  // with exact materialisations (each O(n); typically 2–3 of them).
+  const largestPrefix = (start: Mat, nTombs: number): Mat => {
+    let best = start
+    let k = start.k
     {
-      const base = floor.bytes
+      const base = start.bytes
       let acc = 0
       while (k < cands.length && base + acc + marginal[k]! + PLAN_SAFETY_BYTES <= budget) {
         acc += marginal[k]!
@@ -494,7 +537,7 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
     }
     let hiFail = cands.length + 1
     for (let iter = 0; iter < 12 && k > best.k; iter++) {
-      const m = materialize(k, tombN)
+      const m = materialize(k, nTombs)
       if (fits(m)) {
         best = m
         const slack = budget - m.bytes - PLAN_SAFETY_BYTES
@@ -518,8 +561,45 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
         k = k2
       }
     }
+    return best
   }
-  if (!best) best = materialize(0, 0) // cannot happen once stubs/tombs are shed; defensive
+  let best: Mat = fits(floor) ? largestPrefix(floor, tombN) : materialize(0, 0) // the latter cannot happen once stubs/tombs are shed; defensive
+
+  // 3b. Recent deletions outrank LOW-priority rows (2026-11-06): when the
+  // prefix reaches past the core rules but recent tombstones were left out,
+  // grow the tombstone prefix (recent ones only, up to their share) as far as
+  // it fits WITHOUT dropping a core row, then refill rows after it.
+  const coreN = (() => {
+    const i = cands.findIndex((c) => !isCoreRule(c.rule))
+    return i < 0 ? cands.length : i
+  })()
+  if (fits(best) && best.k > coreN && tombN < recentTombN) {
+    const share = Math.min(budget, input.recentTombstoneShareBytes ?? input.tombstoneShareBytes)
+    const cap = Math.min(recentTombN, tombPrefixWithin(share))
+    if (cap > tombN) {
+      let lo = tombN
+      let hi = cap
+      let loMat: Mat | null = null
+      const atCap = materialize(coreN, cap)
+      if (fits(atCap)) {
+        lo = cap
+        loMat = atCap
+      } else {
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1
+          const m = materialize(coreN, mid)
+          if (fits(m)) {
+            lo = mid
+            loMat = m
+          } else hi = mid
+        }
+      }
+      if (loMat && lo > tombN) {
+        tombN = lo
+        best = largestPrefix(loMat, tombN)
+      }
+    }
+  }
 
   // 4. Leftover budget → more tombstones (newest first).
   if (tombN < tombEnc.length) {
@@ -536,9 +616,15 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
   }
 
   const tombs = best.tombChunks.flatMap((c) => c.items)
-  const recentCutoff = input.now - RECENT_TOMBSTONE_MS
   const truncatedTombstoneCount = input.tombstones.filter((t) => t.deletedAt >= recentCutoff).length -
     tombEnc.slice(0, best.nTombs).filter((t) => t.deletedAt >= recentCutoff).length
+  // Long-settled disables left without a row are out by design (step 2), like
+  // old tombstones — not "truncated".
+  let settledLeftOut = 0
+  for (let i = best.k; i < cands.length; i++) {
+    const c = cands[i]!
+    if (!stubSet.has(c.rule.id) && settledDisable(c.rule)) settledLeftOut++
+  }
   return {
     rowChunks: best.rowChunks,
     folderChunks: best.folderChunks,
@@ -549,7 +635,7 @@ export function planSyncPayload(input: SyncPlanInput): SyncPayloadPlan {
     bytes: best.bytes,
     fullRowCount: best.fullRowCount,
     stubCount: best.stubCount,
-    truncatedRuleCount: unencodable + (cands.length - best.fullRowCount - best.stubCount),
+    truncatedRuleCount: unencodable + (cands.length - best.fullRowCount - best.stubCount - settledLeftOut),
     truncatedTombstoneCount: Math.max(0, truncatedTombstoneCount),
     omittedTombstoneCount: input.tombstones.length - best.nTombs,
   }

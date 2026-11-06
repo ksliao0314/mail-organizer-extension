@@ -15,6 +15,12 @@ export type MailFolderNode = {
   parentFolderId?: string
   path: string
   children: MailFolderNode[]
+  /**
+   * Set on the ROOT of Junk Email / Sent Items (2026-11-06 r2). Those two and
+   * their subfolders are ordinary targets for rules, the picker and execute,
+   * but never offered to the AI — see flattenAiVisibleFolders.
+   */
+  wellKnown?: AiHiddenFolderRole
 }
 
 export type EmailAddress = { Name?: string; Address: string }
@@ -138,15 +144,35 @@ export type Rule = {
     | 'superseded'
   /**
    * Logical last-edit time (epoch ms) of this rule's SEMANTIC fields — type,
-   * signal, target, confidence, enabled, source, auto-disable state, orphaned
+   * signal, target, confidence, enabled, source, auto-disable state
    * (2026-11-05). Stamped ONLY by `mutateRules` (rules.ts) when one of those
    * fields actually changes, or when the rule is new; hit counters
-   * (matchCount / overrideCount / lastUsedAt) never stamp it. Cross-machine
+   * (matchCount / overrideCount / lastUsedAt) never stamp it, and neither
+   * does `orphaned` (2026-11-06: a per-device observation of this machine's
+   * folder tree, not an edit). Cross-machine
    * sync merges per rule id by it: the copy with the newer editedAt supplies
    * the semantic fields (tie → cloud), so a stale copy can no longer revert a
    * newer edit. Absent on rules last written before v1.0.8 (treated as 0).
    */
   editedAt?: number
+  /**
+   * Accuracy-counter epoch (epoch ms, 2026-11-06). Set when the engine
+   * deliberately restarts matchCount / overrideCount (revivedRule after a
+   * 'high-error-rate' disable). Sync merges counters by it: the copy with the
+   * newer epoch supplies matchCount / overrideCount, equal epochs take the
+   * max — otherwise the other machine's pre-reset counters came straight back
+   * and the next sweep re-disabled the rule. Absent = never reset.
+   */
+  statsResetAt?: number
+  /**
+   * LOCAL ONLY (2026-11-06, S3): when THIS machine's reconcile set `orphaned`
+   * (epoch ms), maintained by mutateRules alongside editedAt; never synced.
+   * An orphaned copy without it may carry a v1.0.8 orphan stamp (v1.0.8
+   * stamped editedAt when orphaning), so the sync merge never lets it supply
+   * the semantic fields (A2); with it, editedAt is a genuine edit and the
+   * merge is plain last-writer-wins.
+   */
+  orphanedAt?: number
 }
 
 // Plan items ------------------------------------------------------------------
@@ -254,6 +280,15 @@ export type PlanItem = {
    * (userTouched), they come back next batch.
    */
   unclassified?: boolean
+  /**
+   * On an `unclassified` placeholder Claude refused (2026-11-06): `email` =
+   * this email (or its thread's representative) was refused on its own — or
+   * refused before and not re-sent — and needs manual handling; `batch` = the
+   * request carrying it was refused without being pinned on one email (tried
+   * again next batch). `category` = stop_details.category, null when the API
+   * gave none (UI labels: refusalCategoryLabel). Absent on every other row.
+   */
+  refusal?: { scope: 'email' | 'batch'; category: string | null }
   /**
    * Snapshot of what the AI originally decided, captured at classifier time
    * before any user edits. Used after execute to detect "user overrode AI
@@ -431,13 +466,68 @@ export type FolderCache = {
   updatedAt: string
   tree: MailFolderNode[]
   /**
-   * Ids of the well-known folders (Deleted Items, Junk, Drafts, Outbox,
-   * Sent Items) whose subtrees fetchFolderTree left OUT of `tree`
-   * (2026-11-05). Execute refuses moves into them / their descendants.
-   * Absent on caches written before that change (execute then resolves the
-   * ids itself).
+   * The Outlook distinguished folders resolved with `tree` (2026-11-06 r2) —
+   * see WellKnownFolders. A cache without it (and without the legacy fields
+   * below) predates v1.0.8 and lists every folder.
+   */
+  wellKnown?: WellKnownFolders
+  /**
+   * Set when execute found the tree out of date (2026-11-06 r2): a folder in
+   * it now sits in the trash / Drafts / Outbox, or is gone. The cache is then
+   * no longer fresh — the next preflight refetches it, and reconcile orphans
+   * the rules that pointed there.
+   */
+  invalidatedAt?: string
+  /**
+   * v1.0.8 only — no longer written. Ids of the well-known folders whose
+   * whole subtrees that build left OUT of `tree`. Refetched on first use.
    */
   excludedFolderIds?: string[]
+  /**
+   * The 2026-11-06 round-1 build only — no longer written (that build kept
+   * the trash in `tree` and listed its subfolders here). Refetched on first
+   * use.
+   */
+  nonFiling?: NonFilingFolders
+}
+
+/** Outlook REST distinguished folder names the folder tree treats specially. */
+export type WellKnownFolderRole = 'deleteditems' | 'drafts' | 'outbox' | 'junkemail' | 'sentitems'
+
+/** The well-known roots that stay in the tree but are hidden from the AI. */
+export type AiHiddenFolderRole = Extract<WellKnownFolderRole, 'junkemail' | 'sentitems'>
+
+export type WellKnownFolderRoot = { id: string; role: WellKnownFolderRole; displayName?: string }
+
+/**
+ * Well-known folders (2026-11-06 r2). Deleted Items (root and subtree),
+ * Drafts and Outbox are left out of the tree — their subtrees are never even
+ * listed. A rule targeting Deleted Items ITSELF stays valid (a deliberate
+ * auto-trash rule; execute runs it as a delete); anything else missing from
+ * a complete tree is orphaned, including a folder deleted in OWA (it moves
+ * into the trash with the same id). Junk Email and Sent Items stay in the
+ * tree as ordinary targets, their roots tagged `MailFolderNode.wellKnown`.
+ */
+export type WellKnownFolders = {
+  roots: WellKnownFolderRoot[]
+  /**
+   * False when some lookup failed transiently: `roots` holds what resolved,
+   * the cache is only briefly fresh (refetched by the next preflight), and
+   * reconcile leaves every rule as it is.
+   */
+  complete: boolean
+}
+
+/** Well-known folders mail is never filed into. */
+export type NonFilingRoot = 'deleteditems' | 'drafts' | 'outbox'
+
+/**
+ * Round-1 (2026-11-06) cache shape, read only to upgrade it: the trash stayed
+ * in `tree`; its subfolders and Drafts / Outbox (+ subtrees) were recorded here.
+ */
+export type NonFilingFolders = {
+  trashFolderId?: string
+  byId: Record<string, NonFilingRoot>
 }
 
 /**
@@ -578,6 +668,13 @@ export type ExecuteItemResult = {
    * recentlyProcessed ledger for it exactly like the normal path).
    */
   alreadyGone?: boolean
+  /**
+   * Moved into a folder outside the tree while Deleted Items couldn't be
+   * identified (2026-11-06 r3) — it may have been the trash itself. The mail
+   * moved (and 撤回 can bring it back), but nothing is learned, remembered
+   * or logged as folder activity from it.
+   */
+  unverifiedTarget?: boolean
 }
 
 export type ExecuteSummary = {
@@ -699,15 +796,33 @@ export type UndoSnapshot = {
      */
     conversationId?: string
     normalizedSubject?: string
-    /** Rule that drove this move (plan source === 'rule'). Undo counts as
-     *  an override against it, feeding the empirical-accuracy demotion. */
+    /** Rule that drove this move (plan source === 'rule') — or this delete,
+     *  for an auto-trash rule (2026-11-06 r3). Undo counts as an override
+     *  against it, feeding the empirical-accuracy demotion. */
     ruleId?: string
   }>
   /**
-   * Rules minted by THIS batch's AI-confirmed learning. Deleted on undo
-   * (with tombstones, so the same wrong mapping isn't auto-re-learned).
+   * Rules minted by THIS batch's learning — AI-confirmed and (2026-11-06)
+   * override. Deleted on undo (with tombstones, so the same wrong mapping
+   * isn't auto-re-learned).
    */
   mintedRuleIds?: string[]
+  /**
+   * Auto-disabled rules THIS batch's learning switched back on — the
+   * AI-confirmed and (since R7) the override learner (2026-11-06). Undo puts
+   * each back to sleep with its old provenance — otherwise the revived rule
+   * re-proposed the undone misfiling next batch.
+   */
+  revivedRules?: RevivedRuleUndo[]
+  /**
+   * Enabled rules THIS batch switched off (2026-11-06): the learners'
+   * 'superseded' / 'override' demotions and the one-strike disable of a case
+   * rule whose row was re-filed elsewhere. Undo switches each back on with
+   * its pre-batch provenance. One entry per rule across both lists: a rule
+   * the batch touched more than once carries its state BEFORE the batch and
+   * the fingerprint AFTER it.
+   */
+  disabledRules?: DisabledRuleUndo[]
   /**
    * Deletes in the batch (user messaging). Since 2026-11-05 the ones with a
    * known new id are ALSO in `moves` (deleted: true) and are undoable.
@@ -716,6 +831,26 @@ export type UndoSnapshot = {
   /** Folders created by the batch — NOT rolled back by undo. */
   newFolderCount: number
 }
+
+/** A learning revive, as undo needs it (UndoSnapshot.revivedRules, 2026-11-06). */
+export type RevivedRuleUndo = {
+  ruleId: string
+  /** Provenance before the revive — what undo restores. */
+  autoDisabledReason?: Rule['autoDisabledReason']
+  autoDisabledAt?: string
+  /** The rule's semantic state right after the revive. Undo only acts while
+   *  the stored rule still matches it — an edit since then (user, sync,
+   *  reconcile) wins. */
+  fingerprint: string
+}
+
+/**
+ * A rule the batch switched off, as undo needs it (UndoSnapshot.disabledRules,
+ * 2026-11-06) — same shape as RevivedRuleUndo, but the rule was ENABLED
+ * before the batch (an enabled rule may still carry the closed-case
+ * exemption marker as its provenance).
+ */
+export type DisabledRuleUndo = RevivedRuleUndo
 
 export const UNDO_WINDOW_MS = 30_000
 
@@ -808,4 +943,15 @@ export type RuleTombstone = {
   signalNorm: string
   targetFolderPath: string
   deletedAt: number
+  /**
+   * v1.0.9+ (2026-11-06, S1): fingerprint (rules.ts spellingFingerprint) of
+   * the deleted rule's own signal in v1.0.7's normal form (legacySignalNorm)
+   * — e.g. of 「112年度訴字第304號」 under the canonical signalNorm 「112訴304」.
+   * Lets the first-participation merge tell "this exact rule was deleted"
+   * from a canonical collision. Every tombstone this build writes carries
+   * it; older builds' never do (and ignore it on the wire). A fingerprint, not
+   * the spelling itself: a compound's legacy spelling can be 3× its
+   * canonical key, and tombstones compete for the sync budget.
+   */
+  spellingHash?: string
 }

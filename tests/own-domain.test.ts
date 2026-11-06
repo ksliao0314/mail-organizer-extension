@@ -148,6 +148,53 @@ describe('learners never mint an own-domain domain rule', () => {
     expect(created[0]!.signal).toContain('colleague@firm.example') // sender-anchored, not domain
   })
 
+  // B5 (2026-11-06): a generic-provider mailbox shares its domain with every
+  // stranger on it — excluding the DOMAIN silenced every friend@outlook.com.
+  it('generic-provider mailbox: another address on the same provider still learns its sender rule', async () => {
+    await setMailboxIdentity({ address: 'me@outlook.com', domain: 'outlook.com', at: '' })
+    const item = colleagueItem({ emailFrom: 'friend@outlook.com', emailSubject: '週末聚餐', targetFolderPath: '私人/朋友' })
+    const r = await generateAiConfirmedRules([item], [moved(item.emailId)])
+    expect(r.added).toBe(1) // was 0: the 4-char subject can't even form a compound
+    expect((await listRules()).map((x) => `${x.type}:${x.signal}`)).toEqual(['sender:friend@outlook.com'])
+  })
+
+  it("generic-provider mailbox: the owner's own address stays internal (sender + subject, never a plain sender rule)", async () => {
+    await setMailboxIdentity({ address: 'me@outlook.com', domain: 'outlook.com', at: '' })
+    const item = colleagueItem({ emailFrom: 'Me@Outlook.com', targetFolderPath: '私人/備忘' })
+    await generateAiConfirmedRules([item], [moved(item.emailId)])
+    const rules = await listRules()
+    expect(rules).toHaveLength(1)
+    expect(rules[0]!.type).toBe('compound')
+  })
+
+  it('generic-provider mailbox: the initial scan counts other senders on the provider, not the owner', async () => {
+    await setMailboxIdentity({ address: 'me@outlook.com', domain: 'outlook.com', at: '' })
+    const tree: MailFolderNode[] = [
+      {
+        id: 'root-id-xxxxxxxxxxxxxxxxxxxx',
+        displayName: '案件',
+        path: '案件',
+        children: [
+          { id: 'folder-a-xxxxxxxxxxxxxxxxxxx', displayName: 'A', path: '案件/A', children: [] },
+        ],
+      },
+    ]
+    const mails: Partial<Email>[] = [
+      { From: { EmailAddress: { Address: 'friend@outlook.com' } }, Subject: '一' },
+      { From: { EmailAddress: { Address: 'friend@outlook.com' } }, Subject: '二' },
+      { From: { EmailAddress: { Address: 'me@outlook.com' } }, Subject: '三' },
+      { From: { EmailAddress: { Address: 'me@outlook.com' } }, Subject: '四' },
+    ]
+    const api = {
+      listFolderMessages: async (id: string) =>
+        id === 'folder-a-xxxxxxxxxxxxxxxxxxx'
+          ? mails.map((m, i) => ({ Id: `m${i}`, ToRecipients: [], ...m }))
+          : [],
+    } as unknown as OutlookApi
+    await startInitialScan({ rootPath: '案件', tree, api, excludePrefixes: [], internalDomains: [] })
+    expect((await listRules()).map((r) => `${r.type}:${r.signal}`)).toEqual(['sender:friend@outlook.com'])
+  })
+
   it('initial scan skips the own domain', async () => {
     await setMailboxIdentity({ address: ME, domain: 'firm.example', at: '' })
     const tree: MailFolderNode[] = [

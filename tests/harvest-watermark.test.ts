@@ -11,9 +11,12 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   HARVEST_LOOKBACK_MS,
+  HARVEST_MAX_PAGES,
+  HARVEST_PAGE_SIZE,
   HARVEST_WATERMARK_MARGIN_MS,
   harvestWindowStart,
   nextHarvestWatermark,
+  resumeHarvestWatermark,
   selectHarvestScanItems,
 } from '@/background/harvest'
 import {
@@ -78,6 +81,31 @@ describe('pure window helpers', () => {
   it('watermark = scan start − margin', () => {
     expect(nextHarvestWatermark(now)).toBe('2026-11-05T11:50:00.000Z')
   })
+  it('capped run: resume one second before the last row; always past the window start (C7)', () => {
+    const rows = (...ts: Array<string | undefined>) => ts.map((t, i) => ({ Id: `m${i}`, LastModifiedDateTime: t }))
+    expect(
+      resumeHarvestWatermark(rows('2026-11-03T10:00:00Z', '2026-11-03T10:05:07Z') as never, '2026-11-01T00:00:00Z'),
+    ).toBe('2026-11-03T10:05:06.000Z')
+    // A whole capped run inside the window start's own second: step past it.
+    expect(
+      resumeHarvestWatermark(rows('2026-11-03T10:05:07Z', '2026-11-03T10:05:07Z') as never, '2026-11-03T10:05:06Z'),
+    ).toBe('2026-11-03T10:05:07.000Z')
+    expect(resumeHarvestWatermark(rows(undefined, 'garbage') as never, '2026-11-01T00:00:00Z')).toBeNull()
+  })
+  // O5 (2026-11-06 r2): rounding DOWN landed back on the window start when the
+  // timestamps carried fractions of a second — `gt 10:05:07` still matches
+  // 10:05:07.5, so a capped run of one bulk change never advanced.
+  it('a capped run inside one (fractional) second still moves the watermark past it (O5)', () => {
+    const rows = (...ts: string[]) => ts.map((t, i) => ({ Id: `m${i}`, LastModifiedDateTime: t }))
+    const start = '2026-11-03T10:05:07Z'
+    const next = resumeHarvestWatermark(
+      rows('2026-11-03T10:05:07.4000000Z', '2026-11-03T10:05:07.5000000Z') as never,
+      start,
+    )
+    expect(next).toBe('2026-11-03T10:05:08.000Z')
+    // …and the window the next run asks for is strictly later.
+    expect(Date.parse(harvestWindowStart(next, Date.parse('2026-11-05T12:00:00Z')))).toBeGreaterThan(Date.parse(start))
+  })
   it('keeps only rows sitting in a target folder', () => {
     const out = selectHarvestScanItems(
       [
@@ -132,17 +160,69 @@ describe('harvestManualFilings handler', () => {
   it('a failure mid-paging leaves the watermark untouched', async () => {
     const w = new Date(Date.now() - 60 * 60 * 1000).toISOString()
     await setLastHarvestAt(w)
+    const t0 = Date.now() - 50 * 60 * 1000
     fetchSpy
       .mockResolvedValueOnce(
+        // A FULL page — there is more to read…
         json({
-          value: [{ Id: 'm1', Subject: 'x', ParentFolderId: JIA }],
-          '@odata.nextLink': 'https://outlook.office.com/api/v2.0/me/messages?$skip=100',
+          value: Array.from({ length: HARVEST_PAGE_SIZE }, (_, i) => ({
+            Id: `m${i}`,
+            Subject: 'x',
+            ParentFolderId: JIA,
+            LastModifiedDateTime: new Date(t0 + i * 1000).toISOString(),
+          })),
         }),
       )
+      // …and reading it fails.
       .mockResolvedValueOnce(new Response('bad request', { status: 400 }))
     const r = await sw.send({ type: 'harvestManualFilings' })
     expect(r.ok).toBe(false)
     expect(await getLastHarvestAt()).toBe(w)
+  })
+
+  // C7 (2026-11-06): more modified mail than the page cap (read-state changes
+  // count) meant every run was incomplete, so the watermark never moved, each
+  // run paid all 30 pages on the same newest mail, and the rest was never seen.
+  // Keyset pages since O5 (2026-11-06 r2): the server below honours the
+  // filter / $top / $skip of each request like Exchange does.
+  it('a PAGE-CAPPED run advances the watermark to where it stopped; the next run resumes there', async () => {
+    // Relative to now: the window start is clamped to the 14-day lookback,
+    // so fixed dates break once the real clock moves past them.
+    const now = Math.floor(Date.now() / 60_000) * 60_000
+    const w0 = new Date(now - 5 * 86_400_000).toISOString()
+    await setLastHarvestAt(w0)
+    const base = now - 4 * 86_400_000
+    const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
+    const rows = Array.from({ length: HARVEST_PAGE_SIZE * HARVEST_MAX_PAGES * 2 }, (_, i) => ({
+      Id: `m${i}`,
+      Subject: `s${i}`,
+      ParentFolderId: JIA,
+      LastModifiedDateTime: iso(base + i * 60_000),
+    }))
+    let lastServed = 0
+    fetchSpy.mockImplementation(async (input: unknown) => {
+      const url = decodeURIComponent(String(input))
+      const f = /LastModifiedDateTime (gt|ge) (\S+?)(&|$)/.exec(url)!
+      const bound = Date.parse(f[2]!)
+      const top = Number(/\$top=(\d+)/.exec(url)![1])
+      const skip = Number(/\$skip=(\d+)/.exec(url)?.[1] ?? 0)
+      const value = rows
+        .filter((r) => (f[1] === 'gt' ? Date.parse(r.LastModifiedDateTime) > bound : Date.parse(r.LastModifiedDateTime) >= bound))
+        .slice(skip, skip + top)
+      for (const r of value) lastServed = Math.max(lastServed, Date.parse(r.LastModifiedDateTime))
+      return json({ value })
+    })
+    const r = await sw.send({ type: 'harvestManualFilings' })
+    expect(r).toMatchObject({ ok: true, data: { complete: false } })
+    expect(fetchSpy).toHaveBeenCalledTimes(HARVEST_MAX_PAGES)
+    const decoded = decodeURIComponent(String(fetchSpy.mock.calls[0]![0]))
+    expect(decoded).toContain('$orderby=LastModifiedDateTime asc')
+    expect(await getLastHarvestAt()).toBe(new Date(lastServed - 1000).toISOString())
+
+    fetchSpy.mockReset()
+    fetchSpy.mockResolvedValue(json({ value: [] }))
+    await sw.send({ type: 'harvestManualFilings' })
+    expect(Date.parse(sinceOf(String(fetchSpy.mock.calls[0]![0])))).toBe(lastServed - 1000)
   })
 
   it('a second run while one is in flight is refused synchronously', async () => {

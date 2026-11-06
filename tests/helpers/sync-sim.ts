@@ -47,6 +47,8 @@ export async function simulateOtherMachinePush(opts: {
   /** Stamp a fresh wipe marker (id defaults to a unique value). */
   wipe?: { id?: string; at?: string }
   pushId?: string
+  /** The pusher's active-day ledger (2026-11-06). */
+  activeDays?: string[]
 }): Promise<PushPayload> {
   const machineId = opts.machineId ?? 'other-machine'
   const updatedAt = new Date().toISOString()
@@ -56,6 +58,7 @@ export async function simulateOtherMachinePush(opts: {
     tombstones: opts.tombstones ?? [],
     folderActivity: opts.folderActivity ?? [],
     settings: { ...DEFAULT_SETTINGS, claudeModel: 'claude-opus-5-5', batchSize: 99, ...opts.settings },
+    activeDays: opts.activeDays,
     prevMeta: await readCloudMeta(),
     wipeMarker: opts.wipe
       ? { id: opts.wipe.id ?? `wipe-${++seq}`, at: opts.wipe.at ?? updatedAt, byMachineId: machineId }
@@ -144,6 +147,30 @@ export async function simulateV2Push(opts: {
   for (const c of ruleChunks) writes[`syncRules_${c.index}`] = c
   for (const c of tombChunks) writes[`syncTombstones_${c.index}`] = c
   await replaceCloud(writes)
+}
+
+/**
+ * Several machines on one mock (2026-11-06): chrome.storage.sync is shared,
+ * each machine has its own chrome.storage.local. `use(name)` parks the
+ * current machine's local storage (JSON round-trip, like Chrome's own
+ * serialisation) and loads `name`'s; the engine's in-memory state is reset,
+ * as if that machine's service worker had just woken.
+ */
+export function machines(): { use: (name: string) => Promise<void>; current: () => string | undefined } {
+  const parked = new Map<string, string>()
+  let current: string | undefined
+  return {
+    current: () => current,
+    async use(name: string) {
+      if (current === name) return
+      if (current !== undefined) parked.set(current, JSON.stringify(await chrome.storage.local.get(null)))
+      await chrome.storage.local.clear()
+      const next = parked.get(name)
+      if (next) await chrome.storage.local.set(JSON.parse(next) as Record<string, unknown>)
+      resetSyncEngineForTests()
+      current = name
+    },
+  }
 }
 
 type Listener = (changes: Record<string, chrome.storage.StorageChange>, area: string) => void

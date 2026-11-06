@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildRuleIndex,
   encodeCompound,
+  matchBodyCaseWithIndex,
   matchEmailWithIndex,
   newRule,
   ruleBeatsThread,
@@ -141,6 +142,123 @@ describe('compound specificity (item 8)', () => {
     expect(out?.rule.targetFolderPath).toBe('case/乙') // was case/甲
     // The broad one still catches what only it matches.
     expect(match([broad, specific], email({ Subject: '甲案報告' }))?.rule.targetFolderPath).toBe('case/甲')
+  })
+
+  // B4 (2026-11-06): "longest subject first" ignored source and structure.
+  it('a hand-written compound beats a longer auto one (vendor + 請款 vs vendor + 三月份請款單…)', () => {
+    const manual = compound('請款', 'manual/billing', { source: 'user_manual' })
+    const auto = compound('三月份請款單與發票明細', 'auto/march')
+    const out = match([auto, manual], email({ Subject: 'RE: 三月份請款單與發票明細' }))
+    expect(out?.rule.targetFolderPath).toBe('manual/billing') // was auto/march
+  })
+
+  it('a court-case compound beats a full-subject compound that merely contains the case number', () => {
+    const court = compound('112訴204', 'case/204')
+    const fullSubject = compound('112訴204 股權移轉案進度報告', 'case/progress', { source: 'ai_overridden' })
+    const out = match([fullSubject, court], email({ Subject: '112訴204 股權移轉案進度報告' }))
+    expect(out?.rule.targetFolderPath).toBe('case/204') // was case/progress
+    // …and so does a Latin case-code compound.
+    const code = compound('25A0067A', 'case/25A0067A')
+    const full2 = compound('25A0067A 補件通知與期日', 'case/notice')
+    expect(match([full2, code], email({ Subject: '25A0067A 補件通知與期日' }))?.rule.targetFolderPath).toBe(
+      'case/25A0067A',
+    )
+  })
+
+  it('a hand-written compound with no subject condition beats an auto one that has one', () => {
+    const manual = rule({
+      type: 'compound',
+      signal: encodeCompound([
+        { type: 'sender', value: 'someone@client.example' },
+        { type: 'domain', value: 'client.example' },
+      ]),
+      source: 'user_manual',
+      targetFolderPath: 'manual/someone',
+    })
+    const auto = compound('季度營運報告', 'auto/quarterly')
+    expect(match([auto, manual], email({ Subject: '季度營運報告' }))?.rule.targetFolderPath).toBe('manual/someone')
+  })
+
+  it('structural still outranks hand-written inside the compound tier', () => {
+    const manual = compound('請款', 'manual/billing', { source: 'user_manual' })
+    const court = compound('112訴204', 'case/204')
+    expect(match([manual, court], email({ Subject: '112訴204 律師費請款' }))?.rule.targetFolderPath).toBe('case/204')
+  })
+
+  // R1 (2026-11-06): B4 ranked every auto case-number compound above a
+  // hand-written compound whose subject merely CONTAINS that case number —
+  // the user's exception inside the case. v1.0.8 routed 「112訴204 帳單
+  // 三月份」 to 帳務; B4 sent it to the case folder, and correcting that
+  // one-strike-disabled the case rule and learned (domain + 112訴204) → 帳務.
+  it('a hand-written compound naming a case number beats the auto case compound (the exception inside the case)', () => {
+    const manual = compound('112訴204 帳單', 'manual/帳務', { source: 'user_manual' })
+    const auto = compound('112訴204', 'case/甲')
+    const rules = [auto, manual]
+    expect(match(rules, email({ Subject: '112訴204 帳單 三月份' }))?.rule.targetFolderPath).toBe('manual/帳務') // was case/甲
+    // The rest of the case still goes to the case folder.
+    expect(match(rules, email({ Subject: '112訴204 開庭通知' }))?.rule.targetFolderPath).toBe('case/甲')
+  })
+
+  it('the same for a Latin case code inside the hand-written subject; an AUTO one that contains it still loses', () => {
+    const manual = compound('25A0067A 帳單', 'manual/帳務', { source: 'user_manual' })
+    const auto = compound('25A0067A', 'case/25A0067A')
+    expect(match([auto, manual], email({ Subject: '25A0067A 帳單' }))?.rule.targetFolderPath).toBe('manual/帳務')
+    const autoFull = compound('25A0067A 帳單', 'auto/帳務', { source: 'ai_overridden' })
+    expect(match([autoFull, auto], email({ Subject: '25A0067A 帳單' }))?.rule.targetFolderPath).toBe('case/25A0067A')
+  })
+})
+
+// Tier 0 (2026-11-06): R1 across tiers. A hand-written rule whose subject
+// names a case id still lost to the auto case_code (tier 1) and to the auto
+// case-number subject rules (tier 3) / compounds (tier 2); correcting the
+// misfile one-strike-disabled the case rule and taught the whole case to go
+// to the exception's folder.
+describe('tier 0: hand-written rules naming a case id beat every auto case rule', () => {
+  const caseCode = (code: string, target: string, over: Partial<Rule> = {}) =>
+    rule({ type: 'case_code', signal: code, targetFolderPath: target, confidence: 0.9, ...over })
+  const compound = (subject: string, target: string, over: Partial<Rule> = {}) =>
+    rule({
+      type: 'compound',
+      signal: encodeCompound([
+        { type: 'domain', value: 'client.example' },
+        { type: 'subject_keyword', value: subject },
+      ]),
+      targetFolderPath: target,
+      ...over,
+    })
+
+  it('repro: a hand-written compound naming a Latin case code beats the auto case_code rule', () => {
+    const rules = [
+      caseCode('25A0067A', 'case/25A0067A'),
+      compound('25A0067A 帳單', 'manual/帳務', { source: 'user_manual' }),
+    ]
+    expect(match(rules, email({ Subject: '25A0067A 帳單 三月份' }))?.rule.targetFolderPath).toBe('manual/帳務') // was case/25A0067A
+    expect(match(rules, email({ Subject: '25A0067A 補件通知' }))?.rule.targetFolderPath).toBe('case/25A0067A')
+  })
+
+  it('repro: a hand-written subject rule naming a court case number beats the auto case-number rules', () => {
+    const manual = rule({ type: 'subject_keyword', signal: '112訴204 帳單', source: 'user_manual', targetFolderPath: 'manual/帳務' })
+    const autoCompound = compound('112訴204', 'case/甲', { confidence: 0.9 })
+    const autoSubject = rule({ type: 'subject_keyword', signal: '112訴204', targetFolderPath: 'case/甲2', confidence: 0.85 })
+    expect(match([autoCompound, manual], email({ Subject: '112訴204 帳單 三月份' }))?.rule.targetFolderPath).toBe('manual/帳務') // was case/甲
+    expect(match([autoSubject, manual], email({ Subject: '112訴204 帳單 三月份' }))?.rule.targetFolderPath).toBe('manual/帳務') // was case/甲2
+    expect(match([autoCompound, autoSubject, manual], email({ Subject: '112訴204 開庭通知' }))?.rule.targetFolderPath).toBe('case/甲')
+  })
+
+  it('a hand-written case_code rule keeps its place (tier 1): ahead of auto compounds, behind the tier-0 exception', () => {
+    const manualCode = caseCode('25A0067A', 'manual/code', { source: 'user_manual' })
+    const autoCompound = compound('25A0067A', 'auto/compound')
+    expect(match([autoCompound, manualCode], email({ Subject: '25A0067A 進度' }))?.rule.targetFolderPath).toBe('manual/code')
+    const exception = rule({ type: 'subject_keyword', signal: '25A0067A 帳單', source: 'user_manual', targetFolderPath: 'manual/帳務' })
+    expect(match([manualCode, exception], email({ Subject: '25A0067A 帳單' }))?.rule.targetFolderPath).toBe('manual/帳務')
+  })
+
+  it('a hand-written pure case-number subject rule still serves the body case pass', () => {
+    const manual = rule({ type: 'subject_keyword', signal: '112訴204', source: 'user_manual', targetFolderPath: 'manual/case' })
+    const index = buildRuleIndex([manual])
+    expect(matchEmailWithIndex(email({ Subject: '112訴204 通知' }), index)?.rule.targetFolderPath).toBe('manual/case')
+    const bodyOnly = email({ Subject: '開庭通知', bodyText: '本院 112年度訴字第204號 定於下週開庭' })
+    expect(matchBodyCaseWithIndex(bodyOnly, index)?.rule.targetFolderPath).toBe('manual/case')
   })
 })
 

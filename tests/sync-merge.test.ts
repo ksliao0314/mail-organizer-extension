@@ -504,10 +504,16 @@ describe('Item 9: restoreBackup goes through mutateRules', () => {
     expect((await listRules()).map((r) => r.id)).toEqual(['restored'])
   })
 
-  it('restored versions keep their editedAt', async () => {
-    const at = await seedBackup([{ ...rule({ id: 'keep', signal: 'keep.com' }), editedAt: 4242 }])
+  it('a restored version identical to the current one keeps its version; a different one is a new edit (A5)', async () => {
+    await addRules([rule({ id: 'same', signal: 'same.com' })])
+    const same = (await byId('same'))!
+    const before = Date.now()
+    const at = await seedBackup([same, { ...rule({ id: 'gone', signal: 'gone-here.com' }), editedAt: 4242 }])
     await restoreBackup(at)
-    expect((await byId('keep'))!.editedAt).toBe(4242)
+    expect((await byId('same'))!.editedAt).toBe(same.editedAt)
+    // 2026-11-05 kept the snapshot's editedAt 4242: any newer copy anywhere
+    // then reverted the rollback at the next pull.
+    expect((await byId('gone'))!.editedAt).toBeGreaterThanOrEqual(before)
   })
 
   it('a rule deleted after the snapshot is un-deleted: tombstone cleared, re-stamped newer', async () => {

@@ -2,7 +2,7 @@
 
 Chrome MV3 擴充工具,把 Outlook 收件夾用「rule + Claude AI」兩段式歸類。權威使用者文件:`README.md`。本檔是給 Claude Code(及其他 AI 助手)接手時看的 architecture / convention / gotcha 速查。
 
-最後一次大改:**2026-11-05**(v1.0.7 急救批 + v1.0.8 P1/P2 全面修補,逐項見 `CHANGELOG.md`)。本檔下方標 (2026-05-xx) 的段落若與「2026-11-05 更新」衝突,以後者為準。
+最後一次大改:**2026-11-06**(v1.0.9 單批上限 500 + 分類 / 搬信平行加速;v1.0.10 再審查約 50 項全面修補。更早:2026-11-05 的 v1.0.7 急救批 + v1.0.8 P1/P2 全面修補。逐項見 `CHANGELOG.md`)。本檔下方標 (2026-05-xx) 的段落若與「2026-11-05 / 2026-11-06 更新」衝突,以後者為準。
 
 ---
 
@@ -24,7 +24,7 @@ popup (React)        options (React)         content (outlook.*)
    chrome.storage.local (持久) / .session (暫存) / .sync (跨機器)
 ```
 
-代碼大小快查(2026-11-05):`service-worker.ts` ≈ 3900 行、`options/App.tsx` ≈ 7700 行、`popup/App.tsx` ≈ 3800 行、`sync-engine.ts` ≈ 2100 行、`shared/rules.ts` ≈ 3000 行、`background/execute.ts` ≈ 2800 行、`shared/classifier.ts` ≈ 1600 行。998 tests across 74 test files。
+代碼大小快查(2026-11-06):`service-worker.ts` ≈ 4700 行、`options/App.tsx` ≈ 7800 行、`popup/App.tsx` ≈ 4200 行、`sync-engine.ts` ≈ 3200 行、`shared/rules.ts` ≈ 3900 行、`background/execute.ts` ≈ 4100 行、`shared/classifier.ts` ≈ 2200 行。1504 tests across 111 test files。
 
 ---
 
@@ -106,7 +106,7 @@ popup (React)        options (React)         content (outlook.*)
 | `ruleHistory` | 規則編輯 audit log | 500 events |
 | `ruleTombstones` | 已刪除規則(防自動復活) | 2000 本機 / 500 同步 |
 | `skipHistory` | 使用者選擇保留的 email IDs | 5000 + 60 天 TTL |
-| `folderCache` | Outlook 資料夾樹快取 | — |
+| `folderCache` | Outlook 資料夾樹快取;`nonFiling`(2026-11-06)= 不能歸檔的 well-known 資料夾 id(草稿 / 寄件匣 / 已刪除的郵件的子資料夾),取代 v1.0.8 的 `excludedFolderIds` | — |
 | `folderActivity` | 近日活動 ledger | 200 |
 | `folderActivityRefreshAt` | popup auto-refresh 節流 | — |
 | `conversationMemory` | ConvId → folder map | 5000 |
@@ -114,20 +114,25 @@ popup (React)        options (React)         content (outlook.*)
 | `metrics` | 累積統計 | — |
 | `undoSnapshot` | 30 秒撤回快照 | 過期清除 |
 | `weeklyDigest` | 週報 snapshot | — |
-| `syncBackups` | 本機 snapshot:只在 replace 合併 / 遠端 wipe / 首次啟用 / 還原前寫;不含墓碑;另有固定的「wipe 前」slot(2026-11-05) | 5 + pinned |
+| `syncBackups` | 本機 snapshot:只在 replace 合併 / 遠端 wipe / 首次啟用 / 還原 / 撕裂修復前寫;固定 slot 每種 trigger 一份(「套用他機全部刪除前」、「升級同步格式前」);upgrade / first-enable 含墓碑(2026-11-06) | 5 + pinned |
 | `syncLastError` | 上次同步失敗紀錄 | next success 清空 |
 | `remoteWipeNotice` | 收到另一台機器 wipeMarker 後的本地通知 | 用戶 dismiss 清除 |
 | `errorLog` | 中央 SW 錯誤集中 | 200 entries |
-| `activeDays` | 有執行批次的 UTC 日('YYYY-MM-DD'),stale sweep 的時鐘 | 400 |
+| `activeDays` | 本機有執行批次的 UTC 日('YYYY-MM-DD'),stale sweep 的時鐘(2026-11-06 起只記本機;其他機器的在 `fleetActiveDays`) | 400 |
 | `lastSweepAt` | 上次 stale sweep 時間(ms),啟動補跑的 20h 閘門 | — |
-| `mailboxIdentity` | 本機信箱 `{ address, domain, at }`(GET /me,快取 7 天;own-domain 排除用) | — |
+| `mailboxIdentity` | 本機信箱 `{ address, domain, at, accountId? }`(GET /me,快取 7 天;own-domain 排除用)。2026-11-06 起依 MSAL 帳號(homeAccountId)綁定,換帳號就重查;學習器與初始掃描一律經 `src/background/mailbox-identity.ts` 的 `getAccountCheckedIdentity()` 讀取 | — |
 | `movedByUsLedger` | 本工具搬過的信(目的地新 id;harvester 排除自己搬的);**只在 harvestEnabled 時寫** | 5000 + 90 天 |
 | `lastHarvestAt` | harvester 水位(掃描**開始**時間 − 10 分) | — |
-| `syncLocalState` | 同步本機狀態:上次合併的 pushId、已見過的 wipe id、上次同步的 settings 快照(三方合併用)。永不同步 / 備份 / 匯出 | — |
+| `syncLocalState` | 同步本機狀態:上次合併的 pushId、已見過的 wipe id、上次同步的 settings 快照(三方合併用);2026-11-06 加 `v4Adopted` / `legacyLastSyncAt`(升級採用)、`foreignSettings`(別台的未知模型)、`counterPushDueAt`(計數合併推送)。永不同步 / 備份 / 匯出 | — |
+| `syncTornStreak` | 雲端撕裂讀取連續次數(依 meta pushId);≥3 次且跨 ≥60 秒才允許修復推送(2026-11-06) | — |
+| `refusedEmails` | Claude 拒絕分類過的信 `{ [emailId]: { at, category, model } }`,後續批次不再送 Claude、也不佔批次名額(換模型會重試)。本機限定,不同步 / 備份 / 匯出(2026-11-06) | 500 + 7 天 |
+| `refusalSuspicion` | 整批共用內容被拒的判定 `{ model, promptKey, category, at }`:同模型 + 同 prompt 前綴在期限內不再逐封拆分,任何成功回答即清除。本機限定(2026-11-06) | 6 小時 |
+| `fleetActiveDays` | 從同步收到的其他機器使用日;`getActiveDays()` = 本機 ∪ fleet(同步規則用),`getLocalActiveDays()` 只含本機(auto_scan 規則用)(2026-11-06) | 400 |
+| `ruleCounterBaseline` | 升級後第一次清理記下的各規則命中 / 改歸計數基準(含 epochs);high-error-rate 要基準後 ≥20 次觸發才判斷。只有 `statsResetAt` 變新才算重設,其他下降重新定基準;同步 / 還原 / 匯入帶進來的計數由 `mutateRules` 的 `coverArrivingCounters` 先納入基準。本機限定(2026-11-06) | — |
 
 ### `chrome.storage.session`(SW 生命週期)
 
-`cachedToken` / `lastTokenError`(token.ts,getStatus 轉給 popup 顯示真正原因) / `aiClassifyProgress`(帶 `runId`) / `classifyRun`(目前分類 run 的擁有者) / `popupState` / `preflightCache` / `classifyStage` / `executeState` / `executeFinalize`(批次收尾步驟 marker,SW 中途被砍可從斷點重放) / `scanState` / `folderTreeStale`
+`cachedToken`(含 `accountId`) / `lastTokenError`(token.ts,getStatus 轉給 popup 顯示真正原因) / `aiClassifyProgress`(帶 `runId`) / `classifyRun`(目前分類 run 的擁有者) / `popupState` / `preflightCache` / `classifyStage` / `executeState` / `executeFinalize`(批次收尾步驟 marker,SW 中途被砍可從斷點重放;2026-11-06 加 `intents` / `statAt`(計數 exactly-once)與 `subjectPrior`(主旨記憶重放)、`learningIntent` / `ruleDisables`(學習步驟與 one-strike 停用 exactly-once,撤回用)) / `executeInFlight`(搬移 / 刪除 / 建資料夾送出前寫入的進行中索引;SW 被砍時這些列標「可能已完成」) / `mailboxIdentityFailure`(/me 查詢失敗冷卻,`{ byAccount }`) / `scanState` / `folderTreeStale`(含 `logged`)
 
 ### `chrome.storage.sync`(跨機器,100 KB quota)
 
@@ -135,9 +140,9 @@ popup (React)        options (React)         content (outlook.*)
 |---|---|
 | `syncMeta` | schemaVersion(**4**)/ sourceMachineId / updatedAt / chunkCounts / `pushId` / `contentHash` / `recentPushes[]` / `wipeMarker?`(含隨機 `id`) |
 | `syncSettings4` | settings minus per-device fields(帶 pushId) |
-| `syncRows4_0..N` | 規則 compact rows(user_manual + ai_confirmed + ai_overridden;預算放不下的**停用**規則以 stub 形式永遠送出) |
+| `syncRows4_0..N` | 規則 compact rows(user_manual + ai_confirmed + ai_overridden;預算放不下時,**最近 30 天內停用**的規則以 stub 形式保證送出(2026-11-06 前是所有停用規則);可帶 `sr`(statsResetAt)) |
 | `syncFolders4_0..F` | 資料夾字典(hash key) |
-| `syncTombs4_0..M` | 墓碑(最新優先、最多佔預算 15%) |
+| `syncTombs4_0..M` | 墓碑(最新優先;一般最多佔預算 15%,近 30 天的墓碑可擠掉低優先規則列、最多到 40%,2026-11-06) |
 | `syncActivity4_0..K` | 最近 20 個 folder activity |
 
 v1–v3 的舊 key(`syncSettings` / `syncRules_*` / `syncRulesC_*` / `syncFolders_*` / `syncTombstones_*` / `syncFolderActivity_*`)只讀不寫,v4 第一次 push 時清掉。每個 v4 chunk 帶 meta 的 `pushId`,讀到不一致(撕裂讀取)就整次放棄、退避重試。
@@ -151,11 +156,27 @@ v1–v3 的舊 key(`syncSettings` / `syncRules_*` / `syncRulesC_*` / `syncFolder
 - **逐條規則合併**:`Rule.editedAt`(ms)只由 `mutateRules` 在語意欄位(type / signal / target / confidence / enabled / source / autoDisabled* / orphaned)改變時蓋章;命中計數不蓋章。合併:語意欄位取 editedAt 較新者(平手取雲端)、matchCount / overrideCount / lastUsedAt 取最大、createdAt 取最小。同步 pull / restore 用 `mutateRules(fn, { preserveEditedAt: true })`。
 - **單一佇列**:push / pull / restore / clearCloud 共用一個 queue;push 前若雲端 pushId 不是本機上次合併過的就先 pull(union);pull 期間的本機變更延後推送、不再丟棄;settings 用上次同步快照做三方合併。
 - **墓碑看時間**:墓碑只壓 `max(createdAt, editedAt) <= deletedAt` 的規則版本(雙向);刪除時用 `tombstoneDeletedAt()` 蓋 `deletedAt = max(now, editedAt+1, createdAt+1)`,時鐘偏差也能傳遞刪除。墓碑 key 一律經 `tombstoneKey()` 重新正規化(相容舊格式)。
-- **停用一定傳得出去**:預算放不下的停用規則以 stub `[id, editedAt, reason, at]` 送出、不被截掉;stub 不會在對方新建規則。
+- **停用一定傳得出去**:預算放不下的停用規則以 stub `[id, editedAt, reason, at]` 送出、不被截掉;stub 不會在對方新建規則。(2026-11-06 起只保證最近 30 天內編輯過的停用,見下方 v1.0.10 補充)
 - **手動「立即下載」永遠 union**(v1.0.7)。
 - **wipeMarker 有隨機 id**:每台機器記錄已見過的 id、只套用沒見過的;首次參與的機器只記錄不套用;停用同步會重置參與狀態。
 - **錯誤分類**:`MAX_WRITE_OPERATIONS_*` 是速率限制(退避後重試),不是容量問題;push 失敗會依指數退避自動重試。
 - 混版:v1.0.8(v4)可讀 v1–v4 雲端並升級成 v4;v1.0.7(v3)遇到 v4 雲端會拒絕並提示升級。
+
+### 2026-11-06 v1.0.10 補充(與上面衝突時以此為準)
+
+- **升級採用(adoption)**:每台機器第一次 v4 合併前,先建 pinned「升級同步格式前」備份(規則 + 墓碑 + 設定)。本機活著的規則若只被「自己的墓碑」或「v3 已處理過的墓碑(deletedAt ≤ 舊 lastSyncAt)」壓住 → 保留,editedAt 蓋到 deletedAt+1 之上讓所有機器收斂;user_manual 遇到「只在新正規化後才相撞」的墓碑也保留。
+- **`orphaned` 是本機狀態**:不在語意欄位、不蓋 editedAt;本機孤兒版本不會在合併中勝出;合併採用不同目標時清掉孤兒旗標讓 reconcile 重判。
+- **統計 epoch**:`Rule.statsResetAt`(row key `sr`),復活重設計數時蓋章;同步合併與 `dedupeRulesByKey` 的 matchCount / overrideCount 只取最新 epoch,同 epoch 取最大。
+- **還原 = 新的編輯**:與目前不同(或本機沒有)的還原版本蓋新 editedAt(高於對應墓碑);備份之後才出現的同步規則以墓碑移除;回傳 `removedCount`。
+- **撕裂雲端修復**:同一 meta pushId 連續 ≥3 次撕裂讀取且跨 ≥60 秒 → 先建「修復雲端資料前」備份、再以本機重寫雲端(帶著本機沒套用過的 wipe 時拒絕);meta 擁有者看到外來 chunk 會主動修復。
+- **預算**:停用 stub 只保證最近 30 天編輯過的停用;近 30 天的墓碑最多可佔 40% 預算,只擠掉低優先列(從未命中的 ai_confirmed、停用規則)。
+- **計數合併推送**:只有命中數變動(`meta.semanticHash` 不變)時最多每 20 分鐘推一次(alarm `mail-organizer:sync-counter-push`);語意變更、墓碑、設定、近日活動、新使用日、`pushNow` 立即推。`contentHash` 公式不變,與 v1.0.8 的 echo 偵測相容。
+- **使用日同步**:`activeDays` 以 settings item 的 `d` 欄位(差分編碼)同步,pull 時 union(`mergeActiveDaysFromSync`),各機器 stale sweep 的時鐘一致。
+- **參與狀態**:啟用同步時 `beginSyncParticipation()`;沒有 v4 參與狀態的機器把現有 wipe id 記為已見、不套用(舊 lastSyncAt 只當升級採用的分界)。
+- **未知模型**:別台選了本機不認得的 `claudeModel` → 記在 `foreignSettings`、推送時原樣送回,本機模型不變。
+- **mutateRules 先讀墓碑**:`stampEditedAt` 對新規則與重新啟用(false→true)蓋到該三元組最新刪除時間之上(時鐘偏差不再吞掉重建的規則);重複 id 先依物件身分、再依出現順序配對。
+- **墓碑依寫法(第三輪)**:每筆墓碑由 `ruleTombstone()` 建立並帶 `spellingHash`(被刪規則的 legacy 寫法指紋,線上為第 5 個欄位);storage 以 (三元組, spellingHash) 為鍵(`mergeTombstoneSlots`),較新的 deletedAt 勝。帶 spellingHash 的墓碑只壓同寫法的規則(穩態合併與升級採用皆然),沒有 spellingHash 的(v1.0.8 / v1.0.7 / 匯入)壓所有寫法;v1.0.8 回推的去寫法副本會併回原本有寫法的那筆。第二輪的「刪除時重蓋存活雙胞胎」已移除。v1.0.8 機器不認寫法,在它那邊刪一種仍會刪掉另一種,但不會擴散、也不會來回同步。
+- 向下相容:`sr` / `d` / `semanticHash` / `daysHash` / 墓碑第 5 欄全是附加欄位,v1.0.8(v4)會忽略;pushId 撕裂檢查不變。
 
 ### 同步什麼 / 不同步什麼
 
@@ -284,10 +305,13 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 | **自動生** | 執行成功後 `generateAiConfirmedRules` / `generateAiOverrideRules` | 走 `chooseLearningSignal` 6 層、`applyConfidenceCap`、`addRulesFilteringTombstones` |
 | **自動沉寂** | `stale-sweep.ts:runSweep` → `autoDisableStaleRules`(每日 alarm;SW 啟動時若距上次 ≥ 20h 補跑一次;Options「立即執行」= `force`) | 錯誤率以**所有觸發**計(`ruleFires = matchCount + overrideCount`、`ruleErrorRate`;2026-11-05 前只算被接受的命中,越常錯的規則反而活越久)→ `enabled=false` + `autoDisabledReason: 'high-error-rate'` + `autoDisabledAt` |
 | **stale 直接刪** | 同上 sweep | `matchCount === 0` 且 createdAt 之後已過 100 個**使用日**(full_subject 類 45) OR `matchCount > 0` 且 lastUsedAt 之後已過 100 個**使用日** → **完全刪除**(不留 tombstone、不寫 audit、不 console)。**使用日** = 有執行批次的 UTC 日:本機 `activeDays` ledger ∪ 從同步規則的 lastUsedAt / AI 規則 createdAt 推導(`deriveActiveDaysFromRules`)。閒置期間不計 — 2026-11-05 前用日曆天,停用 ~100 天回來整個學習庫被刪光、還原備份後下次喚醒又被刪。設計理由:長期沒命中等於不存在,留痕跡只汙染信任 |
+| **假案號清理** | 同上 sweep(`pseudoCasePurgeTransform`,2026-11-06) | 案號訊號是「1XX度N」(年度編號被舊解析誤當案號)的自動規則 → 完全刪除(不留墓碑);user_manual 不動。其他「年度+非字別」的舊訊號(如 113財報1)無法證明是假的,保留到 stale sweep |
 | **legacy token 清理** | 同上 sweep | 2026-05-27 之前用 tokenize 路徑生的 subject_keyword 規則(`isLegacyTokenSubjectRule`):createdAt < `REDESIGN_CUTOFF_ISO` 的 ai_confirmed / ai_overridden subject_keyword 規則 → 設 `autoDisabledReason: 'legacy_token'` |
-| **自動復活** | `addRulesFilteringTombstones` dedup + learners 的 `isRevivableAutoDisabled` | 同 type+signal+target 對應到 `override` / `superseded` / `high-error-rate` 自動停用的規則 → 復職(high-error-rate 重新起算準確率);使用者停用(無 reason)、`case_closed`、`legacy_token` 仍擋住重學 |
+| **自動復活** | `addRulesFilteringTombstones` dedup(兩段式,2026-11-06)+ learners 的 `isRevivableAutoDisabled` | 同 type+signal+target 對應到 `override` / `superseded` / `high-error-rate` 自動停用的規則 → 復職(high-error-rate 重新起算準確率並蓋 `statsResetAt`);**例外**:同一錨點(網域 / 寄件人,含錨定在它上的 compound)還有活規則指向別處、或同批候選 / 復活互相衝突時不復活;使用者停用、`case_closed`、`legacy_token` 仍擋住重學 |
 | **被改歸 / 被取代** | execute(`override`:案號類規則命中的信被你**改歸到別的資料夾**,一次即停用;刪除 / 保留不算)、learning(`superseded`:廣規則被更精準規則取代) | 帶 `autoDisabledReason` + `autoDisabledAt`;停用滿 60 個使用日由 sweep 硬刪 |
-| **使用者手動 toggle** | UI 按鈕 | 清掉 auto-disable 痕跡(避免 UI 視覺錯誤) |
+| **使用者手動 toggle** | UI 按鈕 / 表單 / 批次(一律 `withToggle`) | 停用清掉 auto-disable 痕跡(所以不會被學習復活、也不會被休眠清理刪掉);重新啟用 `case_closed` 規則時保留 case_closed 當豁免標記、停用豁免規則則清掉 |
+| **錯誤率基準** | `ruleCounterBaseline`(第一次清理建立,本機) | high-error-rate 需要基準之後 ≥20 次觸發、至少一半被改歸(舊版把「刪除」也算改歸);計數低於基準視為重設(復活),以新計數判斷 |
+| **撤回** | `executeUndo`(H2 原則:撤回 = 這批的歸檔是錯的) | 有成功搬回的歸檔時,還原這批學習對規則庫的所有改動:兩個學習器新建的規則刪除(`mintedRuleIds`);復活的規則回到休眠(`revivedRules`);被 superseded / override 降級、或 one-strike `override` 停用的規則恢復(`disabledRules`)。受批次後指紋保護(之後手動改過的不動),計數不動 |
 | **永不自動觸碰** | — | `source==='user_manual'`(神聖) |
 | **不會自動學的** | — | `internalDomains` 內網域的 sender 規則(內部 sender 通常太雜)、generic provider 純 domain 規則(會學成 sender) |
 
@@ -371,6 +395,7 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 - **chooseLearningSignal 接收 internalDomainSet 由 caller 傳入** — 不在裡面 await getSettings、避免 tight loop 多次 storage read
 - **chooseLearningSignal 衝突偵測用 normalizeSignal** — 不是 `.toLowerCase()`,因為 import / manual 路徑可能存進 `@kgi.com` 帶 `@` 前綴的形式
 - **autoUpgradeConflictRules 用 freshFolderPath** — 從 `folderById.get(effectiveFolderId).path` 取當下路徑,避免規則的 stale path 被烙進新升級的 compound 規則
+- **法院字號全形必須有「字第」(2026-11-06)** — `COURT_CASE_FULL_RE` 要求「字」緊接「第」(可有空白),「113年度財報第1季」「113年度第1次董事會」不再解析;`DATE_STOPWORD_RE` 含「度」。簡寫(112訴204)不設字元黑名單:財 / 季 / 午 / 報都出現在真實字別(家財訴、司執季、午字、報字)
 - **Outlook DisplayName 含 `/` 編碼為 U+FF0F** — `encodeFolderName` / path 比對都用 fullwidth solidus
 - **OData filter PascalCase** — `From/EmailAddress/Address`、不是小寫;`autoUpgradeConflictRules` 若 server filter 失敗會 fall back 到 client-side filter
 - **wipeAllRules abort on cloud-clear failure** — 雲端清除失敗時不動本機,避免 cloud 滿、local 空的不一致狀態
@@ -380,7 +405,20 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 - **AI 分組平行(v1.0.9)** — `classifyAi` 最多 `AI_PARALLEL_CHUNKS`(3)組同時呼叫 Claude。第一組先送、等它的回應**開始串流**(`classifyBatch` 的 `onResponseStart`,prompt cache 從此可讀)才放行其餘組;結果依組別順序併入 aiPlan,`completedChunks` 只算連續已併入的前綴;任一 429/529 之後整次退回一次一組;run-fatal 錯誤停止排程、已完成的組(含失敗組之後的)保留、其餘標 `unclassified`。每組的處理(`processChunk`)只回傳結果、不丟例外
 - **搬信平行(v1.0.9)** — `runClaimedExecute` 先逐筆跑 new_folder(後面的 move 可能指向它建的資料夾),其餘最多 `EXECUTE_PARALLEL_ITEMS`(3)筆同時;取消在每個 worker 的下一筆邊界生效,沒開始的列標 cancelled
 - **收件匣掃描預算(v1.0.9)** — `inboxScanBudget(batchSize, ghosts)`:每頁 100–200、總掃描 = 3× 批次(500–2000);`scanInboxForBatch` 跨頁以 Id 去重($skip 分頁在新信進來時會重列上一頁尾端)。批次上限 `BATCH_SIZE_MAX = 500`
-- **well-known 資料夾不是目標** — deleteditems / junkemail / drafts / outbox / sentitems 的子樹不出現在資料夾樹,execute 也拒絕搬進去;規則指向它們會被 reconcile 標孤兒
+- **特殊資料夾(2026-11-06 第二輪定案)** — 資料夾樹不含「已刪除的郵件」(根與子樹)、「草稿」「寄件匣」,也不列舉它們的子樹;「垃圾郵件」「寄件備份」(含子資料夾)在樹裡、根節點標 `wellKnown`。五個 well-known 根的 id 記在 `folderCache.wellKnown { roots, complete }`;查詢不完整時快取只新鮮 60 秒、reconcile 以 `treeComplete:false` 執行(不改任何規則)。v1.0.8(`excludedFolderIds`)與第一輪(`nonFiling`)格式的快取首次使用時重抓。
+  - reconcile:目標是「已刪除的郵件」根 → 保留(使用者的自動丟垃圾桶規則);其他不在完整樹裡的目標 → 孤兒(含在 OWA 被刪、移進垃圾桶的資料夾)
+  - execute:目標 = 垃圾桶根 → 以 `moveToDeletedItems` 執行、狀態 `deleted`(不學習、不記憶、不進近日活動,規則命中照計);垃圾桶 / 草稿 / 寄件匣底下 → 拒絕並給明確訊息;資料夾快取超過 10 分鐘(`FOLDER_TREE_VERIFY_AFTER_MS`)時 DestinationGuard 會即時走 parent chain 確認樹內目標(每批 memo、平行 worker 共用),拒絕時以 `invalidateFolderCache()` 蓋 `folderCache.invalidatedAt`,下次 preflight 重抓
+  - AI:`buildFolderBlock` / 近期資料夾提示 / 範例 / 案號對照只列 AI 可見資料夾(`flattenAiVisibleFolders`,排除垃圾郵件 / 寄件備份子樹與樹外路徑);AI 指到清單外或排除清單的路徑 → `skip` + `unresolved`(保留 AI 原始選擇)
+- **Outlook 請求 60 秒逾時(2026-11-06)** — `OUTLOOK_REQUEST_TIMEOUT_MS`,經 `linkAbortSignals` 與呼叫端的 signal 連動;GET 逾時照網路錯誤重試,非冪等請求逾時或 2xx 本文卡住 → `uncertain`;呼叫端取消維持原語意;slot 一定釋放
+- **權杖依資源排序(2026-11-06)** — `msal-token-reader`:outlook.office.com / office365 / outlook.cloud.microsoft(可帶 :443)優先,其次其他非 Graph 的 Mail.ReadWrite;Graph 與 bare scope 永不採用;NO_TOKEN 診斷列出看到的資源(不含權杖)。函式經 `chrome.scripting` func 注入,**必須自給自足**(不能 import、不能用外層變數)
+- **keep-alive 心跳(2026-11-06)** — 只要有 hold,每 20 秒呼叫 `chrome.runtime.getPlatformInfo` 重設 idle 計時;最後一個 release 清掉,alarm 保留當備援
+- **Claude 拒答隔離(2026-11-06)** — REFUSAL 時在該組的 lane 內二分找出被拒的信(每組最多 12 次、每次 run 最多 36 次額外呼叫);被拒的信記進 `refusedEmails`(依模型、7 天),錯誤紀錄不寫主旨。第二輪:每個 run 有一個 refusal gate(`createRefusalGate`)— run 還沒有任何成功回答前,先送一封合成測試信(`sharedPromptProbeEmail`)驗證共用 prompt,其他 lane 等結果;測試信也被拒 = 共用內容造成,不拆分、記 `refusalSuspicion` 6 小時;warm gate 改在第一段答案文字才打開
+- **串流 90 秒閒置看門狗(2026-11-06)** — 連 header 都算;90 秒沒有任何位元組 → `NETWORK`(可重試);使用者取消仍是 `ABORTED`
+- **重試分種類(2026-11-06)** — `withClaudeRetry` 的 backoff(429/529)與 transient(網路 / 5xx / 串流)各有自己的排程與預算
+- **費用逐次計價(2026-11-06)** — 讀取 serving `model`、`usage.iterations` 與 fallback 區塊;`billedUsage()` 依實際執行的模型計價,`ClassifierUsage.costUsd` 有值時 popup 直接用
+- **5.x prompt(2026-11-06)** — 5.x 的 reason 是決定後的一句說明(schema 把 reason 放最後,避開 reasoning_extraction 拒答);4.x 維持舊的 reason-first prompt / schema(byte-for-byte)
+- **內嵌面板配對(2026-11-06)** — owa-fab 向 SW 要一次性 nonce(`issuePanelPairingNonce`,content script 白名單)放進 `parent-hello`;面板 iframe 用 `redeemPanelPairingNonce` 確認是同一分頁發的才接受 port;配對前不送任何資料夾路徑。nonce 只在 SW 記憶體(60 秒、每分頁 16、總共 512)。第二輪起 popup 與 options(owa-fab 的設定 modal 也內嵌它)都由 `src/components/ui/bridge-gate.tsx` 包住:被內嵌時要等配對驗證完成才渲染(防誘導點擊),10 秒仍未配對就提示重新整理 Outlook 分頁
+- **計畫清單鍵盤(2026-11-06)** — 清單內(`data-plan-list` / `data-plan-row-index`)有游標時 Space = 勾選、Enter = 展開 / 收起游標列;清單外的按鈕(執行)保留原生 Enter;「待確認」chip 與「依資料夾」切換滑鼠點擊不取焦點。第二輪:游標以 emailId 追蹤(排序 / 合併 / 群組拆開不會換到別封);`createFocusOriginTracker` 讓 Tab 移入的列成為游標,Tab 到的非列按鈕(全選此組等)原生觸發;Esc 先清游標、再按才收面板
 - **非冪等 retry 是禁忌** — `outlook-api.ts:request()` 對 POST / DELETE / PATCH **不** retry 網路錯誤 + 5xx,只 retry 429。若硬把這條規則破掉,POST `/move` 第一次成功但 response 掉了的場景會在重試時 404、UI 顯示成失敗、使用者誤以為訊息沒搬走。`OutlookError.uncertain = true` 是給這類「可能成功」case 用的 marker
 - **404 ErrorItemNotFound on move/delete = soft skip,不是 error** — `executeItem` 用 `isAlreadyMovedError(e)` helper 偵測、回傳 `status: 'skipped'`。原因:訊息已不在那個 Id(可能我們上一次 POST 其實成功了、或被其他規則 / 帳號處理過)。重試只會再 404
 - **(2026-11-05 起改用 run id)** 分類 progress 現在有擁有者:preflight 發 `runId`、classifyAi 只服務目前的 run、迴圈每次呼叫 Claude / 寫 progress 前都檢查;取消 = `cancelClassify`。部分執行時 SW 記下已執行的 email id,progress 寫入與讀取都排除它們;消費 progress 依 runId 而非下方的 startedAt 啟發式。下方原文保留作歷史脈絡:
@@ -417,7 +455,7 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 
 ## 測試
 
-`tests/` 目錄、vitest + jsdom + mocked chrome.storage。**998 tests across 74 files**(2026-11-05,v1.0.9)。共用 helper:`tests/helpers/sw-harness.ts`(載入真正的 SW dispatcher,用 UI 實際訊息格式測 contract)、`classify-env.ts` + `claude-sse.ts`(classify 端到端 + SSE fixture)、`sync-sim.ts`(多機器同步模擬)、`ui-harness.ts`(jsdom 渲染真正的 popup / options)、`active-days.ts`。重要測試:
+`tests/` 目錄、vitest + jsdom + mocked chrome.storage。**1504 tests across 111 files**(2026-11-06,v1.0.10)。共用 helper:`tests/helpers/sw-harness.ts`(載入真正的 SW dispatcher,用 UI 實際訊息格式測 contract)、`classify-env.ts` + `claude-sse.ts`(classify 端到端 + SSE fixture)、`sync-sim.ts`(多機器同步模擬)、`ui-harness.ts`(jsdom 渲染真正的 popup / options)、`active-days.ts`。重要測試:
 
 - `compound-learning.test.ts` — 學到內部網域 / compound 規則
 - `case-code-learning.test.ts` — case_code 規則學習
@@ -505,8 +543,10 @@ mail-organizer-extension/
 │   │   ├── content.ts              ← token 抓取
 │   │   └── owa-fab.ts              ← 浮動按鈕注入
 │   └── components/ui/              ← shadcn 基礎元件
-└── tests/                          ← 998 tests (2026-11-05)
+└── tests/                          ← 1504 tests (2026-11-06)
 ```
+
+2026-11-06 新增:`src/background/refusal-isolation.ts`(拒答二分隔離)、`src/shared/refusal-ledger.ts`(`refusedEmails`)、`src/background/handlers/panel-pairing.ts`(面板配對 nonce)、`src/popup/crash-recovery.ts`(錯誤畫面「捨棄暫存計畫並重新載入」)、`src/options/rule-accuracy.ts`(全頁共用的準確率計算)。
 
 2026-11-05 新增:`src/shared/claude-models.ts`(模型表:id / 世代 / 價格 / 是否支援 structured outputs、server-side fallback)、`src/shared/msal-token-reader.ts`(MSAL token 讀取,content script 與測試共用)、`src/background/handlers/rules-bulk.ts`(`bulkRuleAction` 與批次規則操作,一次 mutateRules)、`src/popup/keyboard.ts`、`src/popup/web-storage.ts`(包好 try/catch 的 local/sessionStorage)、`src/options/rule-list.ts`(refresh 時保留未變動規則的物件身分)、`src/components/ui/error-boundary.tsx`、`src/fonts.css`(只打包 Latin 字型子集)。
 
@@ -526,10 +566,12 @@ mail-organizer-extension/
 10. **content script 永不碰 chrome.storage**(2026-11-05) — `settings` 含 `claudeApiKey`;owa-fab 曾 `console.log` 整個 settings、且其 `storage.onChanged` 每次 settings 寫入都收到含 key 的新舊值。現在 owa-fab 只透過 `getOwaFabVisibility` 拿布林值、由 SW 推 `owaFabVisibility`。`tests/ui-sw-contract.test.ts` 掃 `src/content/*.ts` 守門
 11. **手動拉取(立即下載)永遠 union**(2026-11-05) — `doPush` 的位元組預算會刻意把低優先規則留在雲端外(只存本機),replace 模式會把這些唯一副本刪掉。`replace` 只留給明確需要「雲端精確狀態」的內部路徑;刪除靠 tombstone 傳遞
 12. **stale sweep 用使用日、不用日曆天** — 見「規則生命週期」;新增任何會「依時間刪規則」的路徑都要問:使用者沒在用時這個時鐘該不該走
-13. **`editedAt` 只由 `mutateRules` 蓋章**(2026-11-05) — 其他程式碼不要自己設;sync pull / restore 用 `preserveEditedAt`
-14. **SW 只服務擴充頁面** — dispatcher 檢查 sender:`sender.url` 不在 `chrome-extension://<id>/` 底下的(content script)只能用 `CONTENT_SCRIPT_MESSAGE_TYPES` 白名單(目前只有 `getOwaFabVisibility`)。新增 content script 訊息要加進白名單
+13. **`editedAt` 只由 `mutateRules` 蓋章**(2026-11-05) — 其他程式碼不要自己設;sync pull / restore 用 `preserveEditedAt`。2026-11-06 起的合法例外都在 mutateRules 交易內:`stampEditedAt` 把新規則 / 重新啟用蓋到墓碑之上;同步的升級採用與還原以明確選項設定 editedAt
+14. **SW 只服務擴充頁面** — dispatcher 檢查 sender:`sender.url` 不在 `chrome-extension://<id>/` 底下的(content script)只能用 `CONTENT_SCRIPT_MESSAGE_TYPES` 白名單(目前有 `getOwaFabVisibility` 與 `issuePanelPairingNonce`)。新增 content script 訊息要加進白名單
 15. **新增 message type 要加進 `SW_MESSAGE_TYPES`**(`src/shared/messages.ts`) — `handle()` 的 switch 是 exhaustive、UI 的 `send()` 也用這個型別,漏加會編譯失敗
-16. **墓碑一律 `tombstoneKey()` / `tombstoneDeletedAt()`** — 前者相容舊格式 signalNorm,後者避免時鐘偏差讓刪除傳不出去
+16. **墓碑一律 `tombstoneKey()` / `tombstoneDeletedAt()`** — 前者相容舊格式 signalNorm,後者避免時鐘偏差讓刪除傳不出去;2026-11-06 起一律由 `ruleTombstone()` 建立(帶 spellingHash)
+17. **`orphaned` 是本機狀態**(2026-11-06) — 不蓋 editedAt、不讓本機孤兒版本在同步合併中勝出
+18. **計數只在同一個 `statsResetAt` epoch 內合併**(2026-11-06) — 同步、去重都一樣;復活重設的計數不能被舊副本的計數蓋回
 
 ---
 

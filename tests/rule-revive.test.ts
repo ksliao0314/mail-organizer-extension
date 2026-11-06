@@ -100,12 +100,24 @@ describe('learning revives AUTO-disabled rules (item 1)', () => {
     expect(after!.autoDisabledAt).toBeUndefined()
   })
 
-  it('a superseded plain-domain rule revives when the AI re-confirms the same target', async () => {
+  // 2026-11-06 (B1) — this used to assert the opposite. A superseded broad
+  // rule is its anchor's conflict history (先廣後窄): reviving it on the next
+  // A confirmation routed the following B-case mail to A without the AI. The
+  // anchor stays narrow instead — tests/superseded-anchor.test.ts.
+  it('a superseded plain-domain rule is NOT revived when the AI re-confirms its target', async () => {
     const dormant = autoOff('superseded')
     await setRules([dormant])
     const item = planItem()
     const r = await generateAiConfirmedRules([item], [moved(item.emailId)])
-    expect(r.revived).toBe(1)
+    expect(r.revived).toBe(0)
+    expect(r.added).toBe(0) // the narrow form waits for its second observation
+    expect((await listRules()).map((x) => x.enabled)).toEqual([false])
+  })
+
+  it('a plain-domain rule parked for another reason (high-error-rate) still revives', async () => {
+    await setRules([autoOff('high-error-rate', { matchCount: 3, overrideCount: 20 })])
+    const item = planItem()
+    expect((await generateAiConfirmedRules([item], [moved(item.emailId)])).revived).toBe(1)
     expect((await listRules()).map((x) => x.enabled)).toEqual([true])
   })
 

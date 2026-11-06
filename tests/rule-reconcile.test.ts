@@ -138,6 +138,84 @@ describe('reconcileRulesAgainstTree', () => {
   })
 })
 
+// O1 (2026-11-06 r2). Round 1 never orphaned a target that "exists but isn't
+// a filing target" — so a case folder deleted in OWA (now 刪除的郵件/甲, same
+// id) kept routing mail every batch into an execute refusal. Now only
+// Deleted Items ITSELF is a valid target outside the tree; everything else
+// missing from a complete tree is orphaned, as in v1.0.8.
+describe('reconcileRulesAgainstTree with well-known folders (O1)', () => {
+  // The tree as built now: Junk in it; the trash, Drafts and Outbox not.
+  const tree: MailFolderNode[] = [leaf('fid-junk', '垃圾郵件'), leaf('fid-case', '甲', '案件')]
+  const trashFolder = { id: 'fid-trash', path: '刪除的郵件' }
+
+  it('a USER rule on Deleted Items itself stays valid (auto-trash) — and one v1.0.8 orphaned is restored', () => {
+    const live = rule({ targetFolderId: 'fid-trash', targetFolderPath: '刪除的郵件' })
+    const old = rule({ targetFolderId: 'fid-trash', targetFolderPath: '刪除的郵件', orphaned: true })
+    const out = reconcileRulesAgainstTree([live, old], tree, { trashFolder })
+    expect(out.rules[0]).toBe(live)
+    expect(out.rules[1]!.orphaned).toBe(false)
+    expect(out.summary).toEqual({ pathsUpdated: 0, newlyOrphaned: 0, unorphaned: 1 })
+  })
+
+  // r3 (2026-11-06): every trash-root rule used to come back — so v1.0.7's
+  // learned auto-trash rules (orphaned by shipped v1.0.8) resumed trashing.
+  it('…only as the user’s intent: user_manual / ai_overridden stay valid, learned / scanned ones stay orphaned', () => {
+    const at = (source: Rule['source'], orphaned?: boolean) =>
+      rule({ id: source, targetFolderId: 'fid-trash', targetFolderPath: '刪除的郵件', source, ...(orphaned ? { orphaned } : {}) })
+    const out = reconcileRulesAgainstTree(
+      [at('user_manual', true), at('ai_overridden', true), at('ai_confirmed', true), at('auto_scan')],
+      tree,
+      { trashFolder },
+    )
+    expect(out.rules.map((r) => [r.id, r.orphaned ?? false])).toEqual([
+      ['user_manual', false],
+      ['ai_overridden', false],
+      ['ai_confirmed', true],
+      ['auto_scan', true],
+    ])
+    expect(out.summary).toMatchObject({ unorphaned: 2, newlyOrphaned: 1 })
+  })
+
+  it('…matched by path when the rule has no local id (synced from another mailbox)', () => {
+    const r = rule({ targetFolderId: 'fid-other-mailbox-trash', targetFolderPath: '刪除的郵件' })
+    const out = reconcileRulesAgainstTree([r], tree, { trashFolder })
+    expect(out.rules[0]!.targetFolderId).toBe('fid-trash')
+    expect(out.rules[0]!.orphaned ?? false).toBe(false)
+  })
+
+  it('a folder deleted in OWA (in the trash, same id) is orphaned, user_manual included', () => {
+    const r = rule({ targetFolderId: 'fid-trashed-case', targetFolderPath: '案件/乙', source: 'user_manual' })
+    const out = reconcileRulesAgainstTree([r], tree, { trashFolder })
+    expect(out.rules[0]!.orphaned).toBe(true)
+    expect(out.rules[0]!.targetFolderPath).toBe('案件/乙') // never re-pathed into the trash
+  })
+
+  it('Drafts / Outbox targets are orphaned like any missing folder', () => {
+    const r = rule({ targetFolderId: 'fid-drafts', targetFolderPath: '草稿' })
+    expect(reconcileRulesAgainstTree([r], tree, { trashFolder }).rules[0]!.orphaned).toBe(true)
+  })
+
+  it('an untrusted tree (partial lookup / legacy cache) leaves EVERY rule exactly as it is', () => {
+    // A degraded fetch lists the trash subtree: 案件/乙 shows up as 刪除的郵件/乙.
+    const degraded: MailFolderNode[] = [
+      ...tree,
+      { ...leaf('fid-trash', '刪除的郵件'), children: [leaf('fid-trashed-case', '乙', '刪除的郵件')] },
+    ]
+    const trashed = rule({ targetFolderId: 'fid-trashed-case', targetFolderPath: '案件/乙' })
+    const gone = rule({ targetFolderId: 'fid-gone', targetFolderPath: '案件/丙' })
+    const old = rule({ targetFolderId: 'fid-junk', targetFolderPath: '垃圾郵件', orphaned: true })
+    const out = reconcileRulesAgainstTree([trashed, gone, old], degraded, { treeComplete: false })
+    expect(out.rules).toEqual([trashed, gone, old])
+    expect(out.rules[0]).toBe(trashed) // NOT rewritten to 刪除的郵件/乙
+    expect(out.summary).toEqual({ pathsUpdated: 0, newlyOrphaned: 0, unorphaned: 0 })
+  })
+
+  it('Junk Email in the tree resolves like any folder (user_manual sender → 垃圾郵件)', () => {
+    const r = rule({ type: 'sender', signal: 'spam@x.example', targetFolderId: 'fid-junk', targetFolderPath: '垃圾郵件', orphaned: true })
+    const out = reconcileRulesAgainstTree([r], tree)
+    expect(out.rules[0]!.orphaned).toBe(false)
+  })
+})
 describe('snapshotOf / diffSnapshots — orphaned audit support', () => {
   it('includes orphaned in snapshot', () => {
     const r = rule({ orphaned: true })

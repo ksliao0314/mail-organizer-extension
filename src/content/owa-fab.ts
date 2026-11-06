@@ -534,6 +534,15 @@ async function shouldShow(): Promise<boolean> {
 // arrives we re-offer on a short backoff, in case the page's listener wasn't
 // installed yet. Commands then arrive ONLY over the port — nothing goes
 // through window.postMessage, where any script on the page can listen.
+//
+// Each hello also carries a one-time nonce from the SW (2026-11-06). Outlook
+// page scripts share `window` with us, so to the frame their hellos look
+// exactly like ours (same `event.source`) — and the popup / options pages
+// are web-accessible, so a page script can embed one itself. The frame only
+// accepts a port whose nonce the SW confirms was issued to THIS tab's content
+// script (background/handlers/panel-pairing.ts); page scripts can't call
+// chrome.runtime, so they can't get one. A fresh nonce per offer means a
+// lost / expired one (e.g. the SW restarted in between) only costs a retry.
 
 type BridgeCommand = {
   type?: unknown
@@ -544,6 +553,22 @@ type BridgeCommand = {
 }
 
 const HELLO_RETRY_DELAYS_MS = [150, 400, 1000, 2000, 4000]
+
+/** One-time pairing nonce for the next hello, or null if the SW can't be reached. */
+async function requestPairingNonce(): Promise<string | null> {
+  try {
+    const r = (await chrome.runtime.sendMessage({ type: 'issuePanelPairingNonce' })) as
+      | { ok?: boolean; data?: { nonce?: unknown } }
+      | undefined
+    const nonce = r?.ok === true ? r.data?.nonce : undefined
+    return typeof nonce === 'string' && nonce.length > 0 ? nonce : null
+  } catch (e) {
+    // Orphaned by an extension update ("Extension context invalidated") or
+    // the SW is unreachable — no nonce, no hello; the retry may succeed.
+    console.warn(LOG_PREFIX, 'pairing nonce request failed', e)
+    return null
+  }
+}
 
 function pairFrame(
   frame: HTMLIFrameElement,
@@ -575,48 +600,54 @@ function pairFrame(
     if (!frame.src.startsWith(`${extOrigin}/`)) return // about:blank — not ours
     let acked = false
     let attempt = 0
-    const offer = () => {
+    const offer = async () => {
       retryTimer = null
       if (acked || gen !== generation) return
-      const channel = new MessageChannel()
-      const mine = channel.port1
-      ports.push(mine)
-      mine.onmessage = (ev: MessageEvent) => {
-        if (gen !== generation) return
-        const data = ev.data as BridgeCommand | null
-        if (!data || typeof data !== 'object') return
-        if (data.type === 'mail-organizer/bridge-ack') {
-          acked = true
-          // The frame refused every other offer — release those ports.
-          for (const p of ports) {
-            if (p === mine) continue
-            try {
-              p.close()
-            } catch {
-              /* ignore */
+      // A fresh one-time nonce per offer (2026-11-06) — the frame redeems it
+      // with the SW before it trusts this port.
+      const nonce = await requestPairingNonce()
+      if (acked || gen !== generation) return
+      if (nonce) {
+        const channel = new MessageChannel()
+        const mine = channel.port1
+        ports.push(mine)
+        mine.onmessage = (ev: MessageEvent) => {
+          if (gen !== generation) return
+          const data = ev.data as BridgeCommand | null
+          if (!data || typeof data !== 'object') return
+          if (data.type === 'mail-organizer/bridge-ack') {
+            acked = true
+            // The frame refused every other offer — release those ports.
+            for (const p of ports) {
+              if (p === mine) continue
+              try {
+                p.close()
+              } catch {
+                /* ignore */
+              }
             }
+            ports = [mine]
+            if (retryTimer !== null) {
+              window.clearTimeout(retryTimer)
+              retryTimer = null
+            }
+            return
           }
-          ports = [mine]
-          if (retryTimer !== null) {
-            window.clearTimeout(retryTimer)
-            retryTimer = null
-          }
-          return
+          onCommand(data)
         }
-        onCommand(data)
-      }
-      try {
-        frame.contentWindow?.postMessage(
-          { type: 'mail-organizer/parent-hello' },
-          { targetOrigin: extOrigin, transfer: [channel.port2] },
-        )
-      } catch (e) {
-        console.warn(LOG_PREFIX, 'parent-hello failed', e)
+        try {
+          frame.contentWindow?.postMessage(
+            { type: 'mail-organizer/parent-hello', nonce },
+            { targetOrigin: extOrigin, transfer: [channel.port2] },
+          )
+        } catch (e) {
+          console.warn(LOG_PREFIX, 'parent-hello failed', e)
+        }
       }
       const delay = HELLO_RETRY_DELAYS_MS[attempt++]
-      if (delay !== undefined) retryTimer = window.setTimeout(offer, delay)
+      if (delay !== undefined) retryTimer = window.setTimeout(() => void offer(), delay)
     }
-    offer()
+    void offer()
   }
 
   frame.addEventListener('load', onLoad)

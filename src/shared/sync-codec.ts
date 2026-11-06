@@ -147,6 +147,9 @@ export type CompactRuleRow = {
   da?: CompactTime // autoDisabledAt (omit if absent)
   dr?: number // autoDisabledReason code (omit if absent)
   ea?: number // v4: editedAt epoch ms (omit if absent)
+  // v4 additive (2026-11-06): statsResetAt epoch ms (omit if absent). A
+  // v1.0.8 reader ignores unknown row keys — it just merges counters by max.
+  sr?: number
 }
 
 /**
@@ -162,8 +165,16 @@ export type DisabledStub = [string, number, number?, CompactTime?]
 /** One entry of the v4 row chunks: a full row or a disabled stub. */
 export type WireRuleEntry = CompactRuleRow | DisabledStub
 
-/** v4 tombstone row: [typeCode, signalNorm (compact for compounds), path, deletedAt]. */
-export type CompactTombstone = [number, string | CompactCompound, string, number]
+/**
+ * v4 tombstone row: [typeCode, signalNorm (compact for compounds), path,
+ * deletedAt, spellingHash?]. The 5th entry (2026-11-06, v1.0.9) is
+ * RuleTombstone.spellingHash: `1` when it is the fingerprint of signalNorm
+ * itself (2 bytes — it still marks the row as written by a build that records
+ * it), else the fingerprint. A v1.0.8 decoder reads [0..3] only.
+ */
+export type CompactTombstone =
+  | [number, string | CompactCompound, string, number]
+  | [number, string | CompactCompound, string, number, 1 | string]
 
 export type EncodedRules = {
   folders: FolderDictEntry[]
@@ -375,6 +386,9 @@ export function encodeRuleRow(r: Rule, folderRef: string): CompactRuleRow | null
     if (code !== undefined) row.dr = code
   }
   if (typeof r.editedAt === 'number' && r.editedAt > 0) row.ea = r.editedAt
+  if (typeof r.statsResetAt === 'number' && Number.isFinite(r.statsResetAt) && r.statsResetAt > 0) {
+    row.sr = r.statsResetAt
+  }
   return row
 }
 
@@ -447,6 +461,7 @@ function decodeFullRow(
   const reason = codeLookup(CODE_TO_REASON, row.dr)
   if (reason) rule.autoDisabledReason = reason // unknown code → drop the reason only
   if (typeof row.ea === 'number' && Number.isFinite(row.ea) && row.ea > 0) rule.editedAt = row.ea
+  if (typeof row.sr === 'number' && Number.isFinite(row.sr) && row.sr > 0) rule.statsResetAt = row.sr
   return rule
 }
 
@@ -503,11 +518,21 @@ export function decodeRulesFromSync(enc: { folders?: unknown; rows?: unknown }):
 
 // --- tombstones -------------------------------------------------------------
 
+/**
+ * RuleTombstone.spellingHash of a spelling in rules.ts legacySignalNorm form
+ * (2026-11-06, S1): its contentHash (53-bit, base36, ~11 chars).
+ */
+export function spellingFingerprint(spelling: string): string {
+  return contentHash(spelling)
+}
+
 export function encodeTombstone(t: RuleTombstone): CompactTombstone | null {
   const code = TYPE_TO_CODE[t.type]
   if (code === undefined || typeof t.signalNorm !== 'string') return null
   const s = t.type === 'compound' ? (compactCompoundNorm(t.signalNorm) ?? t.signalNorm) : t.signalNorm
-  return [code, s, t.targetFolderPath, t.deletedAt]
+  if (typeof t.spellingHash !== 'string') return [code, s, t.targetFolderPath, t.deletedAt]
+  const own = t.spellingHash === spellingFingerprint(t.signalNorm)
+  return [code, s, t.targetFolderPath, t.deletedAt, own ? 1 : t.spellingHash]
 }
 
 export function decodeTombstone(row: unknown): RuleTombstone | null {
@@ -523,7 +548,12 @@ export function decodeTombstone(row: unknown): RuleTombstone | null {
   } else return null
   if (typeof row[2] !== 'string') return null
   if (typeof row[3] !== 'number' || !Number.isFinite(row[3])) return null
-  return { type, signalNorm, targetFolderPath: row[2], deletedAt: row[3] }
+  const t: RuleTombstone = { type, signalNorm, targetFolderPath: row[2], deletedAt: row[3] }
+  // Optional spelling fingerprint (2026-11-06). Anything else there just
+  // means "unknown" — never a reason to drop the deletion itself.
+  if (row[4] === 1) t.spellingHash = spellingFingerprint(signalNorm)
+  else if (typeof row[4] === 'string' && row[4] !== '') t.spellingHash = row[4]
+  return t
 }
 
 // --- legacy (v1–v3) full-object readers ---------------------------------------
@@ -544,6 +574,8 @@ export function sanitizeLegacyTombstone(raw: unknown): RuleTombstone | null {
     signalNorm: t.signalNorm,
     targetFolderPath: t.targetFolderPath,
     deletedAt: t.deletedAt,
+    // Backups taken by this build carry it (2026-11-06); v1–v3 clouds never do.
+    ...(typeof t.spellingHash === 'string' && t.spellingHash !== '' ? { spellingHash: t.spellingHash } : {}),
   }
 }
 
@@ -575,4 +607,56 @@ export function sanitizeLegacyRule(raw: unknown): Rule | null {
     rule.autoDisabledReason = r.autoDisabledReason as DisabledReason
   }
   return rule
+}
+
+// --- active-day ledger (2026-11-06) -------------------------------------------
+//
+// The stale sweep's clock (storage.ts activeDays) travels in the v4 settings
+// item as an optional `d` field — a v1.0.8 reader only looks at `p` / `v`.
+// Compact form: UTC day numbers ascending, the first absolute and the rest as
+// deltas (`[20398,1,1,3,1]`) — ~2 bytes a day, so the full 400-day ledger
+// costs about 1 KB.
+
+const DAY_MS = 86_400_000
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/
+/** Day numbers outside this range are junk (1970 … ~2243). */
+const MAX_DAY_NUMBER = 100_000
+
+function dayNumber(day: string): number | undefined {
+  if (typeof day !== 'string' || !DAY_RE.test(day)) return undefined
+  const ms = Date.parse(`${day}T00:00:00.000Z`)
+  if (!Number.isFinite(ms)) return undefined
+  const n = Math.round(ms / DAY_MS)
+  return n >= 0 && n <= MAX_DAY_NUMBER ? n : undefined
+}
+
+/** 'YYYY-MM-DD' days → compact wire form, newest `cap` kept. */
+export function encodeActiveDays(days: readonly string[], cap: number): number[] {
+  const nums = [...new Set(days.map(dayNumber).filter((n): n is number => n !== undefined))]
+    .sort((a, b) => a - b)
+    .slice(-Math.max(0, cap))
+  const out: number[] = []
+  for (let i = 0; i < nums.length; i++) out.push(i === 0 ? nums[i]! : nums[i]! - nums[i - 1]!)
+  return out
+}
+
+/**
+ * Inverse of encodeActiveDays — defensive: anything malformed yields [] (the
+ * ledger only feeds the stale-sweep clock; a partial decode is never worth
+ * the risk), and days after `latestMs` (a peer whose clock runs far ahead)
+ * are dropped.
+ */
+export function decodeActiveDays(raw: unknown, latestMs: number = Date.now() + 2 * DAY_MS): string[] {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 5000) return []
+  const out: string[] = []
+  let n = 0
+  for (let i = 0; i < raw.length; i++) {
+    const v = raw[i]
+    if (typeof v !== 'number' || !Number.isInteger(v) || (i === 0 ? v < 0 : v < 1)) return []
+    n = i === 0 ? v : n + v
+    if (n > MAX_DAY_NUMBER) return []
+    if (n * DAY_MS > latestMs) break
+    out.push(new Date(n * DAY_MS).toISOString().slice(0, 10))
+  }
+  return out
 }

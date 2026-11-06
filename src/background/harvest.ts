@@ -21,8 +21,9 @@ import type { Email, ThreadMemoryEntry } from '@/shared/types'
 // ate the 10 slots, and the watermark was the client clock at the END of a
 // ~200-request run — filings made meanwhile (or inside client/server clock
 // skew) were lost for good. Now: ONE mailbox-wide `LastModifiedDateTime gt W`
-// query, paged, filtered client-side to the target folders; W is taken at
-// scan START minus a margin and only advances after a COMPLETE paging run.
+// query, paged (oldest first), filtered client-side to the target folders; a
+// COMPLETE run sets W to its START minus a margin, a page-capped one to where
+// it stopped (resumeHarvestWatermark, 2026-11-06).
 
 /** First-run (and long-idle) lookback bound. */
 export const HARVEST_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000
@@ -57,6 +58,38 @@ export function harvestWindowStart(lastHarvestAt: string | null, nowMs: number):
 /** Watermark to persist after a COMPLETE run that started at `scanStartMs`. */
 export function nextHarvestWatermark(scanStartMs: number): string {
   return new Date(scanStartMs - HARVEST_WATERMARK_MARGIN_MS).toISOString()
+}
+
+/**
+ * Watermark after a PAGE-CAPPED run (2026-11-06). The listing is oldest
+ * first, so the run covered the window up to its last row: resume one second
+ * before that row's LastModifiedDateTime (`gt` at second precision would
+ * otherwise skip same-second rows beyond the cap — re-seen ones are filtered
+ * out as known routes). Before this the watermark only moved after a
+ * COMPLETE run, so a window with more modified mail than the cap (read-state
+ * changes count; the first run looks back 14 days) was never finished: every
+ * run paid the full page budget on the same pages and the rest was never
+ * seen. If resuming would not get past `windowStartIso` (a whole capped run
+ * inside about one second), step PAST the last row's time so every run
+ * progresses — the rest of that instant goes unharvested (best effort; the
+ * alternative is re-reading the same page budget forever). Rounded UP to the
+ * second (2026-11-06 r2): the window literal has second precision, and the
+ * old round-down landed back on the window start whenever the timestamps
+ * carried fractions of a second (`gt 10:05:07` still matches 10:05:07.5), so
+ * that run never advanced. Null when no row carries a usable timestamp
+ * (leave the watermark alone).
+ */
+export function resumeHarvestWatermark(messages: ModifiedMessage[], windowStartIso: string): string | null {
+  let last = Number.NEGATIVE_INFINITY
+  for (const m of messages) {
+    const t = m.LastModifiedDateTime ? Date.parse(m.LastModifiedDateTime) : Number.NaN
+    if (Number.isFinite(t) && t > last) last = t
+  }
+  if (!Number.isFinite(last)) return null
+  const start = Date.parse(windowStartIso)
+  const resume = Math.floor(last / 1000) * 1000 - 1000
+  if (!Number.isFinite(start) || resume > start) return new Date(resume).toISOString()
+  return new Date(Math.ceil(last / 1000) * 1000).toISOString()
 }
 
 /**

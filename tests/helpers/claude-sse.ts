@@ -127,6 +127,37 @@ export function answerEvents(
   ]
 }
 
+/**
+ * A refusal as the API streams it (2026-11-06): `before-output` = no content
+ * blocks at all; `after-thinking` = the 5.x thinking block streams first, then
+ * the classifier declines before any answer text (a "mid-stream" refusal).
+ */
+export function refusalEvents(
+  category: string | null,
+  opts: { when?: 'before-output' | 'after-thinking'; input?: number; details?: Record<string, unknown> } = {},
+): SseEvent[] {
+  const events = answerEvents('', { usage: { input: opts.input ?? 300, output: 0 } })
+  const start = events[0]!
+  const thinking = events.slice(1, 4) // content_block_start / signature_delta / content_block_stop
+  return [
+    start,
+    ...(opts.when === 'after-thinking' ? thinking : []),
+    {
+      event: 'message_delta',
+      data: {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'refusal',
+          stop_sequence: null,
+          stop_details: { type: 'refusal', category, explanation: null, ...opts.details },
+        },
+        usage: { output_tokens: 0 },
+      },
+    },
+    { event: 'message_stop', data: { type: 'message_stop' } },
+  ]
+}
+
 /** One classify answer for the given email indexes, as structured output. */
 export function actionsJson(
   actions: Array<{ emailIndex: number; action?: string; targetFolderPath?: string; confidence?: number }>,

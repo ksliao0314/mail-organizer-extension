@@ -54,7 +54,9 @@ describe('folder tree refresh failure streak', () => {
     expect(logged).toHaveLength(1)
     expect(await stale()).toMatchObject({ cacheUpdatedAt: '2026-11-01T00:00:00.000Z' })
 
-    // Recovery: a working refresh clears the streak and persists excluded ids.
+    // Recovery: a working refresh clears the streak and persists the
+    // well-known roots (O1, 2026-11-06 r2: the trash is left out of the tree
+    // and its subtree is never listed).
     fetchSpy.mockImplementation(async (input: unknown) => {
       const url = String(input)
       const wk = wellKnown(url)
@@ -64,7 +66,7 @@ describe('folder tree refresh failure streak', () => {
           JSON.stringify({
             value: [
               { Id: 'FOLDER-NEW-00000000000000', DisplayName: '新', ChildFolderCount: 0 },
-              { Id: 'WK-deleteditems', DisplayName: '刪除的郵件', ChildFolderCount: 3 },
+              { Id: 'WK-deleteditems', DisplayName: '刪除的郵件', ChildFolderCount: 1 },
             ],
           }),
           { status: 200 },
@@ -75,6 +77,9 @@ describe('folder tree refresh failure streak', () => {
     const r3 = await sw.send({ type: 'getFolderTree', forceFresh: true })
     expect((r3.data as { tree: MailFolderNode[] }).tree.map((n) => n.path)).toEqual(['新'])
     expect(await stale()).toBeUndefined()
-    expect((await getFolderCache())?.excludedFolderIds).toContain('WK-deleteditems')
+    const cache = await getFolderCache()
+    expect(cache?.wellKnown).toMatchObject({ complete: true })
+    expect(cache?.wellKnown?.roots.find((r) => r.role === 'deleteditems')?.id).toBe('WK-deleteditems')
+    expect(cache?.excludedFolderIds).toBeUndefined()
   })
 })

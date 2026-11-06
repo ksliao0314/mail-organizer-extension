@@ -31,11 +31,22 @@ const BACKGROUND_REFRESH_MIN_INTERVAL_MS = 15_000
 // The crxjs loader imports the real module asynchronously, so its listener
 // appears a moment after executeScript resolves.
 const REINJECT_SETTLE_MS = 500
+// chrome.tabs.sendMessage has no timeout of its own (2026-11-06): a frozen /
+// hung OWA tab never answers, and since every caller coalesces onto ONE
+// in-flight refresh, that left ALL Outlook I/O waiting forever. The
+// cross-origin account check only asks background tabs for a second opinion,
+// so it gives up fast ("can't tell"); the chosen tab's own answer gets longer.
+const OTHER_ORIGIN_CHECK_TIMEOUT_MS = 1_500
+const TOKEN_REQUEST_TIMEOUT_MS = 10_000
 
-type CachedToken = { secret: string; expiresOn: number }
+/**
+ * `accountId` (2026-11-06) is MSAL's homeAccountId of the token's account —
+ * not a secret; resolveOwnDomains keys the cached mailbox identity by it.
+ */
+type CachedToken = { secret: string; expiresOn: number; accountId?: string }
 
 export type TokenResult =
-  | { ok: true; secret: string; expiresOn: number }
+  | { ok: true; secret: string; expiresOn: number; accountId?: string }
   | {
       ok: false
       code: 'NO_TOKEN' | 'NOT_ON_OWA' | 'EXPIRED' | 'TAB_UNREACHABLE' | 'MULTIPLE_ACCOUNTS'
@@ -142,11 +153,29 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+const TIMED_OUT = Symbol('timed-out')
+
+/** `p`, or TIMED_OUT once `ms` pass first. The timer never outlives the race. */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      p,
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 function asTokenResult(resp: ContentResponse | MsalTokenReadResult | TokenFailure): TokenResult {
-  // Drop extra fields (accountId) — only the documented shape leaves here.
-  return resp.ok
-    ? { ok: true, secret: resp.secret, expiresOn: resp.expiresOn }
-    : { ok: false, code: resp.code, message: resp.message }
+  // Only the documented shape leaves here (accountId included since
+  // 2026-11-06 — it is an account key, not a credential).
+  if (!resp.ok) return { ok: false, code: resp.code, message: resp.message }
+  const accountId = 'accountId' in resp && typeof resp.accountId === 'string' ? resp.accountId : undefined
+  return { ok: true, secret: resp.secret, expiresOn: resp.expiresOn, ...(accountId ? { accountId } : {}) }
 }
 
 /**
@@ -167,8 +196,11 @@ async function reinjectTokenReader(tabId: number): Promise<boolean> {
   const files = tokenReaderScriptFiles()
   if (files.length === 0 || typeof chrome.scripting?.executeScript !== 'function') return false
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files })
-    return true
+    const r = await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, files }),
+      TOKEN_REQUEST_TIMEOUT_MS,
+    )
+    return r !== TIMED_OUT
   } catch (e) {
     console.warn('[mail-organizer] content-script re-injection failed', e)
     return false
@@ -185,10 +217,15 @@ async function reinjectTokenReader(tabId: number): Promise<boolean> {
 async function readTokenViaExecuteScript(tabId: number): Promise<MsalTokenReadResult | null> {
   if (typeof chrome.scripting?.executeScript !== 'function') return null
   try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: readOutlookTokenFromMsalCache,
-    })
+    const out = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: readOutlookTokenFromMsalCache,
+      }),
+      TOKEN_REQUEST_TIMEOUT_MS,
+    )
+    if (out === TIMED_OUT) return null
+    const [res] = out
     const r = res?.result as MsalTokenReadResult | undefined
     if (r && typeof r === 'object' && typeof r.ok === 'boolean') return r
   } catch (e) {
@@ -212,8 +249,20 @@ async function askContentScript(
     code: 'NOT_ON_OWA',
     message: `無法和 OWA 分頁通訊：${e instanceof Error ? e.message : String(e)}`,
   })
-  const send = async (): Promise<ContentResponse | undefined> =>
-    (await chrome.tabs.sendMessage(tabId, req)) as ContentResponse | undefined
+  const timedOut: TokenFailure = {
+    ok: false,
+    code: 'TAB_UNREACHABLE',
+    message: 'Outlook 分頁沒有回應(可能被瀏覽器凍結或正忙)。請切換到 Outlook 分頁、等它載入完成後再試一次。',
+  }
+  // Bounded (2026-11-06): an unanswered sendMessage used to hang the shared
+  // in-flight refresh — and with it every Outlook request — forever.
+  const send = async (): Promise<ContentResponse | TokenFailure | undefined> => {
+    const r = await withTimeout(
+      chrome.tabs.sendMessage(tabId, req) as Promise<ContentResponse | undefined>,
+      TOKEN_REQUEST_TIMEOUT_MS,
+    )
+    return r === TIMED_OUT ? timedOut : r
+  }
 
   try {
     return (await send()) ?? noResponse
@@ -270,7 +319,9 @@ async function askContentScript(
  * signed into different accounts, the token we picked could belong to a
  * mailbox other than the one the user is looking at. Ask one tab per OTHER
  * origin and refuse on an account mismatch. Unanswering tabs are ignored
- * (can't tell → don't block).
+ * (can't tell → don't block) — including ones that never answer at all
+ * (2026-11-06): each ask is raced against a short timeout, since a frozen
+ * background tab used to leave the whole token refresh pending forever.
  */
 async function otherOriginAccountConflict(
   tabs: chrome.tabs.Tab[],
@@ -292,18 +343,25 @@ async function otherOriginAccountConflict(
     if (!o || o === chosenOrigin || t.id == null || t.discarded || byOrigin.has(o)) continue
     byOrigin.set(o, t)
   }
-  for (const t of byOrigin.values()) {
-    try {
-      const resp = (await chrome.tabs.sendMessage(t.id!, { type: 'fetch_token' } satisfies ContentRequest)) as
-        | MsalTokenReadResult
-        | undefined
-      if (resp?.ok && resp.accountId && resp.accountId !== chosenAccountId) return true
-      if (resp && !resp.ok && resp.code === 'MULTIPLE_ACCOUNTS') return true
-    } catch {
-      /* orphaned / loading tab — can't tell */
-    }
-  }
-  return false
+  const verdicts = await Promise.all(
+    [...byOrigin.values()].map(async (t): Promise<boolean> => {
+      try {
+        const resp = await withTimeout(
+          chrome.tabs.sendMessage(t.id!, { type: 'fetch_token' } satisfies ContentRequest) as Promise<
+            MsalTokenReadResult | undefined
+          >,
+          OTHER_ORIGIN_CHECK_TIMEOUT_MS,
+        )
+        if (resp === TIMED_OUT) return false // frozen / busy tab — can't tell
+        if (resp?.ok && resp.accountId && resp.accountId !== chosenAccountId) return true
+        if (resp && !resp.ok && resp.code === 'MULTIPLE_ACCOUNTS') return true
+      } catch {
+        /* orphaned / loading tab — can't tell */
+      }
+      return false
+    }),
+  )
+  return verdicts.some(Boolean)
 }
 
 // Coalesce concurrent token refreshes. Without this, 50 in-flight Outlook
@@ -316,7 +374,11 @@ let lastBackgroundRefreshAt = 0
 async function doFetchToken(opts: { keepUsableOnFailure: boolean }): Promise<TokenResult> {
   const result = await fetchTokenFromTabs()
   if (result.ok) {
-    await setCached({ secret: result.secret, expiresOn: result.expiresOn })
+    await setCached({
+      secret: result.secret,
+      expiresOn: result.expiresOn,
+      ...(result.accountId ? { accountId: result.accountId } : {}),
+    })
   } else if (!(opts.keepUsableOnFailure && isUsable(await getCached()))) {
     // A failed BACKGROUND refresh must not throw away a token that still
     // works; a failed foreground/forced one (e.g. after a 401) must.
@@ -383,7 +445,12 @@ export async function getOwaToken(opts: { force?: boolean } = {}): Promise<Token
   const cached = await getCached()
   if (isUsable(cached)) {
     if (isNearExpiry(cached)) maybeBackgroundRefresh()
-    return { ok: true, secret: cached.secret, expiresOn: cached.expiresOn }
+    return {
+      ok: true,
+      secret: cached.secret,
+      expiresOn: cached.expiresOn,
+      ...(cached.accountId ? { accountId: cached.accountId } : {}),
+    }
   }
   // Re-check after the await — another caller may have started the
   // refresh while we were reading the cache.
@@ -405,6 +472,16 @@ export async function clearTokenCache(): Promise<void> {
 export async function peekCachedToken(): Promise<{ valid: boolean }> {
   const cached = await getCached()
   return { valid: isUsable(cached) }
+}
+
+/**
+ * The account (MSAL homeAccountId) of the cached token, WITHOUT triggering a
+ * refresh (2026-11-06). Undefined when nothing is cached or the cache
+ * predates account tracking — callers treat that as "can't tell".
+ */
+export async function peekCachedTokenAccountId(): Promise<string | undefined> {
+  const cached = await getCached()
+  return typeof cached?.accountId === 'string' && cached.accountId ? cached.accountId : undefined
 }
 
 export async function pingOwa(): Promise<{ ok: true } | { ok: false; code: 'NOT_ON_OWA'; message: string }> {

@@ -1,8 +1,10 @@
 // Parallel AI chunks (2026-11-05, 放寬並加速) end to end through the real SW:
 //
-//   - the first request goes alone; the rest wait until its response starts
-//     streaming (its prompt-cache write is readable from then on), then fan
-//     out to AI_PARALLEL_CHUNKS requests in flight, never more;
+//   - the first request goes alone; the rest wait until its answer starts
+//     streaming (its prompt-cache write is readable by then; since
+//     2026-11-06 a thinking block alone no longer counts — a refusal can still
+//     end the response there), then fan out to AI_PARALLEL_CHUNKS requests in
+//     flight, never more;
 //   - results merge into the plan in chunk order, and completedChunks counts
 //     only the contiguous merged prefix, whatever order chunks finish in;
 //   - a 429 drops the rest of the run to one request at a time;
@@ -72,17 +74,20 @@ function chunkOf(body: Record<string, unknown>): number {
 const chunkOfEmail = (emailId: string) => Math.floor(Number(emailId.slice(1)) / CHUNK)
 
 /**
- * A 200 stream that begins at once (message_start + the thinking block: the
- * moment a real response has started streaming) and sends the rest of an
- * answer that deletes every email only after `rest()` resolves.
+ * A 200 stream that begins at once (message_start, the thinking block and the
+ * start of the answer's text block: the moment a real answer has started
+ * streaming) and sends the rest of an answer that deletes every email only
+ * after `rest()` resolves.
  */
 function heldAnswer(body: Record<string, unknown>, rest: () => Promise<void>): Response {
   const n = requestedEmailCount(body)
   const events = answerEvents(
     actionsJson(Array.from({ length: n }, (_, i) => ({ emailIndex: i, action: 'delete' }))),
   )
+  const textStart =
+    events.findIndex((e) => (e.data as { content_block?: { type?: string } }).content_block?.type === 'text') + 1
   const enc = new TextEncoder()
-  const parts = [enc.encode(sseText(events.slice(0, 2))), enc.encode(sseText(events.slice(2)))]
+  const parts = [enc.encode(sseText(events.slice(0, textStart))), enc.encode(sseText(events.slice(textStart)))]
   let step = 0
   return new Response(
     new ReadableStream<Uint8Array>({

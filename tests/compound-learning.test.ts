@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
+  generateAiConfirmedRules,
   generateAiOverrideRules,
   type ExecuteItemResult,
 } from '@/background/execute'
@@ -236,5 +237,60 @@ describe('AI generators — domain + Taiwan court case → compound rule', () =>
     expect(seed!.enabled).toBe(false)
     // Nothing narrower replaced it — the user's correction silenced it.
     expect(seed!.autoDisabledReason).toBe('override')
+  })
+})
+
+// 2026-11-06: 「113年度第1次董事會議程」 parsed as court case 「113度1」, so the
+// first AI filing learned the structural compound (client.example + 113度1)
+// on first sight — and it took the client's 「113年度第1期財報」「113年度第1號
+// 公告」「113年度第1次股東會」 into the board-meeting folder.
+describe('a 年度 meeting / period / bulletin number is not learned as a case', () => {
+  beforeEach(async () => {
+    await setSettings({ internalDomains: [] })
+  })
+
+  const filing = (subject: string, target: string): PlanItem =>
+    planItem({
+      emailSubject: subject,
+      emailFrom: 'ir@client.example',
+      targetFolderPath: target,
+      aiOriginalAction: undefined,
+      aiOriginalTargetFolderPath: undefined,
+    })
+
+  it('repro: an AI filing of 「113年度第1次董事會議程」 learns no (domain + 113度1) case rule', async () => {
+    await setRules([])
+    const board = filing('113年度第1次董事會議程', '03/董事會')
+    await generateAiConfirmedRules([board], [okResult(board.emailId)])
+    const rules = await listRules()
+    expect(rules.some((r) => /度/.test(r.signal) && r.type !== 'domain')).toBe(false) // was the 113度1 compound
+    // What it learns is the broad domain rule — which, unlike a case rule,
+    // the next filing of the client elsewhere narrows (先廣後窄).
+    expect(rules.map((r) => r.type)).toEqual(['domain'])
+  })
+
+  // Follow-up: the same class without 度 — 字 was optional in the full form.
+  it.each([
+    ['113年度財報第1季', '113財報1'],
+    ['113年度上午第1次全體會議', '113上午1'],
+  ])('repro: an AI filing of 「%s」 learns no (domain + %s) case rule', async (subject, pseudo) => {
+    await setRules([])
+    const mail = filing(subject, '03/財務')
+    await generateAiConfirmedRules([mail], [okResult(mail.emailId)])
+    const rules = await listRules()
+    expect(rules.some((r) => r.signal.includes(pseudo))).toBe(false) // was the case compound
+    expect(rules.map((r) => r.type)).toEqual(['domain'])
+  })
+
+  it('the override path learns no 度 case rule either', async () => {
+    await setRules([])
+    const item = planItem({
+      emailSubject: '113年度第1號公告',
+      emailFrom: 'ir@client.example',
+      targetFolderPath: '03/公告',
+      aiOriginalTargetFolderPath: '03/董事會',
+    })
+    await generateAiOverrideRules([item], [okResult(item.emailId)])
+    expect((await listRules()).some((r) => /度/.test(r.signal))).toBe(false)
   })
 })

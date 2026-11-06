@@ -23,6 +23,7 @@ import { initParentBridge, postToParent } from '@/shared/parent-bridge'
 import { readWebStorage, writeWebStorage } from '@/popup/web-storage'
 import { isImeComposing, isTextEntryTarget, overlayLayerOpen } from '@/popup/keyboard'
 import { countOf, isUnknownHandler, reconcileRuleList } from './rule-list'
+import { aggregateAccuracy, isLowAccuracy, ruleAccuracyPct } from './rule-accuracy'
 import {
   browserLabel,
   detectBrowser,
@@ -62,7 +63,14 @@ const RULE_LIBRARY_SUBVIEWS: RuleLibrarySubView[] = [
  * 分類列點下去就是跳到「全部」view + 套用對應 chip — 清單只有一份。
  * 'disabled' 對應「已停用」(手動 + 自動停用都算);'all' 表示不套用。
  */
-type RulePresetChip = 'all' | 'sleeping' | 'orphaned' | 'overBroad' | 'hotVague' | 'disabled'
+type RulePresetChip =
+  | 'all'
+  | 'sleeping'
+  | 'orphaned'
+  | 'overBroad'
+  | 'hotVague'
+  | 'lowAccuracy'
+  | 'disabled'
 
 const RULE_PRESET_CHIPS: RulePresetChip[] = [
   'all',
@@ -70,6 +78,7 @@ const RULE_PRESET_CHIPS: RulePresetChip[] = [
   'orphaned',
   'overBroad',
   'hotVague',
+  'lowAccuracy',
   'disabled',
 ]
 
@@ -79,7 +88,18 @@ const PRESET_CHIP_LABEL: Record<RulePresetChip, string> = {
   orphaned: '目標遺失',
   overBroad: '過於廣泛',
   hotVague: '模糊熱門',
+  lowAccuracy: '錯誤率高',
   disabled: '已停用',
+}
+
+/**
+ * 「N 條規則錯誤率 > 30%」 on the dashboard and the 「錯誤率高」 chip it opens
+ * (2026-11-06): one predicate, so the chip lists exactly the N rules. The
+ * warning's 查看 used to open 規則健康度, which has no accuracy bucket at all.
+ * ≥ 10 fires — the sample floor effectiveConfidence uses.
+ */
+function isLowAccuracyWarning(r: Rule): boolean {
+  return r.enabled && isLowAccuracy(r, 10)
 }
 
 /**
@@ -115,6 +135,12 @@ function confidenceCeiling(type: RuleType, source: RuleSource): number {
 
 /** Stable empty fallback for prefix lists (keeps memoized children quiet). */
 const NO_PREFIXES: string[] = []
+
+/** Folder tree not loaded yet (no Outlook tab): ask again this often. */
+const FOLDER_TREE_RETRY_MS = 10_000
+/** What to do about a folder tree that can't load yet. */
+const FOLDER_TREE_HINT = '請打開並登入 Outlook 網頁版分頁 — 資料夾樹載入後這裡會自動更新'
+
 // Typed against the SW's MessageType union (2026-11-05): an unknown message
 // type is now a compile error, not a silent UNKNOWN_TYPE at runtime.
 async function send<T>(req: PopupRequest): Promise<Ok<T> | Err> {
@@ -504,14 +530,26 @@ export default function App() {
     if (r.ok && r.data) setSkipCount(r.data.count)
   }, [])
 
+  // One request at a time (2026-11-06): the mount load, the retry below and a
+  // drawer's own call can overlap — they share the request in flight.
+  const treeLoadRef = useRef<Promise<MailFolderNode[] | null> | null>(null)
   const loadTree = useCallback(async () => {
     if (tree) return tree
-    const r = await send<{ tree: MailFolderNode[] }>({ type: 'getFolderTree' })
-    if (r.ok && r.data) {
-      setTree(r.data.tree)
-      return r.data.tree
+    if (treeLoadRef.current) return treeLoadRef.current
+    const load = (async () => {
+      const r = await send<{ tree: MailFolderNode[] }>({ type: 'getFolderTree' })
+      if (r.ok && r.data) {
+        setTree(r.data.tree)
+        return r.data.tree
+      }
+      return null
+    })()
+    treeLoadRef.current = load
+    try {
+      return await load
+    } finally {
+      treeLoadRef.current = null
     }
-    return null
   }, [tree])
 
   useEffect(() => {
@@ -532,6 +570,22 @@ export default function App() {
   useEffect(() => {
     void loadTree()
   }, [loadTree])
+
+  // …but then nothing ever asked again (2026-11-06): opened with no Outlook
+  // tab, the page said 「等待資料夾樹載入…」 forever, also after Outlook was
+  // opened. Retry when the connection comes up (status refreshes on window
+  // focus / tab visible) and every FOLDER_TREE_RETRY_MS while visible.
+  const outlookReady = !!status?.owaConnected && !!status?.tokenValid
+  useEffect(() => {
+    if (!tree && outlookReady) void loadTree()
+  }, [tree, outlookReady, loadTree])
+  useEffect(() => {
+    if (tree) return
+    const id = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadTree()
+    }, FOLDER_TREE_RETRY_MS)
+    return () => window.clearInterval(id)
+  }, [tree, loadTree])
 
   // Stay in step with writes made ELSEWHERE (2026-11-05): a sync pull from
   // another machine, the popup's 停用此規則, the daily sweep, an execute
@@ -1866,18 +1920,18 @@ function RuleLibrarySummaryCard({
 }) {
   const stats = useMemo(() => {
     const enabled = rules.filter((r) => r.enabled).length
-    const totalHits = rules.reduce((sum, r) => sum + r.matchCount, 0)
-    const totalOverrides = rules.reduce((sum, r) => sum + (r.overrideCount ?? 0), 0)
     // Accepted / all fires (2026-11-05): overrides aren't part of matchCount.
-    const totalFires = totalHits + totalOverrides
-    const accuracy = totalFires > 0 ? totalHits / totalFires : 1
-    return { total: rules.length, enabled, totalHits, accuracy }
+    // "No data" is judged on fires too (2026-11-06) — a library whose fires
+    // were ALL overridden has 0 hits but a very real 0 % accuracy.
+    const { fires, accuracy } = aggregateAccuracy(rules)
+    return { total: rules.length, enabled, totalFires: fires, accuracy: accuracy ?? 1 }
   }, [rules])
 
   // 建議清理 TOP 5(2026-07 UX 重整,取代舊的命中 TOP 5)。排序:
   //   1) 目標遺失(orphaned)— 命中也會被跳過,留著只佔空間
-  //   2) 錯誤率 > 30% 且命中 ≥ 5 — 有實績的壞規則,錯誤率高的排前面
-  //   3) 從未命中、閒置最久(lastUsedAt fallback createdAt 最舊)
+  //   2) 錯誤率 > 30% 且觸發 ≥ 5 次(命中 + 被改正;2026-11-06 前只數命中,
+  //      多半被改正的規則反而永遠不上榜)— 錯誤率高的排前面
+  //   3) 從未觸發、閒置最久(lastUsedAt fallback createdAt 最舊)
   // 只列啟用中的規則 — 已停用的不需要再「清理」。
   const cleanupTop = useMemo(() => {
     type CleanupItem = { rule: Rule; reason: 'orphaned' | 'errorRate' | 'neverUsed' }
@@ -1891,13 +1945,14 @@ function RuleLibrarySummaryCard({
     for (const r of rules) {
       if (r.enabled && r.orphaned) push(r, 'orphaned')
     }
-    const errRate = (r: Rule) => (r.overrideCount ?? 0) / r.matchCount
     const badAccuracy = rules
-      .filter((r) => r.enabled && !r.orphaned && r.matchCount >= 5 && errRate(r) > 0.3)
-      .sort((a, b) => errRate(b) - errRate(a))
+      .filter((r) => r.enabled && !r.orphaned && isLowAccuracy(r, 5))
+      .sort((a, b) => ruleErrorRate(b) - ruleErrorRate(a))
     for (const r of badAccuracy) push(r, 'errorRate')
+    // Never FIRED — a rule that only ever got overridden is "always wrong"
+    // (listed above), not "never used".
     const neverUsed = rules
-      .filter((r) => r.enabled && !r.orphaned && r.matchCount === 0)
+      .filter((r) => r.enabled && !r.orphaned && ruleFires(r) === 0)
       .sort(
         (a, b) =>
           Date.parse(a.lastUsedAt ?? a.createdAt) - Date.parse(b.lastUsedAt ?? b.createdAt),
@@ -1907,17 +1962,14 @@ function RuleLibrarySummaryCard({
   }, [rules])
 
   // Warning: rules with low empirical accuracy (effectiveConfidence
-  // would demote them, but they're still firing).
-  const lowAccuracyCount = useMemo(
-    () =>
-      rules.filter((r) => {
-        if (!r.enabled) return false
-        if (r.matchCount < 10) return false
-        const overrides = r.overrideCount ?? 0
-        return overrides / r.matchCount > 0.3
-      }).length,
-    [rules],
-  )
+  // would demote them, but they're still firing). ≥ 10 FIRES — the same
+  // sample floor effectiveConfidence uses (2026-11-06; it counted matches).
+  const lowAccuracyCount = useMemo(() => rules.filter(isLowAccuracyWarning).length, [rules])
+  // 查看 → the full library filtered to exactly these rules (2026-11-06).
+  function openLowAccuracyList() {
+    writeSessionValue('mo-rule-preset-chip', 'lowAccuracy')
+    onOpenLibrary('all')
+  }
 
   // Warning: rules that have been silent for 70+ days but won't be
   // swept until 100 days. Users may want to clean them up early.
@@ -1933,11 +1985,11 @@ function RuleLibrarySummaryCard({
   }, [rules])
 
   const accuracyPct = (stats.accuracy * 100).toFixed(1)
-  const accuracyLabel = stats.totalHits === 0 ? '—' : `${accuracyPct}%`
+  const accuracyLabel = stats.totalFires === 0 ? '—' : `${accuracyPct}%`
 
   // Color-grade the accuracy label so problem libraries flag themselves
   const accuracyClass =
-    stats.totalHits === 0
+    stats.totalFires === 0
       ? 'text-muted-foreground'
       : stats.accuracy >= 0.9
         ? 'text-emerald-700'
@@ -1961,10 +2013,7 @@ function RuleLibrarySummaryCard({
 
   const reasonTag = (item: (typeof cleanupTop)[number]): string => {
     if (item.reason === 'orphaned') return '目標遺失'
-    if (item.reason === 'errorRate') {
-      const pct = Math.round(((item.rule.overrideCount ?? 0) / item.rule.matchCount) * 100)
-      return `錯誤率 ${pct}%`
-    }
+    if (item.reason === 'errorRate') return `錯誤率 ${Math.round(ruleErrorRate(item.rule) * 100)}%`
     return '從未命中'
   }
 
@@ -2050,7 +2099,7 @@ function RuleLibrarySummaryCard({
                   </span>
                   <button
                     type="button"
-                    onClick={() => onOpenLibrary('health')}
+                    onClick={openLowAccuracyList}
                     className="text-amber-900 underline hover:no-underline text-[11px]"
                   >
                     查看 →
@@ -2859,8 +2908,9 @@ function RuleAllView({
       orphaned: new Set(health.orphaned.map((r) => r.id)),
       overBroad: new Set(health.overBroad.map((r) => r.id)),
       hotVague: new Set(health.hotVague.map((r) => r.id)),
+      lowAccuracy: new Set(rules.filter(isLowAccuracyWarning).map((r) => r.id)),
     }),
-    [health],
+    [health, rules],
   )
   const disabledCount = useMemo(() => rules.filter((r) => !r.enabled).length, [rules])
   const chipCount = (chip: RulePresetChip): number => {
@@ -3137,7 +3187,7 @@ function RuleAllView({
             size="sm"
             onClick={() => setAdding(true)}
             disabled={!tree || tree.length === 0}
-            title={!tree ? '需先載入資料夾樹' : ''}
+            title={!tree ? `需先載入資料夾樹（${FOLDER_TREE_HINT}）` : ''}
           >
             <Plus className="size-3.5" />
             新增規則
@@ -3705,6 +3755,7 @@ function RuleLibraryActionsMenu({
       importedTombstones: number
       cappedCount: number
       cappedMaxDelta: number
+      conflictSkipped?: number
     }>({ type: 'importRules', payload: text, strategy: 'merge' })
     if (r.ok) {
       await onAfterImport()
@@ -3713,16 +3764,27 @@ function RuleLibraryActionsMenu({
       // recorded. Threshold of ≥1 cap-affected rule — we don't pop
       // up for trivial 0-delta cases.
       const d = r.data
+      const notes: string[] = []
+      // Same-condition rules that point elsewhere are skipped, not added
+      // (2026-11-06): importing them created conflicts and could bring
+      // back a mapping the user had replaced.
+      if (d && (d.conflictSkipped ?? 0) > 0) {
+        notes.push(
+          `${d.conflictSkipped} 條規則與本機已有的同一條件規則指向不同資料夾,` +
+            `已略過、保留本機的設定。`,
+        )
+      }
       if (d && d.cappedCount > 0) {
-        alert(
-          `匯入完成,但 ${d.cappedCount} 條規則的信心度因目前系統上限被調低` +
-            ` (最大降幅 ${d.cappedMaxDelta.toFixed(2)})。\n\n` +
+        notes.push(
+          `${d.cappedCount} 條規則的信心度因目前系統上限被調低` +
+            ` (最大降幅 ${d.cappedMaxDelta.toFixed(2)})。` +
             `這是預期行為:新版針對不同規則類型設了上限 ` +
             `(網域 0.7 / 寄件人 0.75 / 主旨 0.9 / 複合與案號 0.95),` +
             `避免廣域規則蓋過更精準的同 folder 規則。` +
             `user_manual 規則不受限。`,
         )
       }
+      if (notes.length > 0) alert(`匯入完成。\n\n${notes.join('\n\n')}`)
     } else {
       alert(`匯入失敗:${r.message ?? r.code}`)
     }
@@ -3963,9 +4025,9 @@ function RuleDetailDrawer({
 }) {
   // Accuracy over ALL fires (2026-11-05): overrides are no longer counted
   // inside matchCount, so the old (match − override) / match went negative /
-  // over-optimistic. Same formula the retirement logic uses (rules.ts).
-  const accuracyPct =
-    ruleFires(rule) > 0 ? Math.round((1 - ruleErrorRate(rule)) * 100) : null
+  // over-optimistic. Same formula the retirement logic uses (rules.ts) — and,
+  // since 2026-11-06, every other accuracy on this page (rule-accuracy.ts).
+  const accuracyPct = ruleAccuracyPct(rule)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
   // Load tree on open if not loaded (so edit form can show folder picker).
@@ -4314,9 +4376,8 @@ const RuleRow = memo(function RuleRow({
   const openDetail = () => onOpenDetail(rule.id)
   // Accuracy over ALL fires (2026-11-05): overrides are no longer counted
   // inside matchCount, so the old (match − override) / match went negative /
-  // over-optimistic. Same formula the retirement logic uses (rules.ts).
-  const accuracyPct =
-    ruleFires(rule) > 0 ? Math.round((1 - ruleErrorRate(rule)) * 100) : null
+  // over-optimistic. Same formula as the folder header above it (2026-11-06).
+  const accuracyPct = ruleAccuracyPct(rule)
   const accuracyClass =
     accuracyPct === null
       ? 'text-muted-foreground'
@@ -4498,7 +4559,8 @@ function RuleGroupedTable({
       path: string
       rules: Rule[]
       totalHits: number
-      totalOverrides: number
+      /** Accepted ÷ fires of the enabled rules, whole percent (2026-11-06: was ÷ hits). */
+      accPct: number | null
       enabledCount: number
     }
     const out: Group[] = []
@@ -4509,11 +4571,12 @@ function RuleGroupedTable({
         return b.matchCount - a.matchCount
       })
       const enabled = sorted.filter((r) => r.enabled)
+      const { accuracy } = aggregateAccuracy(enabled)
       out.push({
         path,
         rules: sorted,
         totalHits: enabled.reduce((s, r) => s + r.matchCount, 0),
-        totalOverrides: enabled.reduce((s, r) => s + (r.overrideCount ?? 0), 0),
+        accPct: accuracy === null ? null : Math.round(accuracy * 100),
         enabledCount: enabled.length,
       })
     }
@@ -4537,8 +4600,8 @@ function RuleGroupedTable({
     const needsAttention = (g: (typeof groups)[number]) =>
       g.rules.some((r) => {
         if (r.orphaned) return true
-        if (r.matchCount === 0) return false
-        return (r.matchCount - (r.overrideCount ?? 0)) / r.matchCount < 0.7
+        // Accepted ÷ fires, as the row shows it (2026-11-06).
+        return ruleFires(r) > 0 && 1 - ruleErrorRate(r) < 0.7
       })
     setCollapsed(new Set(groups.filter((g) => !needsAttention(g)).map((g) => g.path)))
   }, [groups, allowDefaultCollapse, setCollapsed])
@@ -4596,10 +4659,7 @@ function RuleGroupedTable({
           <tbody>
             {groups.map((g) => {
               const isCollapsed = collapsed.has(g.path)
-              const accPct =
-                g.totalHits > 0
-                  ? Math.round(((g.totalHits - g.totalOverrides) / g.totalHits) * 100)
-                  : null
+              const accPct = g.accPct
               const accClass =
                 accPct === null
                   ? 'text-muted-foreground'
@@ -4796,12 +4856,8 @@ function ConflictsView({
                   </div>
                   <ul className="mt-2 space-y-1">
                     {group.map((r) => {
-                      const acc =
-                        r.matchCount > 0
-                          ? Math.round(
-                              ((r.matchCount - (r.overrideCount ?? 0)) / r.matchCount) * 100,
-                            )
-                          : null
+                      // Accepted ÷ fires, as everywhere else (2026-11-06).
+                      const acc = ruleAccuracyPct(r)
                       return (
                         <li
                           key={r.id}
@@ -5830,6 +5886,23 @@ function SettingsExportImportRow({
   )
 }
 
+/** 「回復到此」 confirm (2026-11-06): the restore deletes on ALL machines. */
+const RESTORE_CONFIRM_TEXT =
+  '回復到這個備份？\n\n' +
+  '規則庫會回到備份當時的內容，並同步到所有機器：備份之後才新增的手動與 AI 學習規則，' +
+  '會在每一台機器上被刪除（初始掃描產生的規則不受影響）。\n\n' +
+  '回復前會自動備份目前的狀態（「回復備份前」），需要時可以再回復回來。'
+
+/** Result line of a restore — how many rules it deleted / brought back. */
+function restoreResultText(d: { removedCount?: number; undeletedCount?: number }): string {
+  const parts: string[] = []
+  if ((d.removedCount ?? 0) > 0) parts.push(`刪除 ${d.removedCount} 條備份之後新增的規則（所有機器）`)
+  if ((d.undeletedCount ?? 0) > 0) parts.push(`恢復 ${d.undeletedCount} 條之後被刪除的規則`)
+  return parts.length > 0
+    ? `已回復：${parts.join('、')}。可從「回復備份前」的快照復原。`
+    : '已回復'
+}
+
 // ---- Cross-machine sync card (2026-05-22) ---------------------------------
 //
 // Uses chrome.storage.sync, which is browser-account-bound:
@@ -5874,6 +5947,8 @@ function CrossMachineSyncCard({
   type BackupSummary = {
     snapshotAt: string
     direction: 'pre-push' | 'pre-pull' | 'manual'
+    /** Why it was taken, e.g. 「升級同步格式前」 (SW-provided, 2026-11-06). */
+    label?: string
     ruleCount: number
     tombstoneCount: number
   }
@@ -6028,22 +6103,30 @@ function CrossMachineSyncCard({
     setTimeout(() => setOk(null), 3000)
   }
 
+  // A restore is a rollback for EVERY machine (2026-11-06, sync-engine
+  // restoreBackup): synced rules the snapshot lacks are deleted with
+  // tombstones that sync, not just overwritten here — the old prompt said
+  // only "本機規則會被覆蓋". Say what happens, and report how many went.
   async function rollback(snapshotAt: string) {
-    if (!window.confirm('回復到這個備份?目前的本機規則會被覆蓋(新增一個 manual 備份、可再回復)')) return
+    if (!window.confirm(RESTORE_CONFIRM_TEXT)) return
     setBusy(true)
     setError(null)
-    const r = await send<{ restored: boolean }>({
+    const r = await send<{ restored: boolean; removedCount?: number; undeletedCount?: number }>({
       type: 'restoreSyncBackup',
       snapshotAt,
     })
     setBusy(false)
+    let keepMs = 3000
     if (!r.ok) setError(r.message || r.code)
-    else if (r.data?.restored) setOk('已回復')
-    else setError('找不到此備份')
+    else if (r.data?.restored) {
+      setOk(restoreResultText(r.data))
+      // A count of deleted rules is worth reading — don't snatch it away.
+      if ((r.data.removedCount ?? 0) > 0) keepMs = 10_000
+    } else setError('找不到此備份')
     await refreshSync()
     await refreshBackups()
     await onChanged()
-    setTimeout(() => setOk(null), 3000)
+    setTimeout(() => setOk(null), keepMs)
   }
 
   // Enable-sync modal: Esc cancels it (2026-11-05). It had no role and no
@@ -6333,18 +6416,19 @@ function CrossMachineSyncCard({
 
             {historyOpen && (
               <div className="rounded-md border border-border bg-muted/30 p-2 space-y-1">
-                <div className="text-[10px] font-medium">本機同步快照(最近 5 筆)</div>
+                <div className="text-[10px] font-medium">本機同步快照(最近 5 筆;另固定保留「升級同步格式前」與「套用他機全部刪除前」各一份)</div>
                 {backups.length === 0 ? (
                   <div className="text-[10px] text-muted-foreground py-1">尚無快照</div>
                 ) : (
                   <ul className="space-y-1">
                     {backups.map((b) => {
                       const dirLabel =
-                        b.direction === 'pre-push'
+                        b.label ??
+                        (b.direction === 'pre-push'
                           ? '上傳前'
                           : b.direction === 'pre-pull'
                             ? '下載前'
-                            : '手動'
+                            : '手動')
                       return (
                         <li
                           key={b.snapshotAt}
@@ -6969,7 +7053,11 @@ function RecentActivityFilterCard({
             </Button>
             {!tree && (
               <span className="text-[10px] text-muted-foreground">
-                等待資料夾樹載入…
+                {/* No Outlook tab / not signed in (2026-11-06): say what to do —
+                    the tree loads by itself once Outlook is there. */}
+                {status && !(status.owaConnected && status.tokenValid)
+                  ? FOLDER_TREE_HINT
+                  : '等待資料夾樹載入…'}
               </span>
             )}
           </div>

@@ -31,7 +31,9 @@ export async function seedClassifyEnv(opts: { model?: string; batchSize?: number
       batchSize: opts.batchSize ?? 50,
       internalDomains: [],
     },
-    folderCache: { updatedAt: new Date().toISOString(), tree: folderTree() },
+    // A current-format cache (2026-11-06 r3): one without `wellKnown` is
+    // legacy and refetched on first use.
+    folderCache: { updatedAt: new Date().toISOString(), tree: folderTree(), wellKnown: { roots: [], complete: true } },
   })
   await chrome.storage.session.set({
     cachedToken: { secret: 'owa-token', expiresOn: Date.now() / 1000 + 3600 },

@@ -14,9 +14,13 @@
 // Strategies on import:
 //   - 'replace' — clear all existing rules, write imported set verbatim
 //   - 'merge'   — keep existing rules; only add imported rules whose id is
-//                 not already present AND whose (type, normalizeSignal,
-//                 target) triple is not already present. Existing
-//                 matchCount / lastUsedAt stay intact.
+//                 not already present AND whose (type, normalizeSignal)
+//                 isn't held by a stored rule of equal or higher priority
+//                 (planImportMerge). Existing matchCount / lastUsedAt stay
+//                 intact; a lower-priority stored rule an imported one takes
+//                 over is switched off as 'superseded' — after the folder
+//                 reconcile, only for an imported rule whose folder resolved
+//                 (applyImportTakeovers).
 
 import { decodeCompound, normalizeSignal } from './rules'
 import type { Rule, RuleSource, RuleTombstone, RuleType } from './types'
@@ -309,43 +313,130 @@ export type ImportStrategy = 'merge' | 'replace'
 
 export type ImportPreview = {
   totalToImport: number
-  /** Imported rules that 'merge' would skip: same id, or same (type,
-   *  normalized signal, target) as a rule already stored (or earlier in the
-   *  file). */
+  /** Imported rules that 'merge' would skip: same id as a stored rule, a
+   *  stored rule of equal or higher priority for the same (type, normalized
+   *  signal) — see planImportMerge — or the same (type, normalized signal,
+   *  target) as one earlier in the file. */
   duplicateCount: number
+  /** Of duplicateCount: the stored rule that blocks it points at a DIFFERENT
+   *  folder — skipped so the import can't create a conflict or bring back a
+   *  mapping the user replaced (2026-11-06). */
+  conflictCount: number
   /** Imported rules that would be added under 'merge'. */
   newCount: number
+  /** Of newCount: imported rules that take a signal over from a stored rule
+   *  of LOWER priority, or a switched-off one (2026-11-06, R5). */
+  replaceCount: number
+  /** Stored rules 'merge' may switch off ('superseded') because an imported
+   *  rule of higher priority routes their signal to another folder — at
+   *  most: only an imported rule whose folder resolves at import time takes
+   *  over (applyImportTakeovers; importRules reports the actual number). */
+  supersedeCount: number
   /** Current rule count before import. */
   existingCount: number
   /** Tombstones in the payload (v2+); 0 for v1 imports. */
   tombstoneCount: number
 }
 
-function tripleKey(r: Pick<Rule, 'type' | 'signal' | 'targetFolderPath'>): string {
-  return `${r.type}::${normalizeSignal(r.type, r.signal)}::${r.targetFolderPath}`
+function signalKey(r: Pick<Rule, 'type' | 'signal'>): string {
+  return `${r.type}::${normalizeSignal(r.type, r.signal)}`
+}
+
+/** Import priority of a rule's source: user_manual > ai_overridden > ai_confirmed > auto_scan. */
+const SOURCE_PRIORITY: Record<RuleSource, number> = {
+  user_manual: 3,
+  ai_overridden: 2,
+  ai_confirmed: 1,
+  auto_scan: 0,
+}
+
+const priorityOf = (r: Pick<Rule, 'source'>): number => SOURCE_PRIORITY[r.source] ?? -1
+
+type ImportMergePlan = {
+  toAdd: Rule[]
+  conflicting: number
+  replacing: number
+  /** Stored rule (identity) → the imported rules that would take its signal
+   *  over; applied by applyImportTakeovers once the folders are reconciled. */
+  takeovers: Map<Rule, Rule[]>
 }
 
 /**
  * The imported rules 'merge' would add (2026-11-05). Keyed on id FIRST:
  * re-importing an older backup of a rule edited since (new signal / target)
  * used to pass the old raw (type, signal) check and land as a second row
- * with the SAME id. Then on the canonical (type, normalized signal, target)
- * triple — the identity dedupe / tombstones use — so `@x.com` vs `x.com` or
- * full vs compact court-case forms count as the same rule. Also dedupes
- * within the file itself.
+ * with the SAME id. Then on the canonical (type, normalized signal) — so
+ * `@x.com` vs `x.com` or full vs compact court-case forms count as the same
+ * signal — WITHOUT the target (2026-11-06): a stored rule for the signal
+ * wins whatever folder it points at. Keying on the target added the backup's
+ * old mapping next to the one the user replaced it with — a conflict that
+ * also brought the replaced mapping back.
+ *
+ * …but only a stored rule of EQUAL OR HIGHER priority wins (R5, 2026-11-06):
+ * an imported user_manual rule used to lose to any stored rule for its
+ * signal, even an auto_scan one or one switched off. A stored rule blocks an
+ * imported one when its source ranks at least as high AND it is live
+ * (enabled, not orphaned) — or when the imported rule is not user_manual:
+ * a dormant stored copy (user-disabled, superseded, …) still keeps an
+ * imported AUTO rule from bringing the mapping back. When an enabled
+ * imported rule does take a signal over, the live lower-priority stored
+ * rules pointing elsewhere are switched off as 'superseded' (sync-safe —
+ * the edit propagates — and revivable / purged like any superseded rule),
+ * so the import never leaves two live rules routing one signal apart;
+ * same-target ones are left for dedupe. That last step waits for the folder
+ * reconcile (applyImportTakeovers, round 3). user_manual stored rules are
+ * never touched. Within the file itself only exact (signal, target)
+ * duplicates are dropped; the file's own structure is its business.
  */
-function importsToAdd(existing: readonly Rule[], imported: readonly Rule[]): Rule[] {
+function planImportMerge(existing: readonly Rule[], imported: readonly Rule[]): ImportMergePlan {
   const ids = new Set(existing.map((r) => r.id))
-  const triples = new Set(existing.map(tripleKey))
-  const out: Rule[] = []
-  for (const r of imported) {
-    const triple = tripleKey(r)
-    if (ids.has(r.id) || triples.has(triple)) continue
-    ids.add(r.id)
-    triples.add(triple)
-    out.push(r)
+  const local = new Map<string, Rule[]>()
+  for (const r of existing) {
+    const key = signalKey(r)
+    const bucket = local.get(key)
+    if (bucket) bucket.push(r)
+    else local.set(key, [r])
   }
-  return out
+  const fileTriples = new Set<string>()
+  const toAdd: Rule[] = []
+  const takeovers = new Map<Rule, Rule[]>()
+  let conflicting = 0
+  let replacing = 0
+  for (const r of imported) {
+    if (ids.has(r.id)) continue
+    const key = signalKey(r)
+    const same = local.get(key) ?? []
+    const rank = priorityOf(r)
+    const blockers = same.filter(
+      (l) =>
+        priorityOf(l) >= rank &&
+        ((l.enabled && !l.orphaned) || r.source !== 'user_manual'),
+    )
+    if (blockers.length > 0) {
+      if (!blockers.some((l) => l.targetFolderPath === r.targetFolderPath)) conflicting++
+      continue
+    }
+    const triple = `${key}::${r.targetFolderPath}`
+    if (fileTriples.has(triple)) continue
+    ids.add(r.id)
+    fileTriples.add(triple)
+    toAdd.push(r)
+    if (same.length > 0) replacing++
+    if (!r.enabled) continue
+    for (const l of same) {
+      if (
+        l.enabled &&
+        l.source !== 'user_manual' &&
+        priorityOf(l) < rank &&
+        l.targetFolderPath !== r.targetFolderPath
+      ) {
+        const takers = takeovers.get(l)
+        if (takers) takers.push(r)
+        else takeovers.set(l, [r])
+      }
+    }
+  }
+  return { toAdd, conflicting, replacing, takeovers }
 }
 
 export function previewImport(
@@ -353,21 +444,27 @@ export function previewImport(
   imported: Rule[],
   tombstones: RuleTombstone[] = [],
 ): ImportPreview {
-  const newCount = importsToAdd(existing, imported).length
+  const { toAdd, conflicting, replacing, takeovers } = planImportMerge(existing, imported)
+  const newCount = toAdd.length
   return {
     totalToImport: imported.length,
     duplicateCount: imported.length - newCount,
+    conflictCount: conflicting,
     newCount,
+    replaceCount: replacing,
+    supersedeCount: takeovers.size,
     existingCount: existing.length,
     tombstoneCount: tombstones.length,
   }
 }
 
-export function applyImport(
-  existing: Rule[],
-  imported: Rule[],
-  strategy: ImportStrategy,
-): Rule[] {
+/**
+ * The library an import produces: 'replace' — the file; 'merge' — the stored
+ * rules (matchCount / lastUsedAt / user edits intact on every collision) plus
+ * the imported rules planImportMerge adds. The takeovers of 'merge' are a
+ * separate step, applyImportTakeovers, run once the folders are reconciled.
+ */
+export function applyImport(existing: Rule[], imported: Rule[], strategy: ImportStrategy): Rule[] {
   // replace: the file IS the library — but never write two rows with one id.
   if (strategy === 'replace') {
     const seen = new Set<string>()
@@ -377,7 +474,47 @@ export function applyImport(
       return true
     })
   }
-  // merge: keep existing rules on any collision so we don't wipe out their
-  // matchCount / lastUsedAt / user edits.
-  return [...existing, ...importsToAdd(existing, imported)]
+  return [...existing, ...planImportMerge(existing, imported).toAdd]
+}
+
+/**
+ * 'merge' takeovers (R5; round 3): switch off as 'superseded' each stored
+ * rule an imported rule of higher priority takes over (planImportMerge) —
+ * judged on `reconciled`, the imported library after the folder reconcile:
+ * only when the stored rule is still live there AND at least one of its
+ * takers is live there too (enabled, its folder resolved — not orphaned) and
+ * still points elsewhere. Switching a working stored rule off for an
+ * imported rule whose folder no longer exists left nothing routing the
+ * signal. Run it only with a reconciled library: with no folder tree to
+ * reconcile against, an imported rule's folder can't be confirmed.
+ */
+export function applyImportTakeovers(
+  existing: readonly Rule[],
+  imported: readonly Rule[],
+  reconciled: readonly Rule[],
+  nowIso: string = new Date().toISOString(),
+): { next: Rule[]; superseded: Rule[] } {
+  const { takeovers } = planImportMerge(existing, imported)
+  const byId = new Map<string, Rule>()
+  for (const r of reconciled) if (!byId.has(r.id)) byId.set(r.id, r)
+  const live = (r: Rule | undefined): r is Rule => !!r && r.enabled && !r.orphaned
+  const off = new Set<string>()
+  for (const [stored, takers] of takeovers) {
+    const now = byId.get(stored.id)
+    if (!live(now) || now.source === 'user_manual') continue
+    const taken = takers.some((t) => {
+      const taker = byId.get(t.id)
+      return live(taker) && taker.targetFolderPath !== now.targetFolderPath
+    })
+    if (taken) off.add(stored.id)
+  }
+  if (off.size === 0) return { next: [...reconciled], superseded: [] }
+  const superseded: Rule[] = []
+  const next = reconciled.map((r) => {
+    if (!off.has(r.id) || !r.enabled) return r
+    const updated: Rule = { ...r, enabled: false, autoDisabledAt: nowIso, autoDisabledReason: 'superseded' }
+    superseded.push(updated)
+    return updated
+  })
+  return { next, superseded }
 }

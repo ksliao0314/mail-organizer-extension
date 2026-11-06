@@ -1,12 +1,14 @@
-import { type ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, createContext, memo, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { FolderPicker } from './FolderPicker'
 import { cn } from '@/lib/utils'
 import { joinFolderPath } from '@/shared/outlook-api'
+import { refusalCategoryLabel } from '@/shared/refusal-category'
 import type { MailFolderNode, PlanAction, PlanItem } from '@/shared/types'
 import { useLayout } from '../layout-context'
+import { preventsPointerFocus } from '../keyboard'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Sparkles, Tags } from 'lucide-react'
 
 const ACTION_LABEL: Record<PlanAction, string> = {
@@ -123,6 +125,15 @@ export function willLearnFromOverride(item: PlanItem): boolean {
   return overrode && finalTarget !== undefined
 }
 
+/**
+ * How many plan rows are selected (2026-11-06). Only the 「全部套用到勾選 N
+ * 項」 button in an EXPANDED row needs it, so it travels by context to that
+ * button alone: as a row prop (`otherSelectedCount`) it changed on every row
+ * with each 勾選, and React.memo re-rendered the whole list — 500 rows per
+ * click in a big plan. PlanScreen provides it.
+ */
+export const PlanSelectionCountContext = createContext(0)
+
 export type PlanRowProps = {
   item: PlanItem
   /** Position in the rendered list — handed back through onActivate. */
@@ -130,8 +141,6 @@ export type PlanRowProps = {
   tree: MailFolderNode[]
   excludePrefixes: string[]
   selected: boolean
-  /** Number of OTHER rows currently selected (excludes this one). */
-  otherSelectedCount: number
   /** When true, draw a ring to indicate this row is the keyboard-nav target. */
   focused?: boolean
   /**
@@ -180,7 +189,6 @@ export const PlanRow = memo(function PlanRow({
   tree,
   excludePrefixes,
   selected,
-  otherSelectedCount,
   focused,
   scrollIntoViewToken,
   toggleExpandToken,
@@ -340,7 +348,7 @@ export const PlanRow = memo(function PlanRow({
       className="text-[9px] border-amber-300 bg-amber-50 text-amber-800"
       title={
         item.source === 'unresolved'
-          ? 'AI 信心低於門檻、未產生明確分類，請你決定'
+          ? unresolvedWhy(item).short
           : `AI 信心 ${item.confidence.toFixed(2)} 偏低 — 展開看判斷依據`
       }
     >
@@ -375,6 +383,9 @@ export const PlanRow = memo(function PlanRow({
   return (
     <div
       ref={rowRef}
+      // Row position for the plan screen's Enter / Space routing (2026-11-06,
+      // popup/keyboard.ts PLAN_ROW_INDEX_ATTR).
+      data-plan-row-index={index}
       onClick={onActivate ? () => onActivate(index) : undefined}
       className={cn(
         // 勾選與游標分離的視覺語言（UI/UX 檢討 2026-07）：
@@ -490,7 +501,18 @@ export const PlanRow = memo(function PlanRow({
       </div>
 
       {expanded && (
-        <div className="px-3 pb-3 pl-6 space-y-2 border-t border-black/5 pt-2">
+        <div
+          className="px-3 pb-3 pl-6 space-y-2 border-t border-black/5 pt-2"
+          // Detail panel (2026-11-06, popup/keyboard.ts): a control focused
+          // here keeps its own Enter / Space while this row has the cursor.
+          // Mouse clicks on its buttons don't take focus, so that only
+          // happens for a control the user Tabbed to — after clicking 刪除,
+          // Space still means 勾選 this row.
+          data-plan-row-detail=""
+          onMouseDown={(e) => {
+            if (preventsPointerFocus(e.target)) e.preventDefault()
+          }}
+        >
           {item.bodyPreview && item.bodyPreview.trim().length > 0 && (
             <div
               className="rounded-md border border-border bg-muted/40 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap break-words"
@@ -578,21 +600,12 @@ export const PlanRow = memo(function PlanRow({
 
           <div className="flex items-center justify-between gap-2 pt-1">
             <div className="flex-1">
-              {otherSelectedCount > 0 && (
-                <Button
-                  size="sm"
-                  variant="default"
-                  disabled={!canPropagate}
-                  onClick={() => onPropagate(item)}
-                  title={
-                    canPropagate
-                      ? `把這張卡的目標套用到其他 ${otherSelectedCount} 張勾選的卡，套用後自動清空勾選`
-                      : '這張卡的目標尚未指定、無法套用'
-                  }
-                >
-                  全部套用到勾選 {otherSelectedCount} 項
-                </Button>
-              )}
+              <PropagateToSelectedButton
+                item={item}
+                selected={selected}
+                canPropagate={canPropagate}
+                onPropagate={onPropagate}
+              />
             </div>
             <Button size="sm" variant="ghost" onClick={() => setExpanded(false)}>收起</Button>
           </div>
@@ -601,6 +614,37 @@ export const PlanRow = memo(function PlanRow({
     </div>
   )
 })
+
+/** The format-painter button of an expanded row — the only selection-count reader. */
+function PropagateToSelectedButton({
+  item,
+  selected,
+  canPropagate,
+  onPropagate,
+}: {
+  item: PlanItem
+  selected: boolean
+  canPropagate: boolean
+  onPropagate: (source: PlanItem) => void
+}) {
+  const otherSelectedCount = useContext(PlanSelectionCountContext) - (selected ? 1 : 0)
+  if (otherSelectedCount <= 0) return null
+  return (
+    <Button
+      size="sm"
+      variant="default"
+      disabled={!canPropagate}
+      onClick={() => onPropagate(item)}
+      title={
+        canPropagate
+          ? `把這張卡的目標套用到其他 ${otherSelectedCount} 張勾選的卡，套用後自動清空勾選`
+          : '這張卡的目標尚未指定、無法套用'
+      }
+    >
+      全部套用到勾選 {otherSelectedCount} 項
+    </Button>
+  )
+}
 
 
 // ---- Rule trace block ----------------------------------------------------
@@ -793,11 +837,39 @@ export function RuleTraceBlock({
           {item.reason && (
             <div className="italic text-muted-foreground">{item.reason}</div>
           )}
-          <div className="text-muted-foreground">
-            AI 信心過低,沒給出明確分類,請你逐封決定
-          </div>
+          <div className="text-muted-foreground">{unresolvedWhy(item).detail}</div>
         </div>
       )}
     </div>
   )
+}
+
+/**
+ * Why an unresolved row carries no decision (2026-11-06). Only gated / skipped
+ * AI answers are "low confidence": a row Claude refused, or that was never
+ * classified (API error, missing answer), says so instead.
+ */
+function unresolvedWhy(item: PlanItem): { short: string; detail: string } {
+  if (item.unclassified && item.refusal?.scope === 'email') {
+    return {
+      short: 'Claude 拒絕分類這封郵件，請你手動處理',
+      detail: `Claude 拒絕分類這封郵件（類別：${refusalCategoryLabel(item.refusal.category)}），請你手動決定歸檔位置`,
+    }
+  }
+  if (item.unclassified && item.refusal) {
+    return {
+      short: 'Claude 拒絕了這封所在的整批請求，請你決定',
+      detail: 'Claude 拒絕了這封所在的整批請求、無法確定是哪一封；下一批會再試，也可現在手動決定',
+    }
+  }
+  if (item.unclassified) {
+    return {
+      short: 'AI 沒有完成這封的分類，請你決定',
+      detail: 'AI 沒有完成這封的分類，下一批會重新分類；也可現在手動決定',
+    }
+  }
+  return {
+    short: 'AI 信心低於門檻、未產生明確分類，請你決定',
+    detail: 'AI 信心過低,沒給出明確分類,請你逐封決定',
+  }
 }

@@ -23,8 +23,21 @@
 // through ONE queue, every push pulls first when the cloud holds a state this
 // machine hasn't merged, and a pull accepts only a snapshot whose chunks all
 // carry the meta's pushId (torn reads abort and retry). Destructive merges
-// (replace, remote wipe, first-enable) and restores snapshot local state into
-// `syncBackups` first.
+// (replace, remote wipe, first-enable, the first v4 merge of an upgraded
+// machine) and restores snapshot local state into `syncBackups` first.
+//
+// 2026-11-06 additions:
+//   - adoption: a machine's FIRST v4 merge keeps (and re-stamps) live rules
+//     that v3 kept next to an older tombstone (adoptionProtects), after an
+//     'upgrade' backup.
+//   - `orphaned` is per-device: never stamps editedAt, never wins a merge.
+//   - counters merge by epoch (Rule.statsResetAt); counter-only changes are
+//     pushed at most once per SYNC_COUNTER_PUSH_COALESCE_MS (meta.semanticHash).
+//   - a cloud left torn under one pushId is repaired by its owner, or after
+//     repeated torn reads rewritten from local (after a backup).
+//   - the stale-sweep active-day ledger rides in the settings item (`d`).
+//   - a synced setting this build can't represent (an unknown claudeModel) is
+//     neither adopted nor bounced back (foreignSettings).
 //
 // Detection: every push writes `syncMeta.sourceMachineId = ourId` and a fresh
 // `pushId`. The chrome.storage.onChanged listener ignores our own echoes and
@@ -33,13 +46,24 @@
 import {
   addRuleTombstones,
   clearMatchingTombstones,
+  getActiveDays,
   getFolderActivity,
   getRuleTombstones,
   getSettings,
+  mergeActiveDaysFromSync,
   mergeFolderActivityFromSync,
   setSettings,
 } from '@/shared/storage'
-import { applyConfidenceCap, listRules, mutateRules, normalizeSignal, tombstoneKey } from '@/shared/rules'
+import {
+  applyConfidenceCap,
+  legacySignalNorm,
+  listRules,
+  mutateRules,
+  normalizeSignal,
+  ruleTombstone,
+  semanticFieldsEqual,
+  tombstoneKey,
+} from '@/shared/rules'
 import {
   chunkFolderActivity,
   jsonByteSize,
@@ -53,35 +77,49 @@ import {
 } from '@/shared/sync-chunks'
 import {
   contentHash,
+  decodeActiveDays,
   decodeRulePayload,
   decodeTombstone,
+  encodeActiveDays,
   sanitizeLegacyRule,
   sanitizeLegacyTombstone,
+  spellingFingerprint,
+  type CompactRuleRow,
+  type CompactTombstone,
   type DecodedStub,
+  type WireRuleEntry,
 } from '@/shared/sync-codec'
+import { isKnownClaudeModel } from '@/shared/claude-models'
 import {
+  ACTIVE_DAYS_CAP,
+  CANONICAL_TOMBSTONE_KEYS_SINCE_MS,
+  CHUNK_BYTE_TARGET,
   MAX_BACKUPS,
   MAX_FOLDER_ACTIVITY_CHUNKS,
   PULL_DEBOUNCE_MS,
   PULL_GRACE_MS,
   PUSH_DEBOUNCE_MS,
   QUIESCE_TIMEOUT_MS,
+  SYNC_COUNTER_PUSH_COALESCE_MS,
   SYNC_MIN_READABLE_SCHEMA_VERSION,
   SYNC_PUSH_RETRY_BASE_MS,
   SYNC_PUSH_RETRY_MAX_MS,
   SYNC_RATE_LIMIT_HOUR_RETRY_MS,
   SYNC_RATE_LIMIT_MINUTE_RETRY_MS,
   SYNC_RECENT_PUSHES_CAP,
+  SYNC_RECENT_TOMBSTONE_BUDGET_SHARE,
   SYNC_SCHEMA_VERSION,
   SYNC_STARTUP_RECONCILE_DELAY_MS,
   SYNC_TOMBSTONE_BUDGET_SHARE,
+  SYNC_TORN_RECOVERY_MIN_MS,
+  SYNC_TORN_RECOVERY_MIN_READS,
   SYNC_TORN_RETRY_BASE_MS,
   SYNC_TORN_RETRY_MAX_ATTEMPTS,
   SYNC_TORN_RETRY_MAX_MS,
   SYNC_TOTAL_BUDGET_BYTES,
 } from '@/shared/constants'
 import { logError } from '@/shared/error-log'
-import type { FolderActivity, Rule, RuleTombstone, Settings } from '@/shared/types'
+import type { FolderActivity, Rule, RuleSource, RuleTombstone, Settings } from '@/shared/types'
 
 /**
  * Fields that must NEVER round-trip through chrome.storage.sync — each
@@ -233,7 +271,34 @@ type SyncLocalState = {
    * was still waiting to be pushed, silently reverting it.
    */
   settingsBase?: Record<string, unknown>
+  /**
+   * The first-participation merge ("adoption", 2026-11-06) has run since sync
+   * was (re-)enabled — see adoptionProtects. Absent on states written by
+   * v1.0.8: a participating one with lastMergedPushId counts as adopted.
+   */
+  v4Adopted?: boolean
+  /**
+   * lastSyncAt of a machine that was syncing under v1.0.7 when this build
+   * first ran, kept until its first v4 merge: decides the transition's wipe
+   * marker and which tombstones v3 had already processed.
+   */
+  legacyLastSyncAt?: string
+  /**
+   * Synced settings values this build cannot represent (A13: a claudeModel id
+   * from a newer peer). `cloud` is pushed back unchanged while the local value
+   * is still `local` — neither adopted (sanitize would map it to a default)
+   * nor overwritten with ours.
+   */
+  foreignSettings?: Record<string, { cloud: unknown; local: unknown }>
+  /** Counter-only changes are waiting for a coalesced push due at this time (ms). */
+  counterPushDueAt?: number
 }
+
+/** Persisted torn-read streak (per-device): same meta pushId seen torn `count` times since `firstAt`. */
+const SYNC_TORN_STREAK_KEY = 'syncTornStreak'
+type TornStreak = { pushId: string; count: number; firstAt: number }
+
+const COUNTER_PUSH_ALARM = 'mail-organizer:sync-counter-push'
 
 export type RemoteWipeNotice = {
   /** Machine that issued the wipe (from SyncMeta.wipeMarker.byMachineId). */
@@ -260,22 +325,27 @@ export type SyncErrorEntry = {
 export type SyncBackup = {
   snapshotAt: string
   direction: 'pre-push' | 'pre-pull' | 'manual'
-  /** Why the snapshot was taken (2026-11-05; absent on older backups). */
-  trigger?: 'replace-pull' | 'remote-wipe' | 'first-enable' | 'restore'
   /**
-   * The pre-wipe snapshot the remote-wipe banner points to. Exempt from
-   * rotation (replaced only by the next remote wipe) — the old 5-slot
-   * rotation, refilled by every push and pull, evicted it within minutes.
+   * Why the snapshot was taken (2026-11-05; absent on older backups).
+   * 'upgrade' (2026-11-06): before an upgraded v1.0.7 machine's first v4
+   * merge. 'torn-recovery': before a push rewrote a cloud left torn.
+   */
+  trigger?: 'replace-pull' | 'remote-wipe' | 'first-enable' | 'restore' | 'upgrade' | 'torn-recovery'
+  /**
+   * Exempt from rotation — one slot per trigger: the pre-wipe snapshot the
+   * remote-wipe banner points to, and the pre-upgrade snapshot (2026-11-06).
+   * The old 5-slot rotation, refilled by every push and pull, evicted the
+   * pre-wipe one within minutes.
    */
   pinned?: boolean
   /** Local snapshot of what would be overwritten — minus per-machine state. */
   payload: {
     rules: Rule[]
     /**
-     * Always [] since 2026-11-05: a full tombstone list made every snapshot
-     * multi-MB (measured 3.7 MB per push at 2000 tombstones). Restore clears
-     * the tombstones that would suppress a restored rule instead (see
-     * restoreBackup). Older backups may still carry a list; it is ignored.
+     * [] for routine snapshots since 2026-11-05: a full tombstone list made
+     * every snapshot multi-MB (measured 3.7 MB per push at 2000 tombstones).
+     * The one-off 'upgrade' and 'first-enable' snapshots carry the list
+     * (2026-11-06) — restore unions it back.
      */
     tombstones: RuleTombstone[]
     settings: Omit<Settings, 'claudeApiKey'>
@@ -348,6 +418,15 @@ export type SyncMeta = {
   pushId?: string
   /** v4: fingerprint of the pushed content (no ids/times) — lets an identical push be skipped. */
   contentHash?: string
+  /**
+   * v4 additive (2026-11-06; v1.0.8 ignores it): fingerprint of the content
+   * WITHOUT hit counters (matchCount / overrideCount / lastUsedAt). Equal
+   * semanticHash + different contentHash = a counter-only change → coalesced
+   * (see SYNC_COUNTER_PUSH_COALESCE_MS).
+   */
+  semanticHash?: string
+  /** v4 additive (2026-11-06): fingerprint of the active-day ledger (settings item `d`). */
+  daysHash?: string
   /** v4: disabled rules present only as stubs. */
   disabledStubCount?: number
   /** v4 chunk counts (syncRows4_* / syncFolders4_* / syncTombs4_* / syncActivity4_*). */
@@ -388,6 +467,12 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 let pushTimer: ReturnType<typeof setTimeout> | null = null
+// The debounced push must not defer counter-only changes (a flush was asked
+// for while it was pending: 立即上傳, the coalesced counter push, …).
+let pendingPushFlush = false
+// In-memory twin of the COUNTER_PUSH_ALARM (the alarm survives SW restarts).
+let counterPushTimer: ReturnType<typeof setTimeout> | null = null
+let counterPushArmedFor: number | undefined
 // Debounce timer for remote-pull dispatch: a burst of remote onChanged
 // events (meta + late chunks, several pushes) collapses into one pull.
 let pullDebounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -424,10 +509,21 @@ let fullOrphanScanDone = false
  * scheduled retry can't fire into the next test's storage.
  */
 export function resetSyncEngineForTests(): void {
-  for (const t of [pushTimer, pullDebounceTimer, pullGraceTimer, tornRetryTimer, pushRetryTimer, startupTimer]) {
+  for (const t of [
+    pushTimer,
+    pullDebounceTimer,
+    pullGraceTimer,
+    tornRetryTimer,
+    pushRetryTimer,
+    startupTimer,
+    counterPushTimer,
+  ]) {
     if (t) clearTimeout(t)
   }
   pushTimer = pullDebounceTimer = pullGraceTimer = tornRetryTimer = pushRetryTimer = startupTimer = null
+  counterPushTimer = null
+  counterPushArmedFor = undefined
+  pendingPushFlush = false
   syncChain = Promise.resolve()
   remotePullQueued = false
   pullInProgress = false
@@ -466,6 +562,13 @@ export function installSyncListener(): void {
       onLocalAreaChanged(changes)
     }
   })
+  // The coalesced counter push (2026-11-06) is armed as an alarm too: an
+  // in-memory timer dies with the service worker long before 20 minutes.
+  if (typeof chrome.alarms?.onAlarm?.addListener === 'function') {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === COUNTER_PUSH_ALARM) schedulePush('counter-flush', 0, { flush: true })
+    })
+  }
   if (startupTimer) clearTimeout(startupTimer)
   startupTimer = setTimeout(() => {
     startupTimer = null
@@ -474,7 +577,45 @@ export function installSyncListener(): void {
         if (err?.source === 'push') schedulePush('startup-retry', 0)
       })
       .catch(() => {})
+    // A counter push that came due while no service worker was alive.
+    void readLocalSyncState()
+      .then(({ state }) => {
+        if (state.counterPushDueAt !== undefined) armCounterPush(state.counterPushDueAt)
+      })
+      .catch(() => {})
   }, SYNC_STARTUP_RECONCILE_DELAY_MS)
+}
+
+/** (Re-)arm the coalesced counter push for `dueAt` (timer + alarm). */
+function armCounterPush(dueAt: number): void {
+  if (counterPushTimer && counterPushArmedFor === dueAt) return // already armed this SW lifetime
+  if (counterPushTimer) clearTimeout(counterPushTimer)
+  counterPushArmedFor = dueAt
+  counterPushTimer = setTimeout(() => {
+    counterPushTimer = null
+    counterPushArmedFor = undefined
+    schedulePush('counter-flush', 0, { flush: true })
+  }, Math.max(0, dueAt - Date.now()))
+  try {
+    void Promise.resolve(
+      chrome.alarms?.create?.(COUNTER_PUSH_ALARM, { when: Math.max(dueAt, Date.now() + 1000) }),
+    ).catch(() => {})
+  } catch {
+    // alarms unavailable — the in-memory timer and the next push cover it
+  }
+}
+
+function disarmCounterPush(): void {
+  if (counterPushTimer) {
+    clearTimeout(counterPushTimer)
+    counterPushTimer = null
+  }
+  counterPushArmedFor = undefined
+  try {
+    void Promise.resolve(chrome.alarms?.clear?.(COUNTER_PUSH_ALARM)).catch(() => {})
+  } catch {
+    // ignore
+  }
 }
 
 function onSyncAreaChanged(changes: Record<string, chrome.storage.StorageChange>): void {
@@ -560,11 +701,18 @@ function isUserFacingSettingsChange(change?: chrome.storage.StorageChange): bool
  * Schedule a debounced push. Safe to call on every mutation — coalesces
  * into a single push per debounce window. No-op if sync disabled.
  */
-export function schedulePush(reason: string, delayMs: number = PUSH_DEBOUNCE_MS): void {
+export function schedulePush(
+  reason: string,
+  delayMs: number = PUSH_DEBOUNCE_MS,
+  opts: { flush?: boolean } = {},
+): void {
   if (pushTimer) clearTimeout(pushTimer)
+  if (opts.flush) pendingPushFlush = true
   pushTimer = setTimeout(() => {
     pushTimer = null
-    void enqueue(() => doPush(reason)).catch((e) =>
+    const flush = pendingPushFlush
+    pendingPushFlush = false
+    void enqueue(() => doPush(reason, { flush })).catch((e) =>
       console.warn(`[mail-organizer] sync push failed (${reason})`, e),
     )
   }, delayMs)
@@ -579,6 +727,11 @@ export type PushResult = {
   truncatedTombstoneCount?: number
   /** True when the cloud already held exactly this content (nothing written). */
   unchanged?: boolean
+  /**
+   * Only hit counters differed from the cloud: the write was postponed to a
+   * coalesced push (2026-11-06). Never set for a flushing push (pushNow).
+   */
+  deferred?: boolean
 }
 
 /**
@@ -589,6 +742,9 @@ export type PushResult = {
  * pushed SyncMeta — used by wipeAllRules so other machines pull, see the
  * unseen marker, and apply the wipe locally. A wipe push never pulls first:
  * it is meant to overwrite the cloud.
+ *
+ * pushNow always FLUSHES (2026-11-06): pending counter-only changes are
+ * written now instead of waiting for the coalesced push.
  */
 export async function pushNow(
   reason: string,
@@ -598,7 +754,19 @@ export async function pushNow(
     clearTimeout(pushTimer)
     pushTimer = null
   }
-  return enqueue(() => doPush(reason, options))
+  pendingPushFlush = false
+  return enqueue(() => doPush(reason, { ...options, flush: true }))
+}
+
+/**
+ * Write any counter-only changes still waiting for their coalesced push
+ * (2026-11-06) — called before sync is switched off, so the last hit counts
+ * of this machine aren't stranded locally. No-op when nothing is pending.
+ */
+export async function flushPendingPush(reason: string): Promise<PushResult | undefined> {
+  const { state } = await readLocalSyncState()
+  if (state.counterPushDueAt === undefined && !pushTimer) return undefined
+  return pushNow(reason)
 }
 
 export type PullResult = {
@@ -636,10 +804,13 @@ export async function pullNow(
  * block UI forever.
  */
 export async function quiesce(): Promise<void> {
-  for (const t of [pushTimer, pullDebounceTimer, tornRetryTimer, pushRetryTimer, startupTimer]) {
+  for (const t of [pushTimer, pullDebounceTimer, tornRetryTimer, pushRetryTimer, startupTimer, counterPushTimer]) {
     if (t) clearTimeout(t)
   }
   pushTimer = pullDebounceTimer = tornRetryTimer = pushRetryTimer = startupTimer = null
+  counterPushTimer = null
+  counterPushArmedFor = undefined
+  pendingPushFlush = false
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<'timeout'>((r) => {
     timer = setTimeout(() => r('timeout'), QUIESCE_TIMEOUT_MS)
@@ -668,12 +839,46 @@ export async function clearCloudState(): Promise<void> {
  * disabled, so re-enabling counts as FIRST participation again: a wipe marker
  * still in the cloud is then recorded as seen, never applied to the library
  * this machine may have built while sync was off.
+ *
+ * Also the rollback of a failed enable (S6, 2026-11-06), with
+ * `keepTornStreak`: a cloud left torn by a vanished machine is only rewritten
+ * once the same torn pushId has been seen for a minute (tornRecoveryAllowed),
+ * so the streak must survive the user's repeated 啟用同步 attempts (S7).
+ * A machine upgraded from v1.0.7 that hasn't completed its first v4 merge
+ * keeps legacyLastSyncAt: that merge is still an upgrade (A1/A4).
  */
-export async function resetSyncParticipation(): Promise<void> {
+export async function resetSyncParticipation(opts: { keepTornStreak?: boolean } = {}): Promise<void> {
   return enqueue(async () => {
-    await writeLocalSyncState({ participating: false })
+    const { state } = await readLocalSyncState()
+    await writeLocalSyncState({
+      participating: false,
+      ...(state.legacyLastSyncAt !== undefined ? { legacyLastSyncAt: state.legacyLastSyncAt } : {}),
+    })
+    if (!opts.keepTornStreak) await chrome.storage.local.remove(SYNC_TORN_STREAK_KEY)
     tornAttempts = 0
     resetPushRetry()
+    disarmCounterPush()
+  })
+}
+
+/**
+ * Sync is being switched ON (2026-11-06, A12): this machine participates
+ * only from now on. A machine that switched sync off under v1.0.7 has no v4
+ * state and a stale settings.lastSyncAt, which used to count as
+ * participation — re-enabling then applied a wipe marker issued while it was
+ * away to the library it built meanwhile. Records non-participation unless a
+ * v4 state already exists (then disable already reset it, or sync is on).
+ * Its old lastSyncAt is kept for one purpose only: its first v4 merge is
+ * still an upgrade (pinned backup; tombstones v3 had processed by then are
+ * not news — see adoptionProtects).
+ */
+export async function beginSyncParticipation(): Promise<void> {
+  return enqueue(async () => {
+    const r = await chrome.storage.local.get(SYNC_LOCAL_STATE_KEY)
+    if (!r[SYNC_LOCAL_STATE_KEY] || typeof r[SYNC_LOCAL_STATE_KEY] !== 'object') {
+      const { lastSyncAt } = await getSettings()
+      await writeLocalSyncState({ participating: false, ...(lastSyncAt ? { legacyLastSyncAt: lastSyncAt } : {}) })
+    }
   })
 }
 
@@ -751,15 +956,16 @@ export async function listBackups(): Promise<SyncBackup[]> {
 async function appendBackup(
   direction: SyncBackup['direction'],
   trigger: NonNullable<SyncBackup['trigger']>,
-  opts: { pinned?: boolean } = {},
+  opts: { pinned?: boolean; withTombstones?: boolean } = {},
 ): Promise<void> {
   // Bug #Q: serialize the read-list / prepend / slice / write sequence so
   // concurrent appendBackup calls can't clobber each other's snapshot.
   return withBackupLock(async () => {
-    const [rules, settings, existing] = await Promise.all([
+    const [rules, settings, existing, tombstones] = await Promise.all([
       listRules(),
       getSettings(),
       listBackups(),
+      opts.withTombstones ? getRuleTombstones() : Promise.resolve([] as RuleTombstone[]),
     ])
     const { claudeApiKey: _omit, ...settingsNoKey } = settings
     void _omit
@@ -772,14 +978,20 @@ async function appendBackup(
       direction,
       trigger,
       ...(opts.pinned ? { pinned: true } : {}),
-      payload: { rules, tombstones: [], settings: settingsNoKey },
+      payload: { rules, tombstones, settings: settingsNoKey },
     }
-    const pinned = opts.pinned ? snapshot : existing.find((b) => b.pinned)
+    // One pinned slot per trigger (a pinned backup from before 2026-11-06
+    // carries no trigger — it was always the pre-wipe one).
+    const slot = (b: SyncBackup) => b.trigger ?? 'remote-wipe'
+    const pinned = [
+      ...(opts.pinned ? [snapshot] : []),
+      ...existing.filter((b) => b.pinned && !(opts.pinned && slot(b) === trigger)),
+    ]
     const rotating = [...(opts.pinned ? [] : [snapshot]), ...existing.filter((b) => !b.pinned)].slice(
       0,
       MAX_BACKUPS,
     )
-    const next = [...(pinned ? [pinned] : []), ...rotating].sort((a, b) =>
+    const next = [...pinned, ...rotating].sort((a, b) =>
       a.snapshotAt < b.snapshotAt ? 1 : a.snapshotAt > b.snapshotAt ? -1 : 0,
     )
     await chrome.storage.local.set({ [SYNC_BACKUPS_KEY]: next })
@@ -787,24 +999,64 @@ async function appendBackup(
 }
 
 /**
+ * The pinned pre-upgrade snapshot (A1/A4). Taken once per machine: a retry
+ * after a first merge that threw must not replace it with a later state.
+ */
+async function appendUpgradeBackupOnce(direction: SyncBackup['direction']): Promise<void> {
+  if ((await listBackups()).some((b) => b.trigger === 'upgrade')) return
+  await appendBackup(direction, 'upgrade', { pinned: true, withTombstones: true })
+}
+
+/** User-facing name of a backup's trigger (Options backup list). */
+export function backupLabel(b: Pick<SyncBackup, 'trigger' | 'direction'>): string {
+  switch (b.trigger) {
+    case 'upgrade':
+      return '升級同步格式前'
+    case 'remote-wipe':
+      return '套用他機全部刪除前'
+    case 'first-enable':
+      return '啟用同步前'
+    case 'replace-pull':
+      return '下載覆蓋前'
+    case 'restore':
+      return '回復備份前'
+    case 'torn-recovery':
+      return '修復雲端資料前'
+    default:
+      return b.direction === 'pre-push' ? '上傳前' : b.direction === 'pre-pull' ? '下載前' : '手動'
+  }
+}
+
+/**
  * Restore a backup by its snapshotAt timestamp. Rules are replaced by the
- * snapshot's (through mutateRules — invariant 8 — with `preserveEditedAt`, so
- * each restored version keeps its own editedAt); settings overlay keeps the
- * local per-device fields.
+ * snapshot's (through mutateRules — invariant 8 — with `preserveEditedAt`:
+ * the stamps below are restore's own); settings overlay keeps the local
+ * per-device fields.
  *
- * Propagation (2026-11-05 — the old docstring claimed "does NOT push" while
- * the local listener pushed 5 s later): the restored library is pushed by the
- * normal debounced path like any local change. Because restored versions keep
- * their editedAt, on other machines they win only where they are still the
- * newest version (e.g. after a remote wipe) — they do not override edits made
- * elsewhere after the snapshot. A restored rule that was DELETED after the
- * snapshot (a tombstone newer than the version) is an explicit un-delete: its
- * tombstone is cleared and it is re-stamped as a fresh edit so the deletion
- * can't suppress it again on the next pull.
+ * Propagation (2026-11-06 — A5): a restore is a rollback the user expects to
+ * hold on EVERY machine, so it is written as a new edit:
+ *   - a restored version that differs from the current one (or whose rule is
+ *     gone here) gets a fresh editedAt, above every known deletion of its
+ *     triple — it wins the next merge everywhere. Keeping the snapshot's own
+ *     editedAt let any newer copy anywhere revert the "已回復" rollback at the
+ *     next pull. A rule identical to the current one keeps that version.
+ *   - a syncable rule that exists now but not in the snapshot is removed
+ *     with a tombstone (tombstoneDeletedAt), so the removal propagates —
+ *     the other machines used to push it right back.
+ *   - tombstones the snapshot carries ('upgrade' / 'first-enable') are
+ *     unioned back, except where a restored rule stands for the triple.
+ * A restored rule whose triple was deleted after the snapshot is an explicit
+ * un-delete: its local tombstones are cleared.
+ *
+ * Restore restores SEMANTIC content only (S2, 2026-11-06): hit counters,
+ * their epoch and lastUsedAt are merged with the current copy like a sync
+ * merge (assignCounters) — never rolled back. The snapshot's lower counts
+ * read as a counter reset against the local baseline, so the sweep judged the
+ * rule's whole pre-v1.0.8 record again and disabled it for high error rate.
  */
 export async function restoreBackup(
   snapshotAt: string,
-): Promise<{ restored: boolean; undeletedCount?: number }> {
+): Promise<{ restored: boolean; undeletedCount?: number; removedCount?: number }> {
   return enqueue(async () => {
     const backups = await listBackups()
     const backup = backups.find((b) => b.snapshotAt === snapshotAt)
@@ -819,26 +1071,63 @@ export async function restoreBackup(
     const restored = (Array.isArray(backup.payload?.rules) ? backup.payload.rules : [])
       .filter((r): r is Rule => !!r && typeof r === 'object' && typeof r.id === 'string')
       .map(applyConfidenceCap)
+    const snapshotTombs = (Array.isArray(backup.payload?.tombstones) ? backup.payload.tombstones : [])
+      .map(sanitizeLegacyTombstone)
+      .filter((t): t is RuleTombstone => t !== null)
     let undeletedCount = 0
+    let removedCount = 0
     await mutateRules(
-      async () => {
-        const newest = newestDeletionByKey(await getRuleTombstones())
+      async (current) => {
+        const localTombs = await getRuleTombstones()
+        const newest = newestDeletionByKey(localTombs)
         const now = Date.now()
-        const clear: RuleTombstone[] = []
+        const restoredKeys = new Set(restored.map(ruleKey))
+        const restoredIds = new Set(restored.map((r) => r.id))
+        const currentById = new Map(current.map((r) => [r.id, r]))
         const next = restored.map((r) => {
-          const d = newest.get(ruleKey(r))
+          const key = ruleKey(r)
+          const d = newest.get(key)
+          const cur = currentById.get(r.id)
+          if (cur && semanticFieldsEqual(cur, r) && (d === undefined || d < ruleTimeMs(cur))) return cur
           // Same predicate as the pull merge's suppression (d >= version time).
-          if (d === undefined || d < ruleTimeMs(r)) return r
-          undeletedCount++
-          clear.push({
-            type: r.type,
-            signalNorm: normalizeSignal(r.type, r.signal),
-            targetFolderPath: r.targetFolderPath,
-            deletedAt: d,
-          })
-          return { ...r, editedAt: Math.max(now, d + 1, (r.editedAt ?? 0) + 1) }
+          if (d !== undefined && d >= ruleTimeMs(r)) undeletedCount++
+          const out: Rule = { ...r }
+          if (cur) assignCounters(out, cur, r)
+          // A restored orphaned rule carries a restore stamp, never a v1.0.8
+          // orphan stamp (S3): record when this machine saw it orphaned.
+          const sameDeadTarget =
+            cur?.orphaned === true &&
+            cur.targetFolderId === out.targetFolderId &&
+            cur.targetFolderPath === out.targetFolderPath
+          if (out.orphaned) out.orphanedAt = sameDeadTarget ? (cur!.orphanedAt ?? now) : now
+          else delete out.orphanedAt
+          out.editedAt = Math.max(now, (cur?.editedAt ?? 0) + 1, (r.editedAt ?? 0) + 1, (d ?? 0) + 1)
+          return out
         })
+        // Un-delete: every local tombstone of a restored triple goes (legacy
+        // spellings included — matched by canonical key).
+        const clear = localTombs.filter((t) => restoredKeys.has(tombstoneKey(t)))
         if (clear.length > 0) await clearMatchingTombstones(clear)
+        // Removals + the snapshot's own tombstones, never for a triple a
+        // restored rule stands for — each kept unless a known deletion
+        // already deletes everything it deletes, at least as late (round 3:
+        // per spelling; newest-per-triple dropped the other twin's spelling).
+        const known = groupTombstonesByKey(localTombs)
+        const add: RuleTombstone[] = []
+        const offer = (t: RuleTombstone) => {
+          const k = tombstoneKey(t)
+          if (restoredKeys.has(k) || coversDeletion(known.get(k), t)) return
+          add.push(t)
+          known.set(k, [...(known.get(k) ?? []), t])
+        }
+        for (const t of [...snapshotTombs].sort((a, b) => b.deletedAt - a.deletedAt)) offer(t)
+        for (const r of current) {
+          if (restoredIds.has(r.id) || !SYNCABLE_SOURCES.has(r.source)) continue
+          if (restoredKeys.has(ruleKey(r))) continue
+          removedCount++
+          offer(ruleTombstone(r, now))
+        }
+        if (add.length > 0) await addRuleTombstones(add)
         return { next, result: undefined }
       },
       { preserveEditedAt: true },
@@ -851,7 +1140,7 @@ export async function restoreBackup(
     if (backupError) {
       await recordSyncError({ source: 'pull', reason: `backup failed before restore (restore continued): ${backupError}` })
     }
-    return { restored: true, undeletedCount }
+    return { restored: true, undeletedCount, removedCount }
   })
 }
 
@@ -861,6 +1150,8 @@ async function readLocalSyncState(): Promise<{ state: SyncLocalState; legacyLast
   const r = await chrome.storage.local.get(SYNC_LOCAL_STATE_KEY)
   const raw = r[SYNC_LOCAL_STATE_KEY] as Partial<SyncLocalState> | undefined
   if (raw && typeof raw === 'object') {
+    const foreign =
+      raw.foreignSettings && typeof raw.foreignSettings === 'object' ? raw.foreignSettings : undefined
     return {
       state: {
         participating: raw.participating === true,
@@ -869,17 +1160,46 @@ async function readLocalSyncState(): Promise<{ state: SyncLocalState; legacyLast
         ...(raw.settingsBase && typeof raw.settingsBase === 'object'
           ? { settingsBase: raw.settingsBase }
           : {}),
+        ...(raw.v4Adopted === true ? { v4Adopted: true } : {}),
+        ...(typeof raw.legacyLastSyncAt === 'string' ? { legacyLastSyncAt: raw.legacyLastSyncAt } : {}),
+        ...(foreign && Object.keys(foreign).length > 0 ? { foreignSettings: foreign } : {}),
+        ...(typeof raw.counterPushDueAt === 'number' && Number.isFinite(raw.counterPushDueAt)
+          ? { counterPushDueAt: raw.counterPushDueAt }
+          : {}),
       },
+      ...(typeof raw.legacyLastSyncAt === 'string' ? { legacyLastSyncAt: raw.legacyLastSyncAt } : {}),
     }
   }
-  // Absent → first run of this build. A machine that already synced under
+  // Absent → first run of this build with sync on (enabling sync writes a
+  // state first — beginSyncParticipation). A machine that was syncing under
   // v1.0.7 is a participant; its lastSyncAt decides (once) whether the wipe
   // marker currently in the cloud is one it has already applied — the v3
-  // rule, kept only for this one transition decision.
+  // rule, kept only for this one transition — and which tombstones v3 had
+  // already processed (adoptionProtects). It is carried in the state until
+  // the first v4 merge.
   const settings = await getSettings()
   return settings.lastSyncAt
-    ? { state: { participating: true }, legacyLastSyncAt: settings.lastSyncAt }
+    ? {
+        state: { participating: true, legacyLastSyncAt: settings.lastSyncAt },
+        legacyLastSyncAt: settings.lastSyncAt,
+      }
     : { state: { participating: false } }
+}
+
+/**
+ * Has this machine's library been through its first-participation merge?
+ * States written by v1.0.8 carry no flag: a participating one that already
+ * merged or pushed (lastMergedPushId) has been merging under v4 all along.
+ */
+function isAdopted(state: SyncLocalState): boolean {
+  return state.v4Adopted === true || (state.participating && state.lastMergedPushId !== undefined)
+}
+
+/** State after the adoption merge: adopted, the v3 transition data dropped. */
+function adoptedState(state: SyncLocalState): SyncLocalState {
+  const { legacyLastSyncAt: _drop, ...rest } = state
+  void _drop
+  return { ...rest, v4Adopted: true }
 }
 
 async function writeLocalSyncState(state: SyncLocalState): Promise<void> {
@@ -963,6 +1283,8 @@ export type PushPayloadInput = {
   prevMeta?: SyncMeta
   /** A FRESH marker for a wipe push; otherwise the previous one is carried. */
   wipeMarker?: NormalizedWipeMarker
+  /** The stale-sweep active-day ledger ('YYYY-MM-DD'); optional (older callers / tests). */
+  activeDays?: readonly string[]
   updatedAt: string
   pushId: string
   now: number
@@ -973,7 +1295,42 @@ export type PushPayload = {
   writes: Record<string, unknown>
   plan: SyncPayloadPlan
   contentHash: string
+  /** Content minus hit counters (see SyncMeta.semanticHash). */
+  semanticHash: string
+  /**
+   * contentHash as v1.0.8 computes it for the same content (S10): rows
+   * without `sr`, tombstones without their spelling entry — the fields a
+   * v1.0.8 machine drops when it re-pushes what it merged. Equal to
+   * contentHash when this push carries none of them.
+   */
+  v108ContentHash: string
+  daysHash: string
   truncatedActivityCount: number
+}
+
+/** Full rows without their hit counters (m / o / lu) — the semanticHash input. */
+function withoutCounters(rows: readonly WireRuleEntry[]): unknown[] {
+  return rows.map((e) => {
+    if (Array.isArray(e)) return e
+    const { m: _m, o: _o, lu: _lu, ...rest } = e
+    void _m
+    void _o
+    void _lu
+    return rest
+  })
+}
+
+/**
+ * Folder activity as semanticHash sees it (S9, 2026-11-06): which folders
+ * are in the synced list, not their metrics. Every batch rewrites
+ * lastActiveAt / recentCount / lastBatchAt / latestMessage of the folders it
+ * filed into, which kept batch pushes immediate (~88 KB each) despite the
+ * counter coalescing; such metric-only changes now wait for the coalesced
+ * push like hit counters. A folder entering or leaving the list (or renamed)
+ * still pushes at once.
+ */
+function activityMembership(items: readonly FolderActivity[]): Array<[string, string]> {
+  return items.map((e) => [e.folderId, e.folderPath])
 }
 
 function buildMeta(
@@ -981,6 +1338,7 @@ function buildMeta(
   hash: string,
   counts: { rows: number; folders: number; tombs: number; activity: number },
   totals: { rules: number; stubs: number; tombs: number; activity: number },
+  extra: { semanticHash: string; daysHash: string },
 ): SyncMeta {
   // #6: extend the recentPushes log with this push's entry; each machine
   // keeps one (its latest). Bug #V: Array.isArray guards a malformed cloud.
@@ -1002,6 +1360,8 @@ function buildMeta(
     updatedAt: input.updatedAt,
     pushId: input.pushId,
     contentHash: hash,
+    semanticHash: extra.semanticHash,
+    daysHash: extra.daysHash,
     ruleCount: totals.rules,
     disabledStubCount: totals.stubs,
     tombstoneCount: totals.tombs,
@@ -1032,7 +1392,17 @@ function buildMeta(
 export function buildPushPayload(input: PushPayloadInput): PushPayload {
   const { pushId } = input
   const settingsToSync = stripPerDeviceSettings(input.settings)
-  const settingsValue = { p: pushId, v: settingsToSync }
+  // The active-day ledger rides in the settings item as `d` (2026-11-06): it
+  // carries the pushId check like every other item, and a v1.0.8 reader only
+  // looks at `p` / `v`. Dropped (never the settings) if the item would grow
+  // past one chunk.
+  let days = encodeActiveDays(input.activeDays ?? [], ACTIVE_DAYS_CAP)
+  let settingsValue: { p: string; v: typeof settingsToSync; d?: number[] } =
+    days.length > 0 ? { p: pushId, v: settingsToSync, d: days } : { p: pushId, v: settingsToSync }
+  if (days.length > 0 && writeBytes(V4_SETTINGS_KEY, settingsValue) > CHUNK_BYTE_TARGET) {
+    days = []
+    settingsValue = { p: pushId, v: settingsToSync }
+  }
   // chunkFolderActivity already truncates to FOLDER_ACTIVITY_SYNC_CAP=20; the
   // chunk cap is defense-in-depth against one huge entry.
   const allActivityChunks = chunkFolderActivity(input.folderActivity, pushId)
@@ -1043,12 +1413,13 @@ export function buildPushPayload(input: PushPayloadInput): PushPayload {
 
   // Size the meta with worst-case counts (digits only grow it slightly).
   const big = { rows: 99, folders: 99, tombs: 99, activity: 99 }
-  const metaUpperBound = buildMeta(input, 'x'.repeat(12), big, {
-    rules: 99999,
-    stubs: 99999,
-    tombs: 99999,
-    activity: 99999,
-  })
+  const metaUpperBound = buildMeta(
+    input,
+    'x'.repeat(12),
+    big,
+    { rules: 99999, stubs: 99999, tombs: 99999, activity: 99999 },
+    { semanticHash: 'x'.repeat(12), daysHash: 'x'.repeat(12) },
+  )
   let fixedBytes =
     writeBytes(V4_SETTINGS_KEY, settingsValue) + writeBytes(SYNC_META_KEY, metaUpperBound)
   for (const c of activityChunks) fixedBytes += writeBytes(`${V4_ACTIVITY_PREFIX}${c.index}`, c)
@@ -1058,16 +1429,44 @@ export function buildPushPayload(input: PushPayloadInput): PushPayload {
     tombstones: input.tombstones,
     budgetBytes: SYNC_TOTAL_BUDGET_BYTES - fixedBytes,
     tombstoneShareBytes: Math.floor(SYNC_TOMBSTONE_BUDGET_SHARE * SYNC_TOTAL_BUDGET_BYTES),
+    recentTombstoneShareBytes: Math.floor(SYNC_RECENT_TOMBSTONE_BUDGET_SHARE * SYNC_TOTAL_BUDGET_BYTES),
     pushId,
     keyPrefix: { rows: V4_ROWS_PREFIX, folders: V4_FOLDERS_PREFIX, tombs: V4_TOMBS_PREFIX },
     now: input.now,
   })
 
   // Fingerprint of the CONTENT only (no pushId / times): equal content →
-  // equal hash, so an echo push after a pull can be skipped.
+  // equal hash, so an echo push after a pull can be skipped. Same formula as
+  // v1.0.8 (the ledger has its own daysHash), so echo detection keeps working
+  // across the two versions.
   const hash = contentHash(
     JSON.stringify([plan.rows, plan.folders, plan.tombstones, activityItems, settingsToSync]),
   )
+  const semanticHash = contentHash(
+    JSON.stringify([
+      withoutCounters(plan.rows),
+      plan.folders,
+      plan.tombstones,
+      activityMembership(activityItems),
+      settingsToSync,
+    ]),
+  )
+  // S10: what a v1.0.8 peer's push of this very content would hash to.
+  const hasSr = plan.rows.some((e) => !Array.isArray(e) && (e as CompactRuleRow).sr !== undefined)
+  const hasSpelling = plan.tombstones.some((t) => t.length > 4)
+  const v108ContentHash =
+    hasSr || hasSpelling
+      ? contentHash(
+          JSON.stringify([
+            hasSr ? plan.rows.map(withoutV109RowFields) : plan.rows,
+            plan.folders,
+            hasSpelling ? tombstonesAsV108Keeps(plan.tombstones) : plan.tombstones,
+            activityItems,
+            settingsToSync,
+          ]),
+        )
+      : hash
+  const daysHash = contentHash(JSON.stringify(days))
   const meta = buildMeta(
     input,
     hash,
@@ -1083,6 +1482,7 @@ export function buildPushPayload(input: PushPayloadInput): PushPayload {
       tombs: plan.tombstones.length,
       activity: activityItems.length,
     },
+    { semanticHash, daysHash },
   )
   const writes: Record<string, unknown> = {
     [SYNC_META_KEY]: meta,
@@ -1092,7 +1492,37 @@ export function buildPushPayload(input: PushPayloadInput): PushPayload {
   for (const c of plan.folderChunks) writes[`${V4_FOLDERS_PREFIX}${c.index}`] = c
   for (const c of plan.tombChunks) writes[`${V4_TOMBS_PREFIX}${c.index}`] = c
   for (const c of activityChunks) writes[`${V4_ACTIVITY_PREFIX}${c.index}`] = c
-  return { meta, writes, plan, contentHash: hash, truncatedActivityCount }
+  return { meta, writes, plan, contentHash: hash, semanticHash, v108ContentHash, daysHash, truncatedActivityCount }
+}
+
+/**
+ * Tombstone rows as a v1.0.8 machine re-pushes them after merging: no
+ * spelling entry, and ONE row per stored triple — the newest; it keeps one
+ * tombstone per triple (round 3: this build may push one per spelling).
+ * Chunk order is preserved (a triple's rows are adjacent).
+ */
+function tombstonesAsV108Keeps(rows: readonly CompactTombstone[]): CompactTombstone[] {
+  const out: CompactTombstone[] = []
+  let lastKey: string | undefined
+  for (const t of rows) {
+    const key = JSON.stringify([t[0], t[1], t[2]])
+    const row: CompactTombstone = [t[0], t[1], t[2], t[3]]
+    if (key === lastKey) {
+      if (t[3] > out[out.length - 1]![3]) out[out.length - 1] = row
+    } else {
+      out.push(row)
+      lastKey = key
+    }
+  }
+  return out
+}
+
+/** A row as a v1.0.8 encoder writes the same rule: no `sr` (key order otherwise identical). */
+function withoutV109RowFields(e: WireRuleEntry): WireRuleEntry {
+  if (Array.isArray(e) || (e as CompactRuleRow).sr === undefined) return e
+  const { sr: _sr, ...rest } = e as CompactRuleRow
+  void _sr
+  return rest
 }
 
 /** Every key the cloud state described by `meta` occupies. */
@@ -1134,7 +1564,10 @@ function classifyStorageError(msg: string): StorageErrorKind {
 
 // ---- push ----------------------------------------------------------------------
 
-async function doPush(reason: string, options: { wipeMarker?: boolean } = {}): Promise<PushResult> {
+async function doPush(
+  reason: string,
+  options: { wipeMarker?: boolean; flush?: boolean } = {},
+): Promise<PushResult> {
   try {
     return await doPushInner(reason, options)
   } catch (e) {
@@ -1181,13 +1614,18 @@ async function refuseNewerCloud(meta: SyncMeta): Promise<PushResult> {
   return { pushed: false, reason }
 }
 
-async function doPushInner(reason: string, options: { wipeMarker?: boolean }): Promise<PushResult> {
+async function doPushInner(
+  reason: string,
+  options: { wipeMarker?: boolean; flush?: boolean },
+): Promise<PushResult> {
   const settings = await getSettings()
   if (!settings.syncEnabled) return { pushed: false, reason: 'sync disabled' }
   let cloudMeta = await readSyncMeta()
   if (cloudMeta && newerThanUs(cloudMeta)) return refuseNewerCloud(cloudMeta)
   const machineId = await ensureMachineId()
   let { state } = await readLocalSyncState()
+  // A6 (2026-11-06): the cloud stayed torn under one pushId — rewrite it.
+  let recovering = false
 
   // Pull before push (item 2, 2026-11-05) whenever the cloud holds a state
   // this machine hasn't merged — the first push after SW start, after a
@@ -1204,10 +1642,28 @@ async function doPushInner(reason: string, options: { wipeMarker?: boolean }): P
         schedulePushRetry('other')
         return { pushed: false, reason: 'cloud kept changing during pull-before-push; retry scheduled' }
       }
-      const pr = await doPull(`pre-push:${reason}`, { mode: 'union', source: 'pull' })
+      // A first-participation merge (an enable's push path, S7) snapshots
+      // local state first, like the enable's own pull does.
+      const pr = await doPull(`pre-push:${reason}`, { mode: 'union', source: 'pull', backup: !state.participating })
       if (!pr.pulled) {
         if (pr.reason === 'no cloud state') {
           cloudMeta = undefined
+          break
+        }
+        // A6: a snapshot torn under the SAME pushId for many reads and over a
+        // minute is not a push in flight — its owner is gone or can't repair
+        // it, and every other machine was locked out of pushing (立即上傳
+        // included). Back up, then rewrite the cloud from local; the other
+        // machines union-merge it and push their own rules back.
+        if (pr.torn && (await tornRecoveryAllowed(machineId))) {
+          try {
+            await appendBackup('pre-push', 'torn-recovery')
+          } catch (e) {
+            console.warn('[mail-organizer] backup before torn-cloud recovery failed (recovery continues)', e)
+          }
+          recovering = true
+          cloudMeta = (await readSyncMeta()) ?? cloudMeta
+          state = (await readLocalSyncState()).state
           break
         }
         schedulePushRetry('other')
@@ -1224,15 +1680,27 @@ async function doPushInner(reason: string, options: { wipeMarker?: boolean }): P
     }
   }
 
+  // Adoption (2026-11-06) when this machine's first v4 operation is a push
+  // (nothing in the cloud to merge, or a torn one): protect its own library
+  // the way a first merge would — before it is uploaded and then merged back.
+  if (!isAdopted(state)) {
+    if (!options.wipeMarker) await adoptLocalLibrary(state)
+    state = adoptedState(state)
+    await writeLocalSyncState(state)
+  }
+
   // Read local state AFTER the pull: it may have merged rules and overlaid
   // the other machine's settings, which must not be pushed back stale.
-  const [rules, tombstones, folderActivity, pushSettings] = await Promise.all([
+  const [rules, tombstones, folderActivity, pushSettings, activeDays] = await Promise.all([
     listRules(),
     getRuleTombstones(),
     getFolderActivity(),
     getSettings(),
+    getActiveDays(),
   ])
   if (!pushSettings.syncEnabled) return { pushed: false, reason: 'sync disabled' }
+  // A13: a synced value this build can't represent goes back out unchanged.
+  const outgoing = applyForeignSettings(pushSettings, state.foreignSettings)
   const updatedAt = new Date().toISOString()
   const pushId = randomId()
   const freshMarker = options.wipeMarker
@@ -1243,7 +1711,8 @@ async function doPushInner(reason: string, options: { wipeMarker?: boolean }): P
     rules,
     tombstones,
     folderActivity,
-    settings: pushSettings,
+    settings: outgoing.settings,
+    activeDays,
     prevMeta: cloudMeta,
     wipeMarker: freshMarker,
     updatedAt,
@@ -1268,26 +1737,78 @@ async function doPushInner(reason: string, options: { wipeMarker?: boolean }): P
     ...extra,
   })
 
+  const localBase = stripPerDeviceSettings(pushSettings) as Record<string, unknown>
+  // S10 (2026-11-06): the cloud was last written by a v1.0.8 peer (its meta
+  // has no semanticHash) and holds exactly this content minus what v1.0.8
+  // drops when it re-pushes a merge (rows' `sr`, tombstone spellings) —
+  // i.e. our own last push as that peer echoed it. Re-pushing changes
+  // nothing for it and only provokes its next echo.
+  const sameAsV108Echo =
+    cloudMeta !== undefined &&
+    cloudMeta.semanticHash === undefined &&
+    cloudMeta.contentHash === payload.v108ContentHash
+  // The cloud's own items must actually carry its meta's pushId before we
+  // trust its hashes (A6, 2026-11-06): the owner of a meta whose chunks were
+  // overwritten by another push used to skip its repair push as "unchanged".
+  const comparable =
+    !freshMarker &&
+    !recovering &&
+    cloudMeta !== undefined &&
+    cloudMeta.schemaVersion === SYNC_SCHEMA_VERSION &&
+    (cloudMeta.contentHash === payload.contentHash ||
+      cloudMeta.semanticHash === payload.semanticHash ||
+      sameAsV108Echo) &&
+    (await snapshotIntact(cloudMeta))
+  // A first-time participant that writes without having pulled (torn-cloud
+  // recovery, S7) records the wipe marker its push carries forward as seen —
+  // F1: never applied to the library it joined with.
+  const carriedMarker = state.participating ? undefined : normalizeWipeMarker(cloudMeta?.wipeMarker)
+
+  // The active-day ledger (A14) forces a push only when this machine knows a
+  // day the cloud lacks: a day it merely LACKS (e.g. a far-future day from a
+  // skewed peer that its decoder drops) must never make every follow-up push
+  // differ — that would ping-pong. A meta from an older build has no ledger:
+  // the days then ride along with the next real push.
+  const daysNews = comparable && (await ledgerHasNews(cloudMeta!, payload.daysHash, activeDays))
+
   // No-op push: the cloud already holds exactly this content (typically the
   // echo of a pull). Skipping it is what makes deferring every local change
   // during a pull safe — echoes cost nothing and can't ping-pong.
-  if (
-    !freshMarker &&
-    cloudMeta &&
-    cloudMeta.schemaVersion === SYNC_SCHEMA_VERSION &&
-    cloudMeta.contentHash === payload.contentHash
-  ) {
-    if (!state.participating || state.lastMergedPushId !== cloudMeta.pushId || !state.settingsBase) {
+  if (comparable && !daysNews && (cloudMeta!.contentHash === payload.contentHash || sameAsV108Echo)) {
+    if (
+      !state.participating ||
+      state.lastMergedPushId !== cloudMeta!.pushId ||
+      !state.settingsBase ||
+      state.counterPushDueAt !== undefined ||
+      !sameForeign(state.foreignSettings, outgoing.foreign)
+    ) {
       await writeLocalSyncState({
-        ...state,
+        ...withoutCounterPush(state),
         participating: true,
-        lastMergedPushId: cloudMeta.pushId,
-        settingsBase: stripPerDeviceSettings(pushSettings) as Record<string, unknown>,
+        lastMergedPushId: cloudMeta!.pushId,
+        settingsBase: localBase,
+        ...foreignField(outgoing.foreign),
+        ...(carriedMarker ? { lastSeenWipeId: carriedMarker.id } : {}),
       })
     }
+    if (state.counterPushDueAt !== undefined || counterPushTimer) disarmCounterPush()
     await clearSyncError()
     resetPushRetry()
     return result({ unchanged: true })
+  }
+
+  // Counter-only change (2026-11-06): the cloud differs from local only in
+  // hit counters — postpone the ~88 KB rewrite to one coalesced push per
+  // SYNC_COUNTER_PUSH_COALESCE_MS. Anything semantic (rules, tombstones,
+  // settings, folder activity) changes semanticHash and pushes now, as does
+  // a new active day; so do 立即上傳 and every other pushNow (flush).
+  if (comparable && !daysNews && !options.flush && cloudMeta!.semanticHash === payload.semanticHash) {
+    const dueAt = state.counterPushDueAt ?? Date.now() + SYNC_COUNTER_PUSH_COALESCE_MS
+    if (state.counterPushDueAt === undefined) await writeLocalSyncState({ ...state, counterPushDueAt: dueAt })
+    armCounterPush(dueAt)
+    await clearSyncError()
+    resetPushRetry()
+    return { pushed: false, deferred: true, reason: 'counter-only changes deferred' }
   }
 
   // Orphans: keys the previous cloud state occupied that this push doesn't
@@ -1364,17 +1885,175 @@ async function doPushInner(reason: string, options: { wipeMarker?: boolean }): P
     fullOrphanScanDone = true
   }
 
+  const seenMarker = freshMarker ?? carriedMarker
   await writeLocalSyncState({
-    ...state,
+    ...withoutCounterPush(state),
     participating: true,
     lastMergedPushId: pushId,
-    settingsBase: stripPerDeviceSettings(pushSettings) as Record<string, unknown>,
-    ...(freshMarker ? { lastSeenWipeId: freshMarker.id } : {}),
+    settingsBase: localBase,
+    ...foreignField(outgoing.foreign),
+    ...(seenMarker ? { lastSeenWipeId: seenMarker.id } : {}),
   })
+  if (state.counterPushDueAt !== undefined || counterPushTimer) disarmCounterPush()
+  if (recovering) await chrome.storage.local.remove(SYNC_TORN_STREAK_KEY)
   await setSettings({ lastSyncAt: updatedAt })
   await clearSyncError()
   resetPushRetry()
   return result()
+}
+
+/** `state` minus a pending counter push (a push just carried the counters). */
+function withoutCounterPush(state: SyncLocalState): SyncLocalState {
+  const { counterPushDueAt: _drop, ...rest } = state
+  void _drop
+  return rest
+}
+
+type ForeignSettings = NonNullable<SyncLocalState['foreignSettings']>
+
+/** `{ foreignSettings }` when there is any, else an explicit removal. */
+function foreignField(f: ForeignSettings | undefined): { foreignSettings?: ForeignSettings } {
+  return f && Object.keys(f).length > 0 ? { foreignSettings: f } : { foreignSettings: undefined }
+}
+
+function sameForeign(a: ForeignSettings | undefined, b: ForeignSettings | undefined): boolean {
+  return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {})
+}
+
+/**
+ * Can this build hold the synced value `v` of setting `k` as is? (A13,
+ * 2026-11-06) sanitizeSettings maps an unknown claudeModel — e.g. one a newer
+ * peer offers — to the default, so adopting it would really adopt the
+ * default, and the next push would bounce that default back to the peer.
+ */
+function isAdoptableSetting(k: string, v: unknown): boolean {
+  return k !== 'claudeModel' || isKnownClaudeModel(v)
+}
+
+/**
+ * The settings a push sends: local values, except a synced value this build
+ * couldn't adopt (foreignSettings) goes back out unchanged while the local
+ * value is still the one it had then. A local change since drops the record —
+ * the user's own choice is pushed instead.
+ */
+function applyForeignSettings(
+  local: Settings,
+  foreign: ForeignSettings | undefined,
+): { settings: Partial<Settings>; foreign?: ForeignSettings } {
+  if (!foreign || Object.keys(foreign).length === 0) return { settings: local }
+  const out: Record<string, unknown> = { ...local }
+  const kept: ForeignSettings = {}
+  for (const [k, f] of Object.entries(foreign)) {
+    if (!f || typeof f !== 'object') continue
+    if (JSON.stringify(out[k]) === JSON.stringify(f.local)) {
+      out[k] = f.cloud
+      kept[k] = f
+    }
+  }
+  return { settings: out as Partial<Settings>, ...(Object.keys(kept).length > 0 ? { foreign: kept } : {}) }
+}
+
+/**
+ * Does every item `meta` references carry its pushId? (A6.) Legacy metas
+ * can't be checked (no pushId) and count as intact; so does a meta that
+ * changed meanwhile — the change brings its own pull.
+ */
+async function snapshotIntact(meta: SyncMeta): Promise<boolean> {
+  if (meta.schemaVersion < 4 || !meta.v4 || typeof meta.pushId !== 'string' || !meta.pushId) return true
+  const keys = keysOfMeta(meta)
+  const stored = await chrome.storage.sync.get([SYNC_META_KEY, ...keys])
+  const fresh = stored[SYNC_META_KEY] as SyncMeta | undefined
+  if (!fresh || fresh.pushId !== meta.pushId) return true
+  return keys.every((k) => {
+    const item = stored[k] as { p?: unknown } | undefined
+    return !!item && typeof item === 'object' && item.p === meta.pushId
+  })
+}
+
+/**
+ * Does this machine know an active day the cloud's ledger lacks? (A14)
+ * Free when the fingerprints agree; otherwise reads the cloud's settings
+ * item. An older writer (no daysHash) never forces a push for the ledger.
+ */
+async function ledgerHasNews(meta: SyncMeta, daysHash: string, localDays: readonly string[]): Promise<boolean> {
+  if (meta.daysHash === undefined || meta.daysHash === daysHash || localDays.length === 0) return false
+  const item = (await chrome.storage.sync.get(V4_SETTINGS_KEY))[V4_SETTINGS_KEY] as
+    | { p?: unknown; d?: unknown }
+    | undefined
+  if (!item || item.p !== meta.pushId) return false // changed meanwhile — that change brings a pull
+  const cloudDays = new Set(decodeActiveDays(item.d, Number.POSITIVE_INFINITY))
+  const ours = decodeActiveDays(encodeActiveDays(localDays, ACTIVE_DAYS_CAP), Number.POSITIVE_INFINITY)
+  return ours.some((d) => !cloudDays.has(d))
+}
+
+async function readTornStreak(): Promise<TornStreak | undefined> {
+  const r = await chrome.storage.local.get(SYNC_TORN_STREAK_KEY)
+  const s = r[SYNC_TORN_STREAK_KEY] as Partial<TornStreak> | undefined
+  return s && typeof s.pushId === 'string' && typeof s.count === 'number' && typeof s.firstAt === 'number'
+    ? (s as TornStreak)
+    : undefined
+}
+
+/** Count one more torn read of `pushId` (a different pushId restarts the streak). */
+async function noteTornRead(pushId: string): Promise<void> {
+  const cur = await readTornStreak()
+  const next: TornStreak =
+    cur && cur.pushId === pushId
+      ? { ...cur, count: cur.count + 1 }
+      : { pushId, count: 1, firstAt: Date.now() }
+  await chrome.storage.local.set({ [SYNC_TORN_STREAK_KEY]: next })
+}
+
+/**
+ * May a push rewrite the torn cloud? Only when the CURRENT meta's pushId has
+ * read torn at least SYNC_TORN_RECOVERY_MIN_READS times over at least
+ * SYNC_TORN_RECOVERY_MIN_MS — a push still being delivered heals in seconds —
+ * and the meta carries no wipe this machine still has to act on (the
+ * rewrite would re-upload what that wipe removes).
+ */
+async function tornRecoveryAllowed(machineId: string): Promise<boolean> {
+  const meta = await readSyncMeta()
+  if (!meta || typeof meta.pushId !== 'string' || !meta.pushId) return false
+  const streak = await readTornStreak()
+  if (!streak || streak.pushId !== meta.pushId) return false
+  if (streak.count < SYNC_TORN_RECOVERY_MIN_READS) return false
+  if (Date.now() - streak.firstAt < SYNC_TORN_RECOVERY_MIN_MS) return false
+  const { state } = await readLocalSyncState()
+  const marker = normalizeWipeMarker(meta.wipeMarker)
+  if (marker && marker.id !== state.lastSeenWipeId && marker.byMachineId !== machineId && state.participating) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Adoption without a cloud to merge (push path): the first-participation
+ * protections of mergeCloudIntoLocal against this machine's own tombstones,
+ * after the 'upgrade' backup for a machine that synced under v1.0.7.
+ */
+async function adoptLocalLibrary(state: SyncLocalState): Promise<void> {
+  if (state.legacyLastSyncAt !== undefined) {
+    try {
+      await appendUpgradeBackupOnce('pre-push')
+    } catch (e) {
+      console.warn('[mail-organizer] upgrade backup failed (sync continues)', e)
+    }
+  }
+  await mutateRules(
+    async (existing) => {
+      const res = mergeCloudIntoLocal({
+        local: existing,
+        localTombstones: await getRuleTombstones(),
+        cloudRules: [],
+        cloudStubs: [],
+        cloudTombstones: [],
+        mode: 'union',
+        adoption: { processedBeforeMs: parseTime(state.legacyLastSyncAt) },
+      })
+      return { next: res.next, result: undefined }
+    },
+    { preserveEditedAt: true },
+  )
 }
 
 // ---- pull ------------------------------------------------------------------------
@@ -1430,6 +2109,8 @@ type CloudSnapshot = {
   tombstones: RuleTombstone[]
   activity: FolderActivity[]
   settings?: Record<string, unknown>
+  /** The pusher's active-day ledger (v4 settings item `d`, 2026-11-06); [] when absent. */
+  activeDays: string[]
   /** Rows dropped by the decoder, or chunks missing from a partial legacy read. */
   imperfect: boolean
 }
@@ -1496,7 +2177,7 @@ async function readCloudSnapshot(meta: SyncMeta, allowPartialLegacy: boolean): P
     const folders = collect<unknown>(folderKeys)
     const tombs = collect<unknown>(tombKeys)
     const activity = collect<unknown>(activityKeys)
-    const settingsItem = stored[V4_SETTINGS_KEY] as { p?: unknown; v?: unknown } | undefined
+    const settingsItem = stored[V4_SETTINGS_KEY] as { p?: unknown; v?: unknown; d?: unknown } | undefined
     for (const part of [rows, folders, tombs, activity]) {
       if (typeof part === 'string') {
         return { ok: false, reason: `cloud snapshot incomplete: ${part} missing or from another push` }
@@ -1527,6 +2208,7 @@ async function readCloudSnapshot(meta: SyncMeta, allowPartialLegacy: boolean): P
           settingsItem.v && typeof settingsItem.v === 'object'
             ? (settingsItem.v as Record<string, unknown>)
             : undefined,
+        activeDays: decodeActiveDays(settingsItem.d),
         imperfect: decoded.skipped > 0 || badTombs > 0,
       },
     }
@@ -1591,6 +2273,7 @@ async function readCloudSnapshot(meta: SyncMeta, allowPartialLegacy: boolean): P
       activity: sanitizeActivity(unchunkArray(chunks(activityKeys))),
       settings:
         settingsRaw && typeof settingsRaw === 'object' ? (settingsRaw as Record<string, unknown>) : undefined,
+      activeDays: [],
       imperfect: skipped > 0 || missing.length > 0,
     },
   }
@@ -1631,6 +2314,10 @@ async function doPullInner(opts: {
   }
   if (!snap.ok) {
     tornAttempts++
+    // A6: the streak survives SW restarts — see tornRecoveryAllowed.
+    if (typeof meta.pushId === 'string' && meta.pushId) {
+      await noteTornRead(meta.pushId).catch(() => {})
+    }
     if (tornAttempts >= SYNC_TORN_RETRY_MAX_ATTEMPTS) {
       await recordSyncError({ source: opts.source, reason: snap.reason })
     }
@@ -1642,6 +2329,7 @@ async function doPullInner(opts: {
     clearTimeout(tornRetryTimer)
     tornRetryTimer = null
   }
+  if (await readTornStreak()) await chrome.storage.local.remove(SYNC_TORN_STREAK_KEY)
   const cloud = snap.value
   // An imperfect snapshot (skipped rows, missing legacy chunks) may not
   // delete anything a full one would have kept.
@@ -1649,6 +2337,9 @@ async function doPullInner(opts: {
 
   const { state, legacyLastSyncAt } = await readLocalSyncState()
   const nextState: SyncLocalState = { ...state }
+  // First merge since sync was (re-)enabled — or the first v4 merge of a
+  // machine upgraded from v1.0.7 (A1, 2026-11-06).
+  const adopting = !isAdopted(state)
 
   // Item 6: a wipe marker is acted on at most once, by id.
   //   - our own marker → record only (echo guard)
@@ -1664,12 +2355,22 @@ async function doPullInner(opts: {
     nextState.lastSeenWipeId = marker.id
   }
 
-  // Item 8: back up only before merges that can destroy local state.
+  // Item 8: back up only before merges that can destroy local state. A1/A4
+  // (2026-11-06): the first v4 merge of a machine that synced under v1.0.7
+  // is one of them — its rules carry no editedAt (ties go to the cloud) and
+  // there is no settings base (every cloud value wins) — so it gets a pinned
+  // 「升級同步格式前」 snapshot, tombstones included; so does a first-enable
+  // merge (the other first contact).
   let backupError: string | undefined
-  if (applyWipe || mode === 'replace' || opts.backup) {
+  const upgradeBackup = adopting && legacyLastSyncAt !== undefined
+  if (applyWipe || mode === 'replace' || opts.backup || upgradeBackup) {
     try {
+      if (upgradeBackup) await appendUpgradeBackupOnce('pre-pull')
       if (applyWipe) await appendBackup('pre-pull', 'remote-wipe', { pinned: true })
-      else await appendBackup('pre-pull', mode === 'replace' ? 'replace-pull' : 'first-enable')
+      else if (mode === 'replace') await appendBackup('pre-pull', 'replace-pull')
+      else if (opts.backup && !upgradeBackup) {
+        await appendBackup('pre-pull', 'first-enable', { withTombstones: true })
+      }
     } catch (e) {
       backupError = errorMessage(e)
       console.warn('[mail-organizer] sync backup failed (sync continues)', e)
@@ -1722,6 +2423,7 @@ async function doPullInner(opts: {
         cloudStubs: cloud.stubs,
         cloudTombstones: cloud.tombstones,
         mode,
+        ...(adopting ? { adoption: { processedBeforeMs: parseTime(legacyLastSyncAt) } } : {}),
       })
       if (res.newTombstones.length > 0) await addRuleTombstones(res.newTombstones)
       return { next: res.next, result: undefined }
@@ -1733,31 +2435,57 @@ async function doPullInner(opts: {
   if (cloud.activity.length > 0) {
     await mergeFolderActivityFromSync(cloud.activity)
   }
+  // A14 (2026-11-06): the stale-sweep clock is the union of every machine's
+  // active days, so the no-tombstone stale / dormant deletes converge.
+  if (cloud.activeDays.length > 0) {
+    await mergeActiveDaysFromSync(cloud.activeDays)
+  }
 
   // Settings overlay through setSettings (item 14) — per-device fields
   // stripped (defence-in-depth: the push side strips them too) — plus our
   // own lastSyncAt, in one write. Three-way against the last-synced base: a
   // field edited HERE since the last sync is a pending local edit (its push
-  // follows) and is kept; every other field takes the cloud's value.
+  // follows) and is kept; every other field takes the cloud's value. On the
+  // first merge there is no base: every cloud value wins (A4 — the
+  // 'upgrade' / 'first-enable' backup above holds the local ones).
+  // A13: a value this build can't represent (an unknown claudeModel) is
+  // neither adopted — sanitize would turn it into the default — nor later
+  // pushed over; foreignSettings sends it back unchanged.
   const incoming = cloud.settings
     ? (stripPerDeviceSettings(cloud.settings as Partial<Settings>) as Record<string, unknown>)
     : undefined
   const overlay: Record<string, unknown> = {}
+  let settingsBase: Record<string, unknown> | undefined
+  const foreign: ForeignSettings = { ...(state.foreignSettings ?? {}) }
   if (incoming) {
     const local = stripPerDeviceSettings(await getSettings()) as Record<string, unknown>
     const base = state.settingsBase
+    settingsBase = { ...incoming }
     for (const [k, v] of Object.entries(incoming)) {
       const editedHere = base !== undefined && JSON.stringify(local[k]) !== JSON.stringify(base[k])
+      if (!isAdoptableSetting(k, v)) {
+        if (editedHere) {
+          // A local edit is waiting to be pushed — it goes out instead.
+          delete foreign[k]
+          settingsBase[k] = base?.[k]
+        } else {
+          foreign[k] = { cloud: v, local: local[k] }
+          settingsBase[k] = local[k]
+        }
+        continue
+      }
+      delete foreign[k]
       if (!editedHere) overlay[k] = v
     }
   }
   await setSettings({ ...(overlay as Partial<Settings>), lastSyncAt: new Date().toISOString() })
 
   await writeLocalSyncState({
-    ...nextState,
+    ...(adopting ? adoptedState(nextState) : nextState),
     participating: true,
     lastMergedPushId: meta.pushId,
-    ...(incoming ? { settingsBase: incoming } : {}),
+    ...(settingsBase ? { settingsBase } : {}),
+    ...(incoming ? foreignField(foreign) : {}),
   })
   if (backupError) {
     await recordSyncError({
@@ -1842,6 +2570,8 @@ const RULE_FIELDS: ReadonlyArray<keyof Rule> = [
   'autoDisabledAt',
   'autoDisabledReason',
   'editedAt',
+  'statsResetAt',
+  'orphanedAt',
 ]
 
 function rulesEqual(a: Rule, b: Rule): boolean {
@@ -1861,39 +2591,95 @@ function rulesEqual(a: Rule, b: Rule): boolean {
 
 /**
  * Merge two versions of one rule (same id). Semantic fields come from the
- * newer editedAt (tie → cloud); matchCount / overrideCount / lastUsedAt take
- * the max, createdAt the min. On a tie an auto rule keeps the higher
- * confidence: auto-promotion (bumpRuleHits) deliberately doesn't stamp
- * editedAt, so a promotion seen by only one side survives the merge.
+ * newer editedAt (tie → cloud); lastUsedAt takes the latest, createdAt the
+ * earliest. On a tie an auto rule keeps the higher confidence: auto-promotion
+ * (bumpRuleHits) deliberately doesn't stamp editedAt, so a promotion seen by
+ * only one side survives the merge.
+ *
+ * 2026-11-06:
+ *   - matchCount / overrideCount follow the counter epoch (statsResetAt): the
+ *     copy with the newer epoch supplies both, equal epochs take the max. Max
+ *     alone brought a revived rule's pre-reset counters back from the other
+ *     machine, and the next sweep disabled it again (A3).
+ *   - `orphaned` is per-device (A2): it stays orphaned only while the merged
+ *     target is that same dead one — adopting another target clears it so
+ *     reconcile re-checks it. A local orphaned copy WITHOUT orphanedAt may
+ *     carry a v1.0.8 orphan stamp in editedAt, so it never supplies the
+ *     semantic fields (orphanStampSuspect). S3: one orphaned under this build
+ *     (orphanedAt recorded; orphaning no longer stamps) merges by plain
+ *     editedAt — forcing the cloud copy reverted a genuine local edit (e.g.
+ *     the user disabling the orphaned rule) while keeping its newer stamp,
+ *     and the un-orphan later published the reverted content under it.
  */
 function mergeRuleVersions(local: Rule, cloud: Rule): Rule {
   const le = local.editedAt ?? 0
   const ce = cloud.editedAt ?? 0
-  const base = ce >= le ? cloud : local
+  const base = orphanStampSuspect(local) || ce >= le ? cloud : local
   const merged: Rule = { ...base }
   if (ce === le && base.source !== 'user_manual') {
     merged.confidence = Math.max(local.confidence, cloud.confidence)
   }
-  merged.matchCount = Math.max(local.matchCount || 0, cloud.matchCount || 0)
-  merged.createdAt = earlierIso(local.createdAt, cloud.createdAt)
-  const oc = Math.max(local.overrideCount ?? 0, cloud.overrideCount ?? 0)
-  if (oc > 0) merged.overrideCount = oc
-  else delete merged.overrideCount
-  const lu = laterIso(local.lastUsedAt, cloud.lastUsedAt)
-  if (lu !== undefined) merged.lastUsedAt = lu
-  else delete merged.lastUsedAt
+  assignCounters(merged, local, cloud)
   const ea = Math.max(le, ce)
   if (ea > 0) merged.editedAt = ea
   else delete merged.editedAt
+  if (
+    local.orphaned &&
+    merged.targetFolderId === local.targetFolderId &&
+    merged.targetFolderPath === local.targetFolderPath
+  ) {
+    merged.orphaned = true
+    if (local.orphanedAt !== undefined) merged.orphanedAt = local.orphanedAt
+    else delete merged.orphanedAt
+  } else {
+    delete merged.orphaned
+    delete merged.orphanedAt
+  }
   const capped = applyConfidenceCap(merged)
   return rulesEqual(capped, local) ? local : capped
 }
 
-/** Apply a disabled stub to the local copy (newer-or-equal stub wins). */
+/**
+ * Non-semantic fields of one rule merged from two copies of it, onto `out`
+ * (sync merge; restore, S2): matchCount / overrideCount by counter epoch
+ * (statsResetAt — the newer epoch supplies both, equal epochs take the max),
+ * lastUsedAt the latest, createdAt the earliest.
+ */
+function assignCounters(out: Rule, a: Rule, b: Rule): void {
+  const as = a.statsResetAt ?? 0
+  const bs = b.statsResetAt ?? 0
+  const counters = as === bs ? undefined : as > bs ? a : b
+  out.matchCount = counters ? counters.matchCount || 0 : Math.max(a.matchCount || 0, b.matchCount || 0)
+  const oc = counters
+    ? (counters.overrideCount ?? 0)
+    : Math.max(a.overrideCount ?? 0, b.overrideCount ?? 0)
+  if (oc > 0) out.overrideCount = oc
+  else delete out.overrideCount
+  const sr = Math.max(as, bs)
+  if (sr > 0) out.statsResetAt = sr
+  else delete out.statsResetAt
+  out.createdAt = earlierIso(a.createdAt, b.createdAt)
+  const lu = laterIso(a.lastUsedAt, b.lastUsedAt)
+  if (lu !== undefined) out.lastUsedAt = lu
+  else delete out.lastUsedAt
+}
+
+/**
+ * An orphaned local copy whose editedAt may be a v1.0.8 orphan stamp: it was
+ * orphaned before this build recorded orphanedAt, and not edited since (S3).
+ */
+function orphanStampSuspect(r: Rule): boolean {
+  return !!r.orphaned && r.orphanedAt === undefined
+}
+
+/**
+ * Apply a disabled stub to the local copy (newer-or-equal stub wins; an
+ * orphan-stamp suspect loses to it like it loses to a full row — S3).
+ */
 function applyStub(local: Rule, stub: DecodedStub): Rule {
   const le = local.editedAt ?? 0
   const se = stub.editedAt ?? 0
-  if (se < le) return local // the local edit (e.g. a re-enable) is newer
+  if (se < le && !orphanStampSuspect(local)) return local // the local edit (e.g. a re-enable) is newer
   const merged: Rule = { ...local, enabled: false }
   if (stub.autoDisabledReason) merged.autoDisabledReason = stub.autoDisabledReason
   else delete merged.autoDisabledReason
@@ -1904,6 +2690,20 @@ function applyStub(local: Rule, stub: DecodedStub): Rule {
   return rulesEqual(merged, local) ? local : merged
 }
 
+/**
+ * First-participation merge ("adoption", 2026-11-06 — A1). Present on the
+ * first merge since sync was (re-)enabled, which for a machine that synced
+ * under v1.0.7 is its first v4 merge.
+ */
+export type MergeAdoption = {
+  /**
+   * The v1.0.7 machine's lastSyncAt (ms): cloud tombstones deleted at or
+   * before it were already processed by v3. Undefined for a machine that
+   * never synced before (only its own tombstones count as processed then).
+   */
+  processedBeforeMs?: number
+}
+
 export type MergeInput = {
   local: Rule[]
   localTombstones: RuleTombstone[]
@@ -1911,6 +2711,7 @@ export type MergeInput = {
   cloudStubs: DecodedStub[]
   cloudTombstones: RuleTombstone[]
   mode: PullMergeMode
+  adoption?: MergeAdoption
 }
 
 export type MergeOutput = {
@@ -1918,7 +2719,91 @@ export type MergeOutput = {
   next: Rule[]
   /** Cloud tombstones newer than the local one for their triple (to persist). */
   newTombstones: RuleTombstone[]
-  stats: { added: number; updated: number; dropped: number; suppressedIncoming: number }
+  stats: {
+    added: number
+    updated: number
+    dropped: number
+    suppressedIncoming: number
+    /** Local rules adoption kept (and re-stamped) despite a suppressing tombstone. */
+    protected: number
+  }
+}
+
+const SYNCABLE_SOURCES: ReadonlySet<RuleSource> = new Set<RuleSource>([
+  'user_manual',
+  'ai_confirmed',
+  'ai_overridden',
+])
+
+/**
+ * Fingerprint of the spelling (legacySignalNorm form) of the rule a tombstone
+ * was written for, when it can be known (S1, 2026-11-06):
+ *   - the spellingHash this build records on every tombstone it writes;
+ *   - a tombstone deleted before the canonical keys shipped
+ *     (CANONICAL_TOMBSTONE_KEYS_SINCE_MS) was written by v1.0.7 or older, in
+ *     the deleted rule's own spelling: its signalNorm IS that spelling.
+ * Otherwise (v1.0.8 stored the canonical form and nothing else) it is
+ * unknown — and an unknown spelling never counts as a collision: v1.0.8
+ * wrote 「112訴304」 for the user's own deleted 「112年度訴字第304號」.
+ */
+function deletedSpellingHash(t: RuleTombstone): string | undefined {
+  if (typeof t.spellingHash === 'string') return t.spellingHash
+  if (t.deletedAt < CANONICAL_TOMBSTONE_KEYS_SINCE_MS) return spellingFingerprint(t.signalNorm)
+  return undefined
+}
+
+/** One known deletion as the merge applies it; `own` = this machine's local tombstone. */
+type Deletion = { t: RuleTombstone; own: boolean }
+
+/** Same deletion, whatever slot it sits in (spelling stripped or not). */
+function echoKey(t: RuleTombstone): string {
+  return `${t.type}::${t.signalNorm}::${t.targetFolderPath}@${t.deletedAt}`
+}
+
+/**
+ * Every known deletion per canonical triple, local ∪ cloud (round 3,
+ * 2026-11-06). A spelling-less entry with the same stored triple and
+ * deletedAt as a spelled one is that deletion re-pushed by v1.0.8 (which
+ * drops spellings) and is left out — see storage.ts mergeTombstoneSlots.
+ */
+function deletionsByKey(
+  local: readonly RuleTombstone[],
+  cloud: readonly RuleTombstone[],
+): { byKey: Map<string, Deletion[]>; spelledEchoes: Set<string> } {
+  const byKey = new Map<string, Deletion[]>()
+  const spelledEchoes = new Set<string>()
+  const add = (t: RuleTombstone, own: boolean) => {
+    if (t.spellingHash) spelledEchoes.add(echoKey(t))
+    const k = tombstoneKey(t)
+    const list = byKey.get(k)
+    if (list) list.push({ t, own })
+    else byKey.set(k, [{ t, own }])
+  }
+  for (const t of local) add(t, true)
+  for (const t of cloud) add(t, false)
+  if (spelledEchoes.size > 0) {
+    for (const [k, list] of byKey) {
+      const kept = list.filter(({ t }) => t.spellingHash || !spelledEchoes.has(echoKey(t)))
+      if (kept.length !== list.length) byKey.set(k, kept)
+    }
+  }
+  return { byKey, spelledEchoes }
+}
+
+/**
+ * Does deletion `t` delete the version of a rule whose max(createdAt,
+ * editedAt) is `rt` and whose spelling fingerprint `spelling()` returns?
+ * Round 3 (2026-11-06): a tombstone that records the deleted rule's spelling
+ * (spellingHash, v1.0.9+) deletes only that spelling — the canonical twin of
+ * a deleted rule (dedupe keeps a disabled user_manual 「112年度訴字第304號」
+ * next to an enabled auto 「112訴304」) is not touched, wherever its copy
+ * is and whether or not this push carries it. One without (v1.0.8, v1.0.7,
+ * imports) deletes every spelling of the triple, as it always did — and a
+ * v1.0.8 machine, which ignores spellings, still applies every tombstone
+ * that way.
+ */
+function deletes(t: RuleTombstone, rt: number, spelling: () => string): boolean {
+  return t.deletedAt >= rt && (!t.spellingHash || t.spellingHash === spelling())
 }
 
 /**
@@ -1930,47 +2815,69 @@ export type MergeOutput = {
  *   - Local only, with a cloud disabled stub → the stub's disable applies if
  *     it is at least as new as the local edit (item 1).
  *   - Per-device local rules (auto_scan / orphaned) are untouched.
- *   - Tombstones (local ∪ cloud, newest per triple) suppress a rule ONLY if
- *     its version predates the deletion: deletedAt >= max(createdAt,
- *     editedAt) — in BOTH directions (item 3). Incoming cloud rules are now
- *     checked against LOCAL tombstones too (a delete here used to be undone
- *     by the next pull and re-published), and a rule re-created after an old
- *     deletion is no longer killed by that tombstone.
+ *   - Tombstones (local ∪ cloud) suppress a rule ONLY if its version
+ *     predates the deletion: deletedAt >= max(createdAt, editedAt) — in BOTH
+ *     directions (item 3). Incoming cloud rules are now checked against LOCAL
+ *     tombstones too (a delete here used to be undone by the next pull and
+ *     re-published), and a rule re-created after an old deletion is no longer
+ *     killed by that tombstone. Round 3: a tombstone recording the deleted
+ *     rule's spelling suppresses only that spelling (see `deletes`).
  *   - mode 'replace' additionally drops local syncable rules the cloud does
  *     not represent at all.
+ *   - adoption (first participation, 2026-11-06): see adoptionProtects.
  */
 export function mergeCloudIntoLocal(input: MergeInput): MergeOutput {
-  const deletion = newestDeletionByKey(input.localTombstones)
-  const newTombstones: RuleTombstone[] = []
-  for (const t of input.cloudTombstones) {
-    const k = tombstoneKey(t)
-    const cur = deletion.get(k)
-    if (cur === undefined || t.deletedAt > cur) {
-      deletion.set(k, t.deletedAt)
-      newTombstones.push(t)
+  const { byKey: deletions, spelledEchoes } = deletionsByKey(input.localTombstones, input.cloudTombstones)
+  const spellings = new Map<Rule, string>()
+  const spellingOf = (r: Rule): string => {
+    let s = spellings.get(r)
+    if (s === undefined) {
+      s = spellingFingerprint(legacySignalNorm(r.type, r.signal))
+      spellings.set(r, s)
     }
+    return s
   }
-  // `>=`: a deletion always happens after the version it deletes, but both
-  // can land in the same millisecond; a re-creation in that same ms is not a
-  // human-reachable case.
-  const suppressed = (r: Rule) => {
-    const d = deletion.get(ruleKey(r))
-    return d !== undefined && d >= ruleTimeMs(r)
+  // `>=` (in `deletes`): a deletion always happens after the version it
+  // deletes, but both can land in the same millisecond; a re-creation in
+  // that same ms is not a human-reachable case.
+  const suppressed = (r: Rule): boolean => {
+    const list = deletions.get(ruleKey(r))
+    if (!list) return false
+    const rt = ruleTimeMs(r)
+    return list.some(({ t }) => deletes(t, rt, () => spellingOf(r)))
+  }
+  const newTombstones = cloudTombstonesToKeep(input, spelledEchoes)
+  const stats = { added: 0, updated: 0, dropped: 0, suppressedIncoming: 0, protected: 0 }
+  const protects = input.adoption ? adoptionProtects(deletions, input.adoption, spellingOf) : undefined
+  /**
+   * A suppressed rule adoption keeps: re-stamped strictly after every known
+   * deletion of its canonical triple (any spelling — a v1.0.8 machine applies
+   * them all), so it also survives on every other machine (convergent) —
+   * undefined when it really goes.
+   */
+  const keepAdopted = (m: Rule, incoming = false): Rule | undefined => {
+    if (!protects?.(m, incoming)) return undefined
+    const d = Math.max(...deletions.get(ruleKey(m))!.map(({ t }) => t.deletedAt))
+    stats.protected++
+    return { ...m, editedAt: Math.max(m.editedAt ?? 0, d + 1) }
   }
   const cloudById = new Map(input.cloudRules.map((r) => [r.id, r]))
   const stubById = new Map(input.cloudStubs.map((s) => [s.id, s]))
-  const stats = { added: 0, updated: 0, dropped: 0, suppressedIncoming: 0 }
   const next: Rule[] = []
   let changed = false
   for (const r of input.local) {
     const c = cloudById.get(r.id)
     if (c) {
       cloudById.delete(r.id)
-      const m = mergeRuleVersions(r, c)
+      let m = mergeRuleVersions(r, c)
       if (shouldSyncRule(m) && suppressed(m)) {
-        changed = true
-        stats.dropped++
-        continue
+        const kept = keepAdopted(m)
+        if (!kept) {
+          changed = true
+          stats.dropped++
+          continue
+        }
+        m = kept
       }
       if (m !== r) {
         changed = true
@@ -1980,16 +2887,34 @@ export function mergeCloudIntoLocal(input: MergeInput): MergeOutput {
       continue
     }
     if (!shouldSyncRule(r)) {
-      // Per-device rule (auto_scan / orphaned) — never touched by sync.
-      next.push(r)
+      // Per-device: auto_scan never syncs. An orphaned copy (its target is
+      // dead HERE) takes the cloud's edits — a full row above, a disable stub
+      // here (S3: stubs used to be ignored while full rows applied) — but is
+      // never suppressed or dropped while orphaned.
+      const stub = r.orphaned && SYNCABLE_SOURCES.has(r.source) ? stubById.get(r.id) : undefined
+      const m = stub ? applyStub(r, stub) : r
+      if (m !== r) {
+        changed = true
+        stats.updated++
+      }
+      next.push(m)
       continue
     }
     const stub = stubById.get(r.id)
-    const m = stub ? applyStub(r, stub) : r
-    if (suppressed(m) || (!stub && input.mode === 'replace')) {
+    let m = stub ? applyStub(r, stub) : r
+    if (!stub && input.mode === 'replace') {
       changed = true
       stats.dropped++
       continue
+    }
+    if (suppressed(m)) {
+      const kept = keepAdopted(m)
+      if (!kept) {
+        changed = true
+        stats.dropped++
+        continue
+      }
+      m = kept
     }
     if (m !== r) {
       changed = true
@@ -1997,16 +2922,123 @@ export function mergeCloudIntoLocal(input: MergeInput): MergeOutput {
     }
     next.push(m)
   }
-  for (const c of cloudById.values()) {
+  for (const cloudRule of cloudById.values()) {
+    let c = cloudRule
     if (suppressed(c)) {
-      stats.suppressedIncoming++
-      continue
+      const kept = keepAdopted(c, true)
+      if (!kept) {
+        stats.suppressedIncoming++
+        continue
+      }
+      c = kept
     }
     next.push(c)
     changed = true
     stats.added++
   }
   return { next: changed ? next : input.local, newTombstones, stats }
+}
+
+/**
+ * The cloud tombstones worth persisting locally (round 3, 2026-11-06): each
+ * unless a local (or already chosen) tombstone of its canonical triple
+ * deletes everything it deletes, at least as late — a spelling-less one
+ * covers every spelling, a spelled one only its own. Keyed by triple alone,
+ * a deletion of the canonical twin used to be dropped as "older" (or, once
+ * stored, to overwrite the other spelling). A spelling-less copy of a spelled
+ * deletion (a v1.0.8 re-push) is never news.
+ */
+function cloudTombstonesToKeep(input: MergeInput, spelledEchoes: ReadonlySet<string>): RuleTombstone[] {
+  if (input.cloudTombstones.length === 0) return []
+  // A local spelling-less copy of a spelled deletion (stored before the
+  // original reached this machine) covers nothing: the original is stored,
+  // and storage folds the copy into it.
+  const known = groupTombstonesByKey(
+    input.localTombstones.filter((t) => t.spellingHash || !spelledEchoes.has(echoKey(t))),
+  )
+  const out: RuleTombstone[] = []
+  // Newest first, so an older copy of a deletion already chosen is covered.
+  for (const c of [...input.cloudTombstones].sort((a, b) => b.deletedAt - a.deletedAt)) {
+    if (!c.spellingHash && spelledEchoes.has(echoKey(c))) continue
+    const k = tombstoneKey(c)
+    if (coversDeletion(known.get(k), c)) continue
+    out.push(c)
+    known.set(k, [...(known.get(k) ?? []), c])
+  }
+  return out
+}
+
+function groupTombstonesByKey(tombstones: readonly RuleTombstone[]): Map<string, RuleTombstone[]> {
+  const out = new Map<string, RuleTombstone[]>()
+  for (const t of tombstones) {
+    const k = tombstoneKey(t)
+    const list = out.get(k)
+    if (list) list.push(t)
+    else out.set(k, [t])
+  }
+  return out
+}
+
+/**
+ * Does a known deletion of the same canonical triple delete everything `t`
+ * deletes, at least as late? A spelling-less one covers every spelling, a
+ * spelled one only its own (round 3).
+ */
+function coversDeletion(known: readonly RuleTombstone[] | undefined, t: RuleTombstone): boolean {
+  return (known ?? []).some(
+    (x) => x.deletedAt >= t.deletedAt && (!x.spellingHash || x.spellingHash === t.spellingHash),
+  )
+}
+
+/**
+ * Adoption (A1, 2026-11-06). v1.0.7 never let a tombstone remove a rule the
+ * cloud still had, and a machine's own tombstones never removed its own live
+ * rules, so "live rule + newer tombstone of its triple" pairs are ordinary
+ * pre-v4 state: a duplicate that outlived its deleted twin, a rule the
+ * push-before-pull race brought back, one a v3 restore kept — or, under the
+ * 2026-11-05 canonical keys, a rule that merely COLLIDES with a deleted
+ * spelling (a user_manual 「112年度訴字第304號」 vs a deleted auto
+ * 「112訴304」). v1.0.8's first merge deleted every one of them, on every
+ * machine. On the first merge a LOCAL rule is kept when each tombstone that
+ * would suppress it is
+ *   - this machine's own (it has always coexisted with this library), or
+ *   - one v3 had already processed (deletedAt <= the v1.0.7 machine's
+ *     lastSyncAt),
+ * and a user_manual rule also when a tombstone only collides canonically
+ * (the spelling it was written for is known and isn't the rule's own — see
+ * deletedSpellingHash; S1, 2026-11-06: v1.0.8+ tombstones store the canonical
+ * form, so comparing signalNorm read the user's own deletion of
+ * 「112年度訴字第304號」 as a collision and resurrected the rule on every
+ * adoption — the v1.0.7 upgrade and every sync re-enable). An INCOMING cloud
+ * rule — v3 added every cloud rule — gets the same verdict, except that this
+ * machine's own newer tombstone does count (a delete made here). The caller
+ * re-stamps a kept rule above the deletion, so the verdict holds on every
+ * machine.
+ */
+function adoptionProtects(
+  deletions: ReadonlyMap<string, Deletion[]>,
+  adoption: MergeAdoption,
+  spellingOf: (r: Rule) => string,
+): (m: Rule, incoming: boolean) => boolean {
+  const processedBefore = adoption.processedBeforeMs
+  return (m, incoming) => {
+    const rt = ruleTimeMs(m)
+    for (const { t, own } of deletions.get(ruleKey(m)) ?? []) {
+      // Doesn't delete this version — or (round 3) records another spelling.
+      if (!deletes(t, rt, () => spellingOf(m))) continue
+      if (own && !incoming) continue
+      if (processedBefore !== undefined && t.deletedAt <= processedBefore) continue
+      if (m.source === 'user_manual') {
+        // Only a spelling-less tombstone gets here with another spelling
+        // (a spelled one that deletes `m` records m's own): known when v1.0.7
+        // wrote it, unknown — never a collision — when v1.0.8 did.
+        const deleted = deletedSpellingHash(t)
+        if (deleted !== undefined && deleted !== spellingOf(m)) continue // a canonical collision
+      }
+      return false
+    }
+    return true
+  }
 }
 
 // ---- remote pulls / retries --------------------------------------------------------
@@ -2031,8 +3063,15 @@ async function dispatchRemotePull(reason: string): Promise<void> {
       if (!settings.syncEnabled) return
       const meta = await readSyncMeta()
       if (!meta) return
-      // Echo of our own push? Skip — we pulled before writing it.
-      if (meta.sourceMachineId === settings.syncMachineId) return
+      // Echo of our own push? Skip — we pulled before writing it. Unless
+      // another push's chunks now sit under OUR meta (A6, 2026-11-06): the
+      // cloud is torn for everyone else and only its owner can see that its
+      // content hasn't changed — rewrite it (the no-op check verifies the
+      // items too, so this push really writes).
+      if (meta.sourceMachineId === settings.syncMachineId) {
+        if (!(await snapshotIntact(meta))) schedulePush('repair-own-torn-meta', 0, { flush: true })
+        return
+      }
       const { state } = await readLocalSyncState()
       if (meta.pushId && meta.pushId === state.lastMergedPushId) return // already merged
       // Bug #E: union (with tombstone-aware drop), never replace.

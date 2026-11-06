@@ -118,6 +118,50 @@ export const CASE_CLOSED_PURGE_DAYS = 30
 /** Recent-pushes log carried in syncMeta for multi-machine visibility. */
 export const SYNC_RECENT_PUSHES_CAP = 20
 
+/**
+ * Sync budget claims (2026-11-06). Deletions newer than this are "recent":
+ * they may take up to SYNC_RECENT_TOMBSTONE_BUDGET_SHARE of the budget, but
+ * only by displacing low-priority rule rows (never-matched auto rules,
+ * disabled rules) — a 300-rule bulk delete used to leave ~200 deletions out
+ * of a 15 % share while the peer kept routing mail with the deleted rules.
+ */
+export const SYNC_RECENT_TOMBSTONE_MS = 30 * 24 * 60 * 60 * 1000
+export const SYNC_RECENT_TOMBSTONE_BUDGET_SHARE = 0.4
+/**
+ * Disabled rules whose disable is at most this old get a guaranteed stub
+ * (2026-11-06). Every disabled rule used to get one before any enabled row was
+ * placed, so a big pile of long-settled disables (legacy_token, user-disabled
+ * — never purged) crowded live rules out of the cloud.
+ */
+export const SYNC_STUB_RECENT_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * Counter-only changes (matchCount / overrideCount / lastUsedAt) are pushed at
+ * most once per this window (2026-11-06): every push rewrites every chunk
+ * (~88 KB, each carries the pushId), and hit counters change on every batch.
+ * Semantic edits, tombstones, settings and folder activity still push at once.
+ */
+export const SYNC_COUNTER_PUSH_COALESCE_MS = 20 * 60_000
+
+/**
+ * Torn-cloud recovery (2026-11-06): after this many consecutive torn reads of
+ * the SAME cloud pushId, spanning at least SYNC_TORN_RECOVERY_MIN_MS, a push
+ * may rewrite the cloud from local (after a local backup). A torn snapshot
+ * that never heals used to lock every other machine out of pushing at all.
+ */
+export const SYNC_TORN_RECOVERY_MIN_READS = 3
+export const SYNC_TORN_RECOVERY_MIN_MS = 60_000
+
+/**
+ * Release of the canonical tombstone keys (v1.0.8, 2026-11-05): from then on
+ * signalNorm is normalizeSignal output (court-case forms folded — a deleted
+ * 「112年度訴字第304號」 is stored as 「112訴304」). A tombstone deleted before
+ * it was written by v1.0.7 or older in the deleted rule's own spelling — the
+ * only ones the first-participation merge may read as a mere canonical
+ * collision when that spelling differs from a user_manual rule's (S1).
+ */
+export const CANONICAL_TOMBSTONE_KEYS_SINCE_MS = Date.parse('2026-11-05T00:00:00.000Z')
+
 // ---- stale sweep ----------------------------------------------------------
 
 /**
@@ -232,6 +276,34 @@ export const BATCH_SIZE_MAX = 500
 export const AI_PARALLEL_CHUNKS = 3
 
 /**
+ * Refusal isolation (2026-11-06). When Claude refuses a chunk, the chunk is
+ * bisected — sequentially, inside its own lane — to find the email(s) that
+ * trip the safety classifier; the rest are classified normally. Extra calls
+ * are capped per chunk (one culprit in a 25-email chunk takes 10) and per run,
+ * so a refusal triggered by something every request shares (folder names,
+ * rule text) can't multiply the calls.
+ */
+export const AI_REFUSAL_ISOLATION_MAX_CALLS = 12
+export const AI_REFUSAL_ISOLATION_MAX_CALLS_PER_RUN = 36
+
+/**
+ * Emails Claude refused, remembered (local, never synced) so later batches
+ * don't send them again: they take no batch slot and, unless a rule or thread
+ * memory routes them, are left for manual handling (counted next to the
+ * flagged mail). Per model — switching models retries them.
+ */
+export const REFUSED_EMAILS_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
+export const REFUSED_EMAILS_CAP = 500
+
+/**
+ * A refusal of the prompt every request shares (2026-11-06): once a one-email
+ * probe with that prompt was refused too, later runs with the same model and
+ * prompt prefix don't probe / bisect again for this long — unless a call is
+ * answered first, which clears it.
+ */
+export const REFUSAL_SUSPICION_TTL_MS = 6 * 60 * 60 * 1000 // 6 hours
+
+/**
  * Move / delete requests in flight at once during execute (2026-11-05).
  * new_folder items still run first and one at a time (later moves may target
  * them). Below MAX_CONCURRENT_REQUESTS (4) on purpose: the token is OWA's
@@ -267,6 +339,21 @@ export const INBOX_SCAN_MAX_MESSAGES = 2000
 
 /** folderCache freshness window. */
 export const FOLDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000 // 24 h
+
+/**
+ * Freshness of a tree built from a PARTIAL well-known folder lookup
+ * (2026-11-06 r2): short, so the next preflight refetches it, yet long enough
+ * that one popup / Options session doesn't re-walk the tree on every call.
+ */
+export const FOLDER_CACHE_INCOMPLETE_TTL_MS = 60 * 1000
+
+/**
+ * A cached folder tree older than this is double-checked live before execute
+ * files mail into one of its folders (2026-11-06 r2): a folder deleted in OWA
+ * after the fetch is still in the tree, yet sits in 已刪除的郵件. A
+ * just-fetched tree is trusted as is.
+ */
+export const FOLDER_TREE_VERIFY_AFTER_MS = 10 * 60 * 1000
 
 // ---- popup ---------------------------------------------------------------
 

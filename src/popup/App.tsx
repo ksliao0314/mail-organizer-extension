@@ -1,13 +1,26 @@
 import type { PopupRequest } from '@/shared/messages'
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FocusEvent as ReactFocusEvent,
+} from 'react'
 import { LayoutContext, useLayout } from './layout-context'
 import { readWebStorage, writeWebStorage } from './web-storage'
 import {
+  createFocusOriginTracker,
+  focusOwnsPlanActivation,
   isImeComposing,
+  isPlanListCheckbox,
   isTextEntryTarget,
   overlayLayerOpen,
-  ownsActivationKeys,
   ownsNavigationKeys,
+  PLAN_ROW_INDEX_ATTR,
+  type FocusOriginTracker,
 } from './keyboard'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -29,7 +42,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
-import { DELETE_DESTINATION_LABEL, PlanRow } from './components/PlanRow'
+import { DELETE_DESTINATION_LABEL, PlanRow, PlanSelectionCountContext } from './components/PlanRow'
 import { FolderPicker } from './components/FolderPicker'
 import { cn } from '@/lib/utils'
 import { flattenFolderTree, joinFolderPath } from '@/shared/outlook-api'
@@ -87,17 +100,47 @@ type StatusData = {
 const NO_EXCLUDE_PREFIXES: string[] = []
 
 /**
+ * onMouseDown for plan-screen toggles that must not keep DOM focus after a
+ * MOUSE click (2026-11-06) — otherwise the next Space / Enter re-activates
+ * them instead of acting on the keyboard-cursor row. Tab focus still works.
+ */
+const noPointerFocus = (e: { preventDefault(): void }) => e.preventDefault()
+
+/**
  * User-facing text for "OWA tab found but no token" (2026-11-05). Uses the
  * SW's tokenError when present so the user is told the real fix.
  */
 function tokenIssueText(status: StatusData): string {
   const err = status.tokenError
   if (err?.code === 'MULTIPLE_ACCOUNTS' && err.message) return err.message
+  // TAB_UNREACHABLE carries the SW's precise fix (2026-11-06): a tab the
+  // browser put to sleep (Memory Saver) needs a switch-to-it, not a reload,
+  // and this generic line used to replace that message.
+  if (err?.code === 'TAB_UNREACHABLE' && err.message) return err.message
   if (err?.code === 'NOT_ON_OWA' || err?.code === 'TAB_UNREACHABLE') {
     return '請重新整理 Outlook 分頁（擴充功能更新後需要）'
   }
   if (err?.code === 'NO_TOKEN' && err.message) return err.message
   return '無法讀取 Outlook 登入資訊、稍等幾秒再試'
+}
+
+/**
+ * The header pill's short label for the same state (2026-11-06). It said
+ * 「Outlook 登入過期」 for every cause — also for a tab that just isn't
+ * answering (TAB_UNREACHABLE: switch to it) or needs a reload — which sent
+ * people to sign in again for nothing. The tooltip carries tokenIssueText.
+ */
+function tokenIssueLabel(status: StatusData): string {
+  switch (status.tokenError?.code) {
+    case 'TAB_UNREACHABLE':
+      return 'Outlook 分頁沒有回應'
+    case 'NOT_ON_OWA':
+      return 'Outlook 分頁需要重新整理'
+    case 'MULTIPLE_ACCOUNTS':
+      return '多個 Outlook 帳號'
+    default:
+      return 'Outlook 登入過期'
+  }
 }
 
 type ClassifyUsage = { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number }
@@ -158,6 +201,8 @@ type PreflightData = {
   preFilteredCount: number
   /** Emails skipped because they're flagged as 待處理 in Outlook. */
   flaggedCount: number
+  /** Emails left out because Claude refused them before (manual handling; 2026-11-06). */
+  refusedCount?: number
   /** Original batch size requested, before pre-filter. */
   requestedBatchSize: number
 }
@@ -179,6 +224,11 @@ type AiProgressMeta = {
   aiUnresolvedCount: number
   /** Never-classified placeholders among aiCount (failed / refused chunks). */
   aiUnclassifiedCount: number
+  /**
+   * The counts above are all that was stored — session storage was full
+   * (STORAGE_FAILED): the run has no items to resume or adopt (2026-11-06 r3).
+   */
+  planDropped?: boolean
   /** Poll cursor: pass back as `aiFrom` to get only newer AI items. */
   aiCursor: number
   skippedByUser?: number
@@ -186,6 +236,8 @@ type AiProgressMeta = {
   aiError?: { code: string; message: string } | null
   startedAt: number
   done: boolean
+  /** What the run's preflight left out of the inbox scan (r3; see preFilteredBanner). */
+  excluded?: ExcludedCounts
 }
 type AiProgressPoll = AiProgressMeta & { aiPlan: PlanItem[] }
 type AiProgress = AiProgressPoll & { rulePlan: PlanItem[]; folderTree: MailFolderNode[] }
@@ -196,7 +248,52 @@ type AiProgress = AiProgressPoll & { rulePlan: PlanItem[]; folderTree: MailFolde
  * fetch than re-shown as stale 「AI 分類失敗」 rows).
  */
 function hasOfferableItems(p: AiProgressMeta): boolean {
-  return !p.done || p.ruleCount + p.aiCount - (p.aiUnclassifiedCount ?? 0) > 0
+  return !p.done || (!p.planDropped && p.ruleCount + p.aiCount - (p.aiUnclassifiedCount ?? 0) > 0)
+}
+
+type ExcludedCounts = { kept: number; flagged: number; refused: number }
+
+/**
+ * The 已從收件夾排除 banner — one text for a batch started here and for a run
+ * adopted later (繼續歸檔下一批 after a DoneScreen prefetch, 2026-11-06 r3),
+ * which used to show none of these counts.
+ */
+function preFilteredBanner(c: ExcludedCounts | undefined): { code: string; message: string } | undefined {
+  if (!c) return undefined
+  const parts: string[] = []
+  if (c.kept > 0) parts.push(`${c.kept} 件先前選擇保留`)
+  if (c.flagged > 0) parts.push(`${c.flagged} 件標記待處理`)
+  if (c.refused > 0) parts.push(`${c.refused} 件 Claude 先前拒絕分類（需手動歸檔）`)
+  return parts.length > 0
+    ? { code: 'PRE_FILTERED', message: `已從收件夾排除 ${parts.join(' + ')}。可到設定頁調整略過機制。` }
+    : undefined
+}
+
+/**
+ * 「AI N」 in the plan summary: AI items that came back with a decision —
+ * not the ones the user excluded, not unresolved / refused / failed rows.
+ * ONE formula for every path (2026-11-06): the reopen and 繼續歸檔 paths
+ * skipped the unresolved subtraction the poll applied, so the header read
+ * 「AI 2」 with a refused row among the two.
+ */
+function aiHandledCount(
+  p: Pick<AiProgressMeta, 'aiCount' | 'skippedByUser' | 'aiUnresolvedCount'>,
+): number {
+  return Math.max(0, p.aiCount - (p.skippedByUser ?? 0) - (p.aiUnresolvedCount ?? 0))
+}
+
+/**
+ * This surface is taking classify run `runId` over as its plan (2026-11-06):
+ * tell the SW (ClassifyRunRecord.adoptedAt) and wait for it BEFORE showing
+ * the run — otherwise the surface whose DoneScreen prefetched the run
+ * cancels it on 回主畫面 and this plan stops with 「AI 分類已中止」. For
+ * 繼續歸檔 and for the reopen resume alike. False = the run is gone
+ * (cancelled / superseded since it was read). An error answer counts as
+ * taken over: best effort, never drop a plan over it.
+ */
+async function adoptRun(runId: string): Promise<boolean> {
+  const r = await send<{ adopted?: boolean }>({ type: 'adoptClassifyRun', runId })
+  return !(r.ok && r.data?.adopted === false)
 }
 
 function aiErrorBanner(err: { code: string; message: string }): { code: string; message: string } {
@@ -205,7 +302,11 @@ function aiErrorBanner(err: { code: string; message: string }): { code: string; 
     message:
       err.code === 'TRUNCATED' || err.code === 'CONFIDENCE_GATED'
         ? err.message
-        : `AI 分類失敗：${err.message}。規則命中與已完成部分仍可執行。`,
+        : // Not a failure of the run (2026-11-06): only the named / counted
+          // emails were declined, everything else was classified.
+          err.code === 'CLASSIFIER_REFUSAL'
+          ? `${err.message}。其餘郵件不受影響，可照常執行。`
+          : `AI 分類失敗：${err.message}。規則命中與已完成部分仍可執行。`,
   }
 }
 
@@ -345,6 +446,8 @@ const BANNER_TITLE: Record<string, string> = {
   TRUNCATED: 'AI 回應被截斷、部分郵件未分類',
   PRE_FILTERED: '部分郵件已預先排除',
   CONFIDENCE_GATED: '部分郵件 AI 信心不足、已自動保留',
+  CLASSIFIER_REFUSAL: 'Claude 拒絕分類部分郵件、需手動處理',
+  STORAGE_FAILED: '分類進度無法儲存',
 }
 function bannerTitle(code: string): string {
   if (BANNER_TITLE[code]) return BANNER_TITLE[code]
@@ -443,13 +546,17 @@ export default function App() {
   // registration order — so with the ? shortcuts dialog open, Esc used to
   // close the whole OWA panel instead of just the dialog. Any open layer
   // (dialog / menu / open listbox) owns Esc; so does an inner widget that
-  // already handled it (defaultPrevented) or an IME composition cancel.
+  // already handled it (defaultPrevented) or an IME composition cancel —
+  // and the plan list's keyboard cursor, which an Esc clears first
+  // (2026-11-06; PlanScreen marks that Esc defaultPrevented).
+  // A plan row's checkbox is list chrome, not a typing surface (2026-11-06):
+  // with one focused, Esc here and `?` below used to do nothing.
   useEffect(() => {
     if (window.parent === window) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
       if (e.defaultPrevented || isImeComposing(e)) return
-      if (isTextEntryTarget(e.target)) return
+      if (isTextEntryTarget(e.target) && !isPlanListCheckbox(e.target)) return
       if (overlayLayerOpen()) return
       postToParent({ type: 'mail-organizer/close-panel' })
     }
@@ -466,9 +573,7 @@ export default function App() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.metaKey || e.ctrlKey || e.altKey) return
-      const t = e.target as HTMLElement | null
-      const tag = t?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      if (isTextEntryTarget(e.target) && !isPlanListCheckbox(e.target)) return
       if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
         e.preventDefault()
         setShowShortcuts((v) => !v)
@@ -661,14 +766,24 @@ export default function App() {
   // — and the poll cursor into that run's AI output.
   const classifyRunIdRef = useRef<string | null>(null)
   const aiCursorRef = useRef(0)
+  // The run THIS surface's DoneScreen prefetch started (2026-11-06) — 完成
+  // cancels it by id, never "whatever run is current".
+  const prefetchRunIdRef = useRef<string | null>(null)
+  // 回主畫面 is on its way out of this DoneScreen (2026-11-06): set before its
+  // first await, so a prefetch preflight landing meanwhile stops right there
+  // instead of starting classifyAi behind the cleanup's back — the phase only
+  // leaves 'done' after that await. Cleared once the phase has left 'done'.
+  const leavingDoneRef = useRef(false)
   // Synchronous re-entry guard for 繼續歸檔下一批 (item 3): a double click used
   // to run two consume-or-classify chains (two preflights, two AI runs).
   const continueInFlightRef = useRef(false)
   useEffect(() => {
     if (phase.kind !== 'done') {
       prefetchStartedRef.current = null
+      leavingDoneRef.current = false
       return
     }
+    if (leavingDoneRef.current) return
     if (!status?.prefetchNextBatch || !status.owaConnected || !status.tokenValid || !status.apiKeyConfigured) {
       return
     }
@@ -686,7 +801,7 @@ export default function App() {
       // spend, interleaved progress writes); 回主畫面 similarly let the chain
       // resurrect AI progress that finishAndReset had just cleared. (The SW's
       // run ids now refuse a superseded run's classifyAi as well.)
-      const cancelled = () => prefetchStartedRef.current !== phaseKey
+      const cancelled = () => prefetchStartedRef.current !== phaseKey || leavingDoneRef.current
       // Decide by run, not by timestamps (2026-11-05). The SW returns only the
       // current run's progress with already-executed mail filtered out:
       //   - still classifying, or has items left → it IS the next batch (e.g.
@@ -710,8 +825,16 @@ export default function App() {
         batchSize,
         forceFresh: false,
       })
-      if (cancelled()) return
+      if (cancelled()) {
+        // The preflight already made its run current in the SW — drop it,
+        // unless 繼續歸檔 (this or another surface) has taken it over.
+        if (pf.ok && pf.data) {
+          void send({ type: 'cancelClassify', runId: pf.data.runId, unlessAdopted: true })
+        }
+        return
+      }
       if (!pf.ok || !pf.data) return
+      prefetchRunIdRef.current = pf.data.runId
       if (pf.data.unmatchedPreview.length === 0) return // nothing for AI to do
       await send({ type: 'classifyAi', runId: pf.data.runId, excludeIds: [] })
     })().catch((e) => console.warn('[mail-organizer] prefetch failed (non-fatal)', e))
@@ -782,6 +905,10 @@ export default function App() {
       ) {
         aiProg = null
       }
+      // Resuming the run here takes it over, like 繼續歸檔 (2026-11-06): a
+      // DoneScreen elsewhere may have prefetched it and would cancel it on
+      // 回主畫面. A run gone since it was read is not resumed.
+      if (aiProg && !(await adoptRun(aiProg.runId))) aiProg = null
       classifyRunIdRef.current = aiProg?.runId ?? saved?.plan?.runId ?? null
       aiCursorRef.current = aiProg?.aiCursor ?? 0
 
@@ -836,11 +963,7 @@ export default function App() {
             // stale snapshot predates completion. Same formulas as the
             // in-popup poll's done-branch below.
             usage = aiProg.usage ?? usage
-            summary = {
-              ruleHits: aiProg.ruleCount,
-              aiHandled:
-                aiProg.aiCount - (aiProg.skippedByUser ?? 0) - aiProg.aiUnresolvedCount,
-            }
+            summary = { ruleHits: aiProg.ruleCount, aiHandled: aiHandledCount(aiProg) }
             if (aiProg.aiError) banner = aiErrorBanner(aiProg.aiError)
           }
         }
@@ -848,10 +971,7 @@ export default function App() {
         items = [...aiProg.rulePlan, ...aiProg.aiPlan]
         folderTree = aiProg.folderTree
         usage = aiProg.usage ?? null
-        summary = {
-          ruleHits: aiProg.ruleCount,
-          aiHandled: aiProg.aiCount - (aiProg.skippedByUser ?? 0),
-        }
+        summary = { ruleHits: aiProg.ruleCount, aiHandled: aiHandledCount(aiProg) }
         banner = aiProg.aiError ? aiErrorBanner(aiProg.aiError) : undefined
       } else {
         return
@@ -1038,11 +1158,7 @@ export default function App() {
             ...p,
             items,
             usage: prog.usage ?? null,
-            summary: {
-              ruleHits: prog.ruleCount,
-              aiHandled:
-                prog.aiCount - (prog.skippedByUser ?? 0) - prog.aiUnresolvedCount,
-            },
+            summary: { ruleHits: prog.ruleCount, aiHandled: aiHandledCount(prog) },
             aiPending: undefined,
             banner: prog.aiError ? aiErrorBanner(prog.aiError) : p.banner,
           }
@@ -1085,10 +1201,18 @@ export default function App() {
     // DoneScreen (and its button) is gone.
     if (continueInFlightRef.current) return
     continueInFlightRef.current = true
+    // The prefetch run (if any) is adopted below as THE run, or superseded.
+    prefetchRunIdRef.current = null
     try {
       // Read the run BEFORE dropping the execute state (2026-11-05).
       const aiResp = await send<AiProgress | null>({ type: 'getAiClassifyProgress', view: 'full' })
-      const run = aiResp.ok ? aiResp.data : null
+      let run = aiResp.ok ? aiResp.data : null
+      // Taking the run over as this surface's plan: the SW learns it before
+      // anything else happens here (2026-11-06) — awaited: fire-and-forget,
+      // a 回主畫面 cancel from the surface that prefetched the run could land
+      // first and this screen showed a plan whose run was gone. Gone
+      // meanwhile → nothing to consume: classify afresh below.
+      if (run && hasOfferableItems(run) && !(await adoptRun(run.runId))) run = null
 
       void send({ type: 'clearPopupState' })
       await send({ type: 'clearExecuteState' })
@@ -1120,11 +1244,8 @@ export default function App() {
         items: [...run.rulePlan, ...run.aiPlan],
         folderTree: run.folderTree,
         usage: run.usage ?? null,
-        summary: {
-          ruleHits: run.ruleCount,
-          aiHandled: run.aiCount - (run.skippedByUser ?? 0),
-        },
-        banner: run.aiError ? aiErrorBanner(run.aiError) : undefined,
+        summary: { ruleHits: run.ruleCount, aiHandled: aiHandledCount(run) },
+        banner: run.aiError ? aiErrorBanner(run.aiError) : preFilteredBanner(run.excluded),
         aiPending: run.done
           ? undefined
           : {
@@ -1161,16 +1282,11 @@ export default function App() {
     classifyRunIdRef.current = data.runId
 
     // Build a banner describing what got pre-filtered, if anything.
-    const parts: string[] = []
-    if (data.preFilteredCount > 0) parts.push(`${data.preFilteredCount} 件先前選擇保留`)
-    if (data.flaggedCount > 0) parts.push(`${data.flaggedCount} 件標記待處理`)
-    const banner =
-      parts.length > 0
-        ? {
-            code: 'PRE_FILTERED' as const,
-            message: `已從收件夾排除 ${parts.join(' + ')}。可到設定頁調整略過機制。`,
-          }
-        : undefined
+    const banner = preFilteredBanner({
+      kept: data.preFilteredCount,
+      flagged: data.flaggedCount,
+      refused: data.refusedCount ?? 0,
+    })
 
     // No unmatched → no AI needed, go straight to plan.
     if (data.unmatchedPreview.length === 0) {
@@ -1316,13 +1432,54 @@ export default function App() {
     // stops a still-running run (e.g. after 「先執行 N 個」) instead of only
     // deleting its progress key while the loop kept calling Claude and wrote
     // the key back — with already-executed rule hits in it.
-    await Promise.all([
-      send({ type: 'clearExecuteState' }),
-      send({ type: 'clearPopupState' }),
-      send({ type: 'cancelClassify' }),
-    ])
+    //
+    // …but only THIS surface's runs, by id, and only while this DoneScreen's
+    // batch is still the current one (2026-11-06). It used to send
+    // cancelClassify with no runId — "cancel whatever is current" — so a
+    // stale DoneScreen in the OWA panel, clicked after the toolbar popup had
+    // consumed (繼續歸檔: same run id!) or started a run, killed that live
+    // run, and the popup reopened with no banner and the rest of its mail
+    // silently missing; the clears wiped that surface's plan / batch too. If
+    // the execute state is no longer our batch, another surface has moved on
+    // and everything shared is its state now: just go idle here.
+    //
+    // The DoneScreen's own prefetch run is cancelled either way (2026-11-06):
+    // it is this screen's background work, and when the OTHER surface went
+    // home first, nothing ever stopped it — it kept calling Claude and the
+    // next open landed in its plan (v1.0.8's run-less cancel did stop it).
+    // `unlessAdopted`: if 繼續歸檔 on another surface took the run over (the
+    // SW records that), it is that surface's live plan now and stays.
+    // The flag goes up before the first await: a prefetch preflight landing
+    // during it must not go on to start classifyAi (it cancels its run itself).
+    leavingDoneRef.current = true
+    const planRun = classifyRunIdRef.current
+    const prefetchRun = prefetchRunIdRef.current
+    const myBatchStartedAt = phase.kind === 'done' ? phase.state.startedAt : null
     classifyRunIdRef.current = null
+    prefetchRunIdRef.current = null
     aiCursorRef.current = 0
+    try {
+      const exec = await send<{ state: ExecuteState | null }>({ type: 'getExecuteState' })
+      const stillOurs =
+        exec.ok && myBatchStartedAt !== null && exec.data?.state?.startedAt === myBatchStartedAt
+      await Promise.all([
+        ...(stillOurs
+          ? [
+              send({ type: 'clearExecuteState' }),
+              send({ type: 'clearPopupState' }),
+              ...(planRun && planRun !== prefetchRun
+                ? [send({ type: 'cancelClassify', runId: planRun })]
+                : []),
+            ]
+          : []),
+        ...(prefetchRun
+          ? [send({ type: 'cancelClassify', runId: prefetchRun, unlessAdopted: true })]
+          : []),
+      ])
+    } catch (e) {
+      // SW unreachable — still leave the DoneScreen; the next open re-reads state.
+      console.warn('[mail-organizer] 回主畫面 cleanup failed (non-fatal)', e)
+    }
     setPhase({ kind: 'idle' })
     void refreshStatus()
   }
@@ -1455,7 +1612,7 @@ export default function App() {
               {tokenIssue && (
                 <StatusPill
                   ok={false}
-                  label="Outlook 登入過期"
+                  label={tokenIssueLabel(status)}
                   tooltip={status.tokenError ? tokenIssueText(status) : 'OWA 可能剛開、稍等幾秒再試'}
                 />
               )}
@@ -1563,7 +1720,7 @@ function PhaseContext({ phase, model }: { phase: Phase; model?: string }) {
       : null
   let label: string | null = null
   if (phase.kind === 'classifying') label = 'AI 分類中…'
-  else if (phase.kind === 'executing') label = `處理中 ${phase.state.current} / ${phase.state.total}`
+  else if (phase.kind === 'executing') label = `處理中 ${finishedItemCount(phase.state)} / ${phase.state.total}`
   else if (phase.kind === 'done')
     label =
       phase.state.summary.errors > 0
@@ -1623,7 +1780,7 @@ function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             { keys: ['/'], desc: '過濾清單 — 主旨 / 寄件人 / 路徑' },
             { keys: ['u'], desc: '完成畫面 — 撤回剛剛的批次' },
             { keys: ['?'], desc: '顯示這個說明' },
-            { keys: ['Esc'], desc: '由內而外收起：選單 / 說明視窗 → 面板' },
+            { keys: ['Esc'], desc: '由內而外收起：選單 / 說明視窗 → 清單外框 → 面板' },
           ].map((row) => (
             <Fragment key={row.desc}>
               <dt className="flex items-center gap-1 font-mono">
@@ -1638,8 +1795,13 @@ function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             </Fragment>
           ))}
         </dl>
+        {/* 2026-11-06: Space / Enter in the list follow the cursor ring, not
+            whatever the mouse clicked last; and shortcuts have worked during
+            AI classification since 刀3 — the old line said they paused. */}
         <p className="text-[10px] text-muted-foreground pt-2 border-t border-border">
-          AI 分類進行中時鍵盤捷徑暫停 — 等清單載入完成後再用。
+          「此項」是有外框的那一列：在清單裡按 Space / Enter 會作用在這一列，不是滑鼠最後點的地方；用 Tab
+          移到某一列時，外框也會跟著移過去。其他按鈕（例如「執行」、「全選此組」）可用 Tab 移過去再按
+          Enter。AI 分類進行中也能使用 — 已完成的郵件可先審閱。
         </p>
       </div>
     </div>
@@ -2291,6 +2453,23 @@ function targetGroupKey(item: PlanItem): string {
   return '（保留）'
 }
 
+/**
+ * Left by a user's own edit (row change, propagated siblings, bulk action)
+ * for the plan cursor to consume once the edit has landed — see PlanScreen's
+ * "moves the cursor ON" note (2026-11-06).
+ */
+type CursorEditAnchor = {
+  /** The email acted on; the anchor applies when the cursor is on it. */
+  emailId: string
+  /** Its row, and the rows, as they were before the edit. */
+  index: number
+  before: PlanItem[]
+  /** Every email the action changed — none of them is "the next mail". */
+  changed: Set<string>
+  /** `items` before the edit: the anchor is consumed once they've changed. */
+  items: PlanItem[]
+}
+
 function PlanScreen({
   items,
   tree,
@@ -2568,11 +2747,50 @@ function PlanScreen({
   }, [])
 
   // ---- Keyboard navigation ------------------------------------------------
-  // Focused index drives j/k navigation, x toggles select, Enter expands the
+  // The cursor drives j/k navigation, x toggles select, Enter expands the
   // row (via tokens that PlanRow watches), d/s set action without leaving the
   // keyboard. Move requires a target so keyboard does not bind a key for it.
-
-  const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
+  //
+  // The cursor is an EMAIL, not a list position (2026-11-06). It used to be a
+  // displayItems index while the list reorders under it: with 依資料夾 an AI
+  // chunk merged mid-review sorts in ABOVE the cursor, and a conversation
+  // cluster whose members stop agreeing splits and shows its hidden siblings
+  // — the ring stayed on the index, the emails moved, and the next d / s / x
+  // / Enter hit a different email. `focusedIndex` is derived from the email
+  // on every render instead.
+  const [cursorId, setCursorIdState] = useState<string | null>(null)
+  // Mirrors the state synchronously, so a key repeat that lands before the
+  // re-render steps on from where the previous press put the cursor.
+  const cursorIdRef = useRef<string | null>(null)
+  const setCursorId = useCallback((id: string | null) => {
+    cursorIdRef.current = id
+    setCursorIdState(id)
+  }, [])
+  const displayIndexById = useMemo(
+    () => new Map(displayItems.map((it, i) => [it.emailId, i])),
+    [displayItems],
+  )
+  const conversationOf = useMemo(
+    () => new Map(orderedItems.map((it) => [it.emailId, it.conversationId])),
+    [orderedItems],
+  )
+  /**
+   * The rendered row standing for the cursor's email: its own, or — when it
+   * is a sibling folded into a collapsed cluster — the cluster's rep row.
+   * Null when nothing shows it (filtered out).
+   */
+  const cursorIndexOf = useCallback(
+    (id: string | null): number | null => {
+      if (id === null) return null
+      const own = displayIndexById.get(id)
+      if (own !== undefined) return own
+      const cid = conversationOf.get(id)
+      const group = cid ? conversationGroups.get(cid) : undefined
+      return (group && displayIndexById.get(group.rep.emailId)) ?? null
+    },
+    [displayIndexById, conversationOf, conversationGroups],
+  )
+  const focusedIndex = cursorIndexOf(cursorId)
   const [scrollIntoViewToken, setScrollIntoViewToken] = useState(0)
   const [toggleExpandToken, setToggleExpandToken] = useState(0)
   // 持久化（UI/UX 檢討 2026-07）：舊版是 component-local state，每次開
@@ -2590,25 +2808,71 @@ function PlanScreen({
     writeWebStorage('local', 'mo.shortcutsHintDismissed', '1')
   }, [])
 
-  // Auto-clear focus when items disappear (defensive — same scenario as
-  // selection pruning above). F15: keep focus in-range for displayItems
-  // (the rendered rows), since j/k navigation now indexes that. Collapsing
-  // a conversation cluster shrinks displayItems, so a focusedIndex at the
-  // old tail must clamp down to stay on a visible row.
+  // Keep the cursor ON a shown email (F15: d / s / Enter must never act on a
+  // row the user can't see). A sibling folded into a collapsed cluster hands
+  // the cursor to the rep row standing for it; an email a filter (chips,
+  // 「待確認」) hides drops it — no ring — rather than coming back later. A
+  // sort flip keeps it on the same email wherever that row moved. Judged
+  // from the REF: a j / k landing between a commit and this (passive)
+  // effect already moved it, and must not be undone here.
+  //
+  // …except when the user's OWN action on the cursor row is what moved it
+  // (2026-11-06, round 3). Following the email is right when the list
+  // reorders around it — an AI chunk merging in, another row's edit
+  // splitting a cluster. But d / s / a retarget that takes the cursor row
+  // into another 依資料夾 group, out of the filter, or folds it into a
+  // cluster used to drag the ring along — off-screen into e.g. the delete
+  // group, where the next d did nothing (already 刪除) and j went on from
+  // there; under a filter the ring vanished and j restarted at the top.
+  // Such an edit leaves an anchor (anchorEdit); once it has landed, the
+  // cursor moves ON to the next mail of the list as it was.
+  const editAnchorRef = useRef<CursorEditAnchor | null>(null)
   useEffect(() => {
-    if (focusedIndex !== null && focusedIndex >= displayItems.length) {
-      setFocusedIndex(displayItems.length > 0 ? displayItems.length - 1 : null)
+    const id = cursorIdRef.current
+    const anchor = editAnchorRef.current
+    if (anchor && anchor.items !== items) {
+      editAnchorRef.current = null
+      if (id !== null && id === anchor.emailId) {
+        const now = displayIndexById.get(id)
+        const was = anchor.before[anchor.index]
+        const leftItsPlace =
+          now === undefined ||
+          (sortMode === 'byTarget' && !!was && targetGroupKey(displayItems[now]!) !== targetGroupKey(was))
+        if (leftItsPlace) {
+          let next: string | null = null
+          for (let k = anchor.index + 1; k < anchor.before.length && next === null; k++) {
+            const e = anchor.before[k]!.emailId
+            if (!anchor.changed.has(e) && displayIndexById.has(e)) next = e
+          }
+          // Nothing after it stays where it was: the row now at its place.
+          if (next === null && displayItems.length > 0) {
+            next = displayItems[Math.min(anchor.index, displayItems.length - 1)]!.emailId
+          }
+          setCursorId(next)
+          return
+        }
+      }
     }
-  }, [displayItems.length, focusedIndex])
+    const idx = cursorIndexOf(id)
+    const shown = idx === null ? null : (displayItems[idx]?.emailId ?? null)
+    if (id !== shown) setCursorId(shown)
+  }, [cursorId, cursorIndexOf, displayIndexById, displayItems, items, sortMode, setCursorId])
 
-  // Reset focus when the filter narrows differently, OR the sort mode flips
-  // (both reorder displayItems, so a held focusedIndex would point at a
-  // different row than the user expects). Without this, j/k could land on an
-  // item the user can no longer see while their visible list scrolls past
-  // unexpected entries.
-  useEffect(() => {
-    setFocusedIndex(null)
-  }, [filterChips, sortMode])
+  /**
+   * The user is about to change `emailId` (and every email in `changed`) —
+   * record where it sits for the effect above. Not shown (folded / filtered)
+   * → nothing to anchor. Called before the change is handed up.
+   */
+  function anchorEdit(emailId: string, changed: Set<string>) {
+    const index = displayIndexById.get(emailId)
+    editAnchorRef.current =
+      index === undefined ? null : { emailId, index, before: displayItems, changed, items }
+  }
+  /** A bulk action that includes the cursor's email anchors it like a row edit. */
+  function anchorBulkEdit(ids: ReadonlySet<string>) {
+    const cur = cursorIdRef.current
+    if (cur !== null && ids.has(cur)) anchorEdit(cur, new Set(ids))
+  }
 
   // Stable row handlers for the memoized PlanRow (2026-11-05). PlanRow used
   // to get fresh inline arrows on every render, so each filter keystroke or
@@ -2617,23 +2881,83 @@ function PlanScreen({
   // (handleItemChange / propagateFrom are function declarations — hoisted.)
   const onRowChange = useStableCallback(handleItemChange)
   const onRowPropagate = useStableCallback(propagateFrom)
-  const onRowActivate = useCallback((index: number) => setFocusedIndex(index), [])
+  const onRowActivate = useStableCallback((index: number) => {
+    const it = displayItems[index]
+    if (it) setCursorId(it.emailId)
+  })
+
+  // Keyboard-only use (2026-11-06): Tabbing onto a row moves the cursor
+  // there, and a list control that isn't a row (全選此組, 展開 / 收合同對話)
+  // keeps its own Enter / Space when Tabbed to. Before, the cursor stayed
+  // where the first activation's bubbled click had put it: Tab to row 2 +
+  // Enter collapsed row 1, Space on row 2's checkbox selected row 1, and the
+  // non-row controls could not be activated at all. Focus a MOUSE click left
+  // behind still steers nothing — see createFocusOriginTracker.
+  const focusOriginRef = useRef<FocusOriginTracker | null>(null)
+  useEffect(() => {
+    const tracker = createFocusOriginTracker(document)
+    focusOriginRef.current = tracker
+    return () => {
+      tracker.dispose()
+      if (focusOriginRef.current === tracker) focusOriginRef.current = null
+    }
+  }, [])
+  function onListFocus(e: ReactFocusEvent<HTMLUListElement>) {
+    if (!focusOriginRef.current?.isKeyboardFocused(e.target)) return
+    const rowEl = e.target.closest(`[${PLAN_ROW_INDEX_ATTR}]`)
+    const it = rowEl ? displayItems[Number(rowEl.getAttribute(PLAN_ROW_INDEX_ATTR))] : undefined
+    if (it) setCursorId(it.emailId)
+  }
+
+  // Esc clears the cursor FIRST (2026-11-06). In the OWA panel the App-level
+  // Esc handler closes the whole panel — and, registered at mount, it runs
+  // before this screen's bubble listener, so one Esc both cleared the ring
+  // and closed the panel. This capture listener runs ahead of it and marks
+  // the Esc as used (preventDefault, which that handler respects). With no
+  // cursor left, the next Esc reaches it and closes the panel.
+  useEffect(() => {
+    function onEsc(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || e.defaultPrevented || isImeComposing(e)) return
+      if (ownsNavigationKeys(e.target) && !isPlanListCheckbox(e.target)) return
+      if (overlayLayerOpen()) return
+      if (cursorIdRef.current === null) return
+      e.preventDefault()
+      setCursorId(null)
+    }
+    document.addEventListener('keydown', onEsc, true)
+    return () => document.removeEventListener('keydown', onEsc, true)
+  }, [setCursorId])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       // Don't hijack typing in inputs/textareas/selects/contenteditable or
-      // composite widgets (listbox / menu / …) — they own every key.
-      if (ownsNavigationKeys(e.target)) return
+      // composite widgets (listbox / menu / …) — they own every key. A row's
+      // checkbox is not one of them (2026-11-06): clicking it leaves it
+      // focused, which used to kill every shortcut.
+      if (ownsNavigationKeys(e.target) && !isPlanListCheckbox(e.target)) return
       // Don't compete with browser/system shortcuts
       if (e.metaKey || e.ctrlKey || e.altKey) return
       // An open layer (? dialog, menu) owns the keyboard — don't drive the
       // list underneath it.
       if (overlayLayerOpen()) return
-      // Enter / Space on a focused button / link / summary is that
-      // element's native activation (2026-11-05). Clicking a row sets the
-      // keyboard cursor, so Enter on 執行 used to toggle the cursor row
-      // instead of executing. j/k/x/d/s still work from a focused button.
-      if ((e.key === 'Enter' || e.key === ' ') && ownsActivationKeys(e.target)) return
+      // The cursor as of this key press (the ref: a repeat may beat the re-render).
+      const cur = cursorIndexOf(cursorIdRef.current)
+      // Enter / Space: a focused control OUTSIDE the plan list keeps its
+      // native activation (2026-11-05 — Enter on 執行 executes instead of
+      // toggling the cursor row). Inside the list the cursor row wins
+      // (2026-11-06): DOM focus there is usually just the last-clicked row's
+      // toggle while j/k moved the cursor on — except a Tabbed-to control.
+      // See focusOwnsPlanActivation. j/k/x/d/s work from any focused button.
+      if (
+        (e.key === 'Enter' || e.key === ' ') &&
+        focusOwnsPlanActivation(
+          e.target,
+          cur,
+          focusOriginRef.current?.isKeyboardFocused(e.target) === true,
+        )
+      ) {
+        return
+      }
 
       // `/` opens the filter input. Available even during AI classify so
       // the user can pre-narrow the rule-hit portion of the plan while
@@ -2648,8 +2972,9 @@ function PlanScreen({
 
       // 刀3 (UI/UX 檢討 2026-07)：AI 分類中不再封鎖鍵盤 — 律師每批開頭
       // 有 30-60 秒盯著已可審的規則命中列卻按不了 j/k/d/s，一天 2-3 批
-      // 就是每天數分鐘死時間。安全性：focusedIndex 對 displayItems.length
-      // 有 clamp，AI 結果只會 append、不會位移既有 index。
+      // 就是每天數分鐘死時間。安全性（2026-11-06 修正）：游標記的是郵件、
+      // 不是位置 — AI 結果在「依資料夾」排序下會插到游標上方，舊的「只
+      // append、不位移」假設並不成立。
 
       // F15 (2026-06-03): navigate the VISIBLE list (displayItems), not
       // filteredItems. Rows are rendered from displayItems, which omits
@@ -2664,33 +2989,32 @@ function PlanScreen({
       const key = e.key
       const lower = key.toLowerCase()
 
-      if (lower === 'j' || key === 'ArrowDown') {
+      if (lower === 'j' || key === 'ArrowDown' || lower === 'k' || key === 'ArrowUp') {
         e.preventDefault()
-        setFocusedIndex((i) => (i === null ? 0 : Math.min(i + 1, len - 1)))
-        setScrollIntoViewToken((v) => v + 1)
-        setShortcutsHintDismissed(true)
-      } else if (lower === 'k' || key === 'ArrowUp') {
-        e.preventDefault()
-        setFocusedIndex((i) => (i === null ? 0 : Math.max(i - 1, 0)))
+        const down = lower === 'j' || key === 'ArrowDown'
+        const next = cur === null ? 0 : down ? Math.min(cur + 1, len - 1) : Math.max(cur - 1, 0)
+        setCursorId(displayItems[next]!.emailId)
+        // The cursor moved on: a Tabbed-to control no longer owns Enter / Space.
+        focusOriginRef.current?.release()
         setScrollIntoViewToken((v) => v + 1)
         setShortcutsHintDismissed(true)
       } else if (key === ' ' || lower === 'x') {
-        if (focusedIndex !== null) {
+        if (cur !== null) {
           e.preventDefault()
-          const item = displayItems[focusedIndex]
+          const item = displayItems[cur]
           if (item) toggleSelect(item.emailId)
           setShortcutsHintDismissed(true)
         }
       } else if (key === 'Enter') {
-        if (focusedIndex !== null) {
+        if (cur !== null) {
           e.preventDefault()
           setToggleExpandToken((v) => v + 1)
           setShortcutsHintDismissed(true)
         }
       } else if (lower === 'd') {
-        if (focusedIndex !== null) {
+        if (cur !== null) {
           e.preventDefault()
-          const item = displayItems[focusedIndex]
+          const item = displayItems[cur]
           if (item && item.action !== 'delete') {
             onRowChange({
               ...item,
@@ -2707,9 +3031,9 @@ function PlanScreen({
           setShortcutsHintDismissed(true)
         }
       } else if (lower === 's') {
-        if (focusedIndex !== null) {
+        if (cur !== null) {
           e.preventDefault()
-          const item = displayItems[focusedIndex]
+          const item = displayItems[cur]
           if (item && item.action !== 'skip') {
             onRowChange({
               ...item,
@@ -2725,13 +3049,12 @@ function PlanScreen({
           }
           setShortcutsHintDismissed(true)
         }
-      } else if (key === 'Escape') {
-        setFocusedIndex(null)
       }
+      // Escape: the capture listener above (clears the cursor first).
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [displayItems, focusedIndex, onRowChange, toggleSelect])
+  }, [displayItems, cursorIndexOf, setCursorId, onRowChange, toggleSelect])
 
   // Subject groups for "💡 N items share same subject" hints
   const subjectGroups = useMemo(() => {
@@ -2806,6 +3129,7 @@ function PlanScreen({
     // untouched siblings) — hence the wrapper here instead of baking it
     // into the shared transform.
     const base = buildPropagateTransform(source)
+    anchorBulkEdit(otherIds)
     onBulkApply(otherIds, (item) => ({ ...base(item), userTouched: true }))
     setSelectedIds(new Set())
   }
@@ -2815,6 +3139,10 @@ function PlanScreen({
   // fully-specified new_folder). Last-write-wins: subsequent edits override
   // earlier ones across the whole same-subject group.
   function handleItemChange(item: PlanItem) {
+    // The user's own edit of this row (d / s, the row's buttons, a retarget):
+    // the cursor moves on if it takes the row out of its place — anchorEdit.
+    const changed = new Set([item.emailId])
+    anchorEdit(item.emailId, changed)
     onChange(item)
     const complete =
       item.action === 'delete' ||
@@ -2836,6 +3164,7 @@ function PlanScreen({
       siblingIds.filter((id) => !itemsById.get(id)?.userTouched),
     )
     if (targetIds.size === 0) return
+    for (const id of targetIds) changed.add(id) // they move along — not "the next mail"
     onBulkApply(targetIds, buildPropagateTransform(item))
     setPropagateToast({ count: targetIds.size, key: Date.now() })
   }
@@ -2848,6 +3177,7 @@ function PlanScreen({
     if (selectedIds.size === 0) setBulkMoveOpen(false)
   }, [selectedIds])
   function applyMoveTo(node: MailFolderNode) {
+    anchorBulkEdit(selectedIds)
     onBulkApply(selectedIds, (item) => ({
       ...item,
       action: 'move' as const,
@@ -2867,6 +3197,7 @@ function PlanScreen({
   // user decisions — without the flag, a later same-subject auto-propagation
   // could silently flip a bulk-保留 row back to 刪除.
   function applyDelete() {
+    anchorBulkEdit(selectedIds)
     onBulkApply(selectedIds, (item) => ({
       ...item,
       action: 'delete' as const,
@@ -2882,6 +3213,7 @@ function PlanScreen({
   }
 
   function applySkip() {
+    anchorBulkEdit(selectedIds)
     onBulkApply(selectedIds, (item) => ({
       ...item,
       action: 'skip' as const,
@@ -2950,6 +3282,10 @@ function PlanScreen({
             {attentionCount > 0 && (
               <button
                 type="button"
+                // A mouse click must not park DOM focus here (2026-11-06):
+                // the next Space / Enter would flip the filter again instead
+                // of reaching the cursor row. Still Tab-focusable.
+                onMouseDown={noPointerFocus}
                 onClick={() => setAttentionOnly((v) => !v)}
                 className={cn(
                   'rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors',
@@ -2969,6 +3305,7 @@ function PlanScreen({
             {items.length > 2 && (
               <button
                 type="button"
+                onMouseDown={noPointerFocus} // same reason as 待確認 above
                 onClick={() => setSortMode((m) => (m === 'byTarget' ? 'default' : 'byTarget'))}
                 className={cn(
                   'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors',
@@ -3228,7 +3565,12 @@ function PlanScreen({
         // inline expand existed. PlanRow's own layout uses useLayout()
         // to widen its content in wide mode, so we don't need a
         // different render here.
-        <ul className="space-y-1.5">
+        // data-plan-list (= PLAN_LIST_ATTR, 2026-11-06): inside this list
+        // Enter / Space act on the keyboard-cursor row, whatever list element
+        // has DOM focus — see popup/keyboard.ts. The selection count reaches
+        // only the expanded rows' 全部套用 button (context, not a row prop).
+        <PlanSelectionCountContext.Provider value={selectedIds.size}>
+        <ul className="space-y-1.5" data-plan-list="" onFocus={onListFocus}>
           {displayItems.map((it, idx) => {
             const cid = it.conversationId
             const group = cid ? conversationGroups.get(cid) : undefined
@@ -3290,9 +3632,6 @@ function PlanScreen({
                   validPaths={validPaths}
                   excludePrefixes={excludePrefixes}
                   selected={selectedIds.has(it.emailId)}
-                  otherSelectedCount={
-                    selectedIds.size - (selectedIds.has(it.emailId) ? 1 : 0)
-                  }
                   focused={focusedIndex === idx}
                   scrollIntoViewToken={
                     focusedIndex === idx ? scrollIntoViewToken : undefined
@@ -3346,6 +3685,7 @@ function PlanScreen({
             )
           })}
         </ul>
+        </PlanSelectionCountContext.Provider>
       )}
 
       {/* 底欄減層（UI/UX 檢討 2026-07）：舊版最多疊三層（刪除警示條＋
@@ -3431,6 +3771,18 @@ const ACTION_LABEL_SHORT: Record<PlanAction, string> = {
   skip: '留',
 }
 
+/**
+ * Items that reached a final status (2026-11-06). The progress used to show
+ * `state.current` — the index of the item a worker started LAST — and with
+ * new_folder items run first and 3 parallel workers that number jumped
+ * backward and forward; the count of finished items only ever grows.
+ */
+function finishedItemCount(state: ExecuteState): number {
+  let n = 0
+  for (const r of state.results) if (r.status !== 'queued' && r.status !== 'processing') n++
+  return n
+}
+
 function ExecutingScreen({
   state,
   onCancel,
@@ -3438,7 +3790,8 @@ function ExecutingScreen({
   state: ExecuteState
   onCancel: () => void
 }) {
-  const pct = state.total > 0 ? Math.round((state.current / state.total) * 100) : 0
+  const finished = finishedItemCount(state)
+  const pct = state.total > 0 ? Math.round((finished / state.total) * 100) : 0
   // Arm the cancel button only after a short beat (audit P2): PlanScreen's
   // 執行 and this screen's 取消 render in the same sticky-bar spot, so the
   // second click of a double-click on 執行 landed HERE and cancelled the
@@ -3456,7 +3809,7 @@ function ExecutingScreen({
           <div className="font-medium">
             {state.cancelRequested ? '取消中…' : '執行中'}
             <span className="ml-2 text-muted-foreground tabular-nums">
-              {state.current} / {state.total}
+              {finished} / {state.total}
             </span>
           </div>
           <span className="font-mono text-muted-foreground tabular-nums">{pct}%</span>
@@ -3510,6 +3863,8 @@ type UndoResultPayload = {
   restored: number
   failed: number
   errors: Array<{ subject: string; message: string }>
+  /** One shared reason when the whole undo stopped (token outage, 2026-11-06). */
+  message?: string
 }
 
 // Compact rule-type labels for the DoneScreen learned-rules list (覆核 P1-3).
@@ -3745,9 +4100,14 @@ function DoneScreen({
               <div className="font-medium text-red-900">
                 撤回部分失敗:成功 {undoResult.restored} 件 / 失敗 {undoResult.failed} 件
               </div>
+              {undoResult.message && (
+                <div className="text-[11px] text-red-800">{undoResult.message}</div>
+              )}
               {undoResult.errors.slice(0, 3).map((e, i) => (
                 <div key={i} className="text-[10px] text-red-800 truncate">
-                  • {e.subject || '(無主旨)'}: {e.message}
+                  {/* A shared stop reason is shown once above, not per row. */}
+                  • {e.subject || '(無主旨)'}
+                  {undoResult.message && e.message === undoResult.message ? '' : `: ${e.message}`}
                 </div>
               ))}
               {undoResult.errors.length > 3 && (

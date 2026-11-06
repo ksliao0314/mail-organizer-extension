@@ -1,6 +1,7 @@
 // Token-bucket rate limiter + concurrency semaphore.
-// Outlook REST tolerates ~60 req/min (per handoff). We model it as 1 token/sec
-// steady-state with 10 token burst so short flurries don't gate on the bucket.
+// The Outlook budget (OUTLOOK_REQUESTS_PER_SEC steady, OUTLOOK_REQUEST_BURST
+// burst — 8/s and 40 since v1.0.9) lives in constants.ts; this module only
+// implements the mechanisms.
 
 function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('Aborted', 'AbortError')
@@ -109,6 +110,66 @@ export class Semaphore {
       this.waiters.shift()!.grant()
     }
   }
+}
+
+/**
+ * One signal that aborts when any input does (AbortSignal.any, 2026-11-06) —
+ * plus `dispose()`, which detaches it from the inputs again. Callers pass a
+ * batch's long-lived signal into every request; without the detach each
+ * request would leave a listener on it for the rest of the batch.
+ */
+export function linkAbortSignals(signals: Array<AbortSignal | undefined>): {
+  signal: AbortSignal
+  dispose: () => void
+} {
+  const ctl = new AbortController()
+  const detach: Array<() => void> = []
+  for (const s of signals) {
+    if (!s) continue
+    if (s.aborted) {
+      ctl.abort(s.reason)
+      break
+    }
+    const onAbort = () => ctl.abort(s.reason)
+    s.addEventListener('abort', onAbort, { once: true })
+    detach.push(() => s.removeEventListener('abort', onAbort))
+  }
+  return {
+    signal: ctl.signal,
+    dispose: () => {
+      for (const d of detach.splice(0)) d()
+    },
+  }
+}
+
+/**
+ * `p`, unless `signal` aborts first — then rejects with the abort reason
+ * (2026-11-06 r2). `p` itself keeps running (e.g. a shared token refresh
+ * other callers still wait on); only this caller stops waiting.
+ */
+export function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p
+  if (signal.aborted) {
+    p.catch(() => {}) // nobody waits on it any more
+    return Promise.reject(abortReason(signal))
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      p.catch(() => {})
+      reject(abortReason(signal))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(v)
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(e)
+      },
+    )
+  })
 }
 
 export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {

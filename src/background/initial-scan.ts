@@ -21,13 +21,14 @@ import {
   normalizeSignal,
 } from '@/shared/rules'
 import {
-  getMailboxIdentity,
+  type MailboxIdentity,
   recordConversationFilings,
   recordSubjectFilings,
 } from '@/shared/storage'
 import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from '@/shared/normalize'
 import type { MailFolderNode, Rule } from '@/shared/types'
 import { holdKeepAlive, releaseKeepAlive } from './keep-alive'
+import { getAccountCheckedIdentity } from './mailbox-identity'
 
 const SCAN_KEY = 'scanState'
 const TOP_PER_FOLDER = 20
@@ -169,6 +170,15 @@ export async function isScanRunning(): Promise<boolean> {
   return !!(await getScanState())?.inProgress
 }
 
+/**
+ * Synchronous: a scan has claimed the start guard in THIS worker (2026-11-06
+ * r2). The SW handler re-checks it right before calling startInitialScan,
+ * after its own awaits — startInitialScan would refuse right now.
+ */
+export function isScanBusy(): boolean {
+  return scanStartInFlight
+}
+
 export async function startInitialScan(opts: {
   rootPath: string
   tree: MailFolderNode[]
@@ -178,6 +188,10 @@ export async function startInitialScan(opts: {
    *  extracting per-folder sender candidates (colleagues cross-work
    *  many cases). Empty array = solo mode, all senders eligible. */
   internalDomains: string[]
+  /** The signed-in mailbox, resolved and account-checked by the caller (the
+   *  SW handler's GET /me, 2026-11-06 r2); null = unknown. Omitted → the
+   *  account-checked cached identity. */
+  ownIdentity?: MailboxIdentity | null
 }): Promise<void> {
   const { rootPath, tree, api, excludePrefixes, internalDomains } = opts
   // Lowercase + Set for O(1) lookup in the per-email loop.
@@ -337,8 +351,19 @@ export async function startInitialScan(opts: {
     // counted colleagues' mail filed into case folders and could mint
     // `domain: <own domain>` — a rule the owner's address on To/Cc lets
     // match nearly every inbound email. Treat it like internalDomains.
-    const identity = await getMailboxIdentity().catch(() => null)
-    if (identity?.domain) internalDomainSet.add(identity.domain)
+    // The caller resolves it (2026-11-06): the cache alone is filled only
+    // by a classify preflight, so a scan run first had no identity at all.
+    // A generic-provider mailbox (me@outlook.com) shares its domain with
+    // every stranger on it — there only the owner's own address is skipped,
+    // so friend@outlook.com still counts as a sender candidate.
+    // Domain AND address come from the same account-checked identity
+    // (2026-11-06 r2): the address used to come from the raw cache — after an
+    // account switch, the previous mailbox's.
+    const identity = opts.ownIdentity !== undefined ? opts.ownIdentity : await getAccountCheckedIdentity()
+    const ownDomain = (identity?.domain ?? '').trim().toLowerCase().replace(/^@/, '')
+    if (ownDomain && !isGenericProviderDomain(ownDomain)) internalDomainSet.add(ownDomain)
+    const ownAddress =
+      identity?.address && isGenericProviderDomain(identity.domain) ? identity.address : ''
 
     currentController = controller
     await holdKeepAlive()
@@ -386,7 +411,10 @@ export async function startInitialScan(opts: {
         const senderCounts = new Map<string, number>()
         for (const m of emails) {
           const addr = m.From?.EmailAddress?.Address
-          const d = extractDomain(addr ?? null)
+          // The owner's own address counts as internal (generic-provider
+          // mailbox — see ownAddress above).
+          const fromSelf = !!ownAddress && (addr ?? '').toLowerCase().trim() === ownAddress
+          const d = fromSelf ? null : extractDomain(addr ?? null)
           if (d && !isInternalDomain(d)) {
             domainCounts.set(d, (domainCounts.get(d) ?? 0) + 1)
             if (addr && isGenericProviderDomain(d)) {

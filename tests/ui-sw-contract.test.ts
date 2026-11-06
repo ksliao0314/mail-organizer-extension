@@ -80,6 +80,61 @@ describe('rule import contract', () => {
     expect(r.ok).toBe(true)
     expect(await listRules()).toHaveLength(1)
   })
+
+  // Folders on this machine: the imported rule's 某案 (when `withTarget`) and
+  // the local rule's 別案.
+  const OTHER = 'AAMkAD-other-folder-id-000000'
+  const folders = (withTarget: boolean): MailFolderNode[] => [
+    {
+      id: 'AAMkAD-root-folder-id-00000000',
+      displayName: '03進行中案件',
+      path: '03進行中案件',
+      children: [
+        ...(withTarget
+          ? [{ id: 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3', displayName: '某案', path: '03進行中案件/某案', children: [] }]
+          : []),
+        { id: OTHER, displayName: '別案', path: '03進行中案件/別案', children: [] },
+      ],
+    },
+  ]
+  async function importOver(withTarget: boolean) {
+    const mine = rule('d.example')
+    await setRules([mine])
+    const payload = ((await sw.send({ type: 'exportRules' })).data as { payload: string }).payload
+    const scan = { ...rule('d.example'), id: 'scan', source: 'auto_scan' as const, targetFolderId: OTHER, targetFolderPath: '03進行中案件/別案' }
+    await setRules([scan])
+    await setFolderCache({
+      updatedAt: new Date().toISOString(),
+      tree: folders(withTarget),
+      // current-format cache; one without wellKnown is refetched as legacy (round 3)
+      wellKnown: { roots: [], complete: true },
+    })
+    const r = await sw.send({ type: 'importRules', payload, strategy: 'merge' })
+    expect(r.ok).toBe(true)
+    return { r, mine }
+  }
+
+  it('R5: an imported hand-written rule takes over from a local auto one — reported in the counts and the history', async () => {
+    const { r, mine } = await importOver(true)
+    expect(r.data).toMatchObject({ added: 1, skipped: 0, conflictSkipped: 0, replacedLocal: 1, supersededLocal: 1 })
+    const rules = await listRules()
+    expect(rules.find((x) => x.id === mine.id)?.enabled).toBe(true)
+    expect(rules.find((x) => x.id === 'scan')).toMatchObject({ enabled: false, autoDisabledReason: 'superseded' })
+    const events = await getRuleEvents(10)
+    expect(events.some((e) => e.kind === 'toggle' && e.ruleId === 'scan' && e.enabled === false)).toBe(true)
+  })
+
+  // Round 3: the takeover was decided before the reconcile, so a working
+  // local rule was switched off for an imported rule whose folder does not
+  // exist here — and nothing routed that signal any more.
+  it('R5: no takeover by an imported rule whose folder does not exist here', async () => {
+    const { r, mine } = await importOver(false)
+    expect(r.data).toMatchObject({ added: 1, supersededLocal: 0, orphanedCount: 1 })
+    const rules = await listRules()
+    expect(rules.find((x) => x.id === 'scan')).toMatchObject({ enabled: true }) // was: superseded
+    expect(rules.find((x) => x.id === 'scan')!.autoDisabledReason).toBeUndefined()
+    expect(rules.find((x) => x.id === mine.id)).toMatchObject({ enabled: true, orphaned: true })
+  })
 })
 
 describe('OWA floating button never sees the API key', () => {

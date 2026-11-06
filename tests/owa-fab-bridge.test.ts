@@ -10,16 +10,28 @@
 //   - Extension URLs are resolved once; after an extension update (orphaned
 //     content script) the FAB tells the user to reload instead of opening a
 //     half-working panel.
+//   - (2026-11-06) every hello carries a fresh one-time nonce from the SW
+//     ('issuePanelPairingNonce'), which the frame redeems before trusting the
+//     port — no nonce, no hello.
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 const EXT = 'chrome-extension://test-extension'
 let shadow: ShadowRoot | null = null
 let host: HTMLElement | null = null
+let nonceSeq = 0
+let nonceAvailable = true
 const runtime: { id: string | undefined } & Record<string, unknown> = {
   id: 'test-extension',
   getURL: (p: string) => `${EXT}/${p}`,
-  sendMessage: vi.fn(async () => ({ ok: true, data: { show: true } })),
+  sendMessage: vi.fn(async (msg: { type?: string }) => {
+    if (msg?.type === 'issuePanelPairingNonce') {
+      return nonceAvailable
+        ? { ok: true, data: { nonce: `nonce-${++nonceSeq}` } }
+        : { ok: false, code: 'NO_TAB', message: 'no tab' }
+    }
+    return { ok: true, data: { show: true } }
+  }),
   onMessage: { addListener: vi.fn() },
 }
 const realAttachShadow = Element.prototype.attachShadow
@@ -76,9 +88,11 @@ describe('OWA FAB bridge', () => {
     Object.defineProperty(iframe, 'contentWindow', { value: { postMessage }, configurable: true })
     iframe.dispatchEvent(new Event('load'))
 
-    expect(postMessage).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1))
     const [msg, opts] = postMessage.mock.calls[0]!
-    expect(msg).toEqual({ type: 'mail-organizer/parent-hello' })
+    // The hello carries the nonce the SW just issued to this content script.
+    expect(runtime.sendMessage).toHaveBeenCalledWith({ type: 'issuePanelPairingNonce' })
+    expect(msg).toEqual({ type: 'mail-organizer/parent-hello', nonce: `nonce-${nonceSeq}` })
     expect(opts.targetOrigin).toBe(EXT)
     const port = opts.transfer[0] as MessagePort
     expect(port).toBeInstanceOf(MessagePort)
@@ -96,6 +110,42 @@ describe('OWA FAB bridge', () => {
     port.postMessage({ type: 'mail-organizer/close-panel' })
     await vi.waitFor(() => expect(backdrop.classList.contains('open')).toBe(false))
     port.close()
+  })
+
+  it('posts no hello without an SW nonce, and every re-offer carries a fresh one', async () => {
+    const { fab, backdrop, iframe } = parts()
+    fab.click()
+    expect(backdrop.classList.contains('open')).toBe(true)
+    const postMessage = vi.fn()
+    Object.defineProperty(iframe, 'contentWindow', { value: { postMessage }, configurable: true })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      nonceAvailable = false
+      iframe.dispatchEvent(new Event('load'))
+      await vi.advanceTimersByTimeAsync(100)
+      expect(postMessage).not.toHaveBeenCalled() // SW said no → nothing offered
+
+      nonceAvailable = true
+      await vi.advanceTimersByTimeAsync(100) // first retry (150 ms)
+      expect(postMessage).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(400) // no ack yet → second retry
+      expect(postMessage).toHaveBeenCalledTimes(2)
+      const nonces = postMessage.mock.calls.map(([m]) => (m as { nonce: string }).nonce)
+      expect(nonces[0]).toMatch(/^nonce-/)
+      expect(nonces[1]).toMatch(/^nonce-/)
+      expect(nonces[0]).not.toBe(nonces[1])
+
+      // The frame acks the second offer; retries stop and its port carries commands.
+      const port = postMessage.mock.calls[1]![1].transfer[0] as MessagePort
+      port.postMessage({ type: 'mail-organizer/bridge-ack' })
+      port.postMessage({ type: 'mail-organizer/close-panel' })
+      vi.useRealTimers()
+      await vi.waitFor(() => expect(backdrop.classList.contains('open')).toBe(false))
+      port.close()
+    } finally {
+      vi.useRealTimers()
+      nonceAvailable = true
+    }
   })
 
   it('after an extension update, a FAB click asks for an Outlook reload instead of opening', () => {

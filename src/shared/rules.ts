@@ -6,8 +6,13 @@
 // Matching order — matchEmailWithIndex; the first tier that matches wins
 // (2026-11-05). TYPE_PRIORITY below is only the within-library sort key —
 // the real match path interleaves tiers by source and specificity:
+//   0. user_manual compound → subject_keyword whose subject CONTAINS a case
+//                                 id (court case number / Latin case code) —
+//                                 the user's exception inside a case outranks
+//                                 every case rule (2026-11-06, R1 + tier 0)
 //   1. case_code                — Latin case code in the subject (any source)
 //   2. compound                 — AND of (domain | subject_keyword | sender);
+//                                 case-id compounds, then user_manual, then
 //                                 longest subject condition first
 //   3. court-case subject rule  — subject_keyword whose signal IS a court
 //                                 case number (any source)
@@ -28,9 +33,13 @@ import {
   addRuleTombstones,
   clearMatchingTombstones,
   getActiveDays,
+  getLocalActiveDays,
+  getRuleCounterBaseline,
   getRuleTombstones,
   getRules,
   recordRuleEvents,
+  type RuleCounterBaseline,
+  setRuleCounterBaseline,
   setRules,
   utcDay,
 } from './storage'
@@ -46,6 +55,7 @@ import type {
   RuleType,
 } from './types'
 import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from './normalize'
+import { spellingFingerprint } from './sync-codec'
 
 // ---- Concurrency guard -----------------------------------------------------
 //
@@ -81,6 +91,12 @@ export type MutateRulesOptions = {
    * so its semantic edits get stamped (2026-11-05).
    */
   preserveEditedAt?: boolean
+  /**
+   * The counters on the rules this write brings in come from ELSEWHERE (an
+   * import file) — cover them in this machine's counter baseline (2026-11-06,
+   * R2: coverArrivals). Implied by `preserveEditedAt` (sync pull / restore).
+   */
+  arrivingCounters?: boolean
 }
 
 /**
@@ -98,6 +114,14 @@ export async function mutateRules<T>(
 ): Promise<T> {
   return withRulesLock(async () => {
     const current = await getRules()
+    // Tombstones as they were BEFORE fn (2026-11-06, clock skew): a create
+    // path clears the tombstones its rule supersedes inside fn, but the cloud
+    // still holds them — the new rule's editedAt must clear their deletedAt
+    // (see stampEditedAt's deletionFloor). Issued before fn so it reads the
+    // pre-fn state; awaited only when something is written.
+    const tombstonesBefore = opts.preserveEditedAt
+      ? undefined
+      : getRuleTombstones().catch((): RuleTombstone[] => [])
     const { next, result } = await fn(current)
     // Identity check (audit, perf): every transform follows copy-on-write —
     // it returns the SAME array ref only when truly nothing changed (all 18
@@ -107,15 +131,46 @@ export async function mutateRules<T>(
     // writes each — and also suppresses the redundant sync push the rules
     // onChanged listener would schedule.
     if (next !== current) {
-      await setRules(opts.preserveEditedAt ? next : stampEditedAt(current, next, Date.now()))
+      // Counters from elsewhere (sync pull / restore / import) are covered by
+      // this machine's counter baseline (R2, 2026-11-06) — BEFORE they land:
+      // a death in between leaves the baseline ahead (read as a drop and
+      // re-based, nothing judged), never behind.
+      if (opts.preserveEditedAt || opts.arrivingCounters) await coverArrivingCounters(current, next)
+      if (opts.preserveEditedAt) {
+        await setRules(next)
+      } else {
+        await setRules(stampEditedAt(current, next, Date.now(), deletionFloorOf(await tombstonesBefore!)))
+      }
     }
     return result
   })
 }
 
+/** Newest known deletion of a rule's canonical triple, from `tombstones`. */
+function deletionFloorOf(tombstones: readonly RuleTombstone[]): ((r: Rule) => number | undefined) | undefined {
+  if (tombstones.length === 0) return undefined
+  let byKey: Map<string, number> | undefined
+  return (r) => {
+    if (!byKey) {
+      byKey = new Map()
+      for (const t of tombstones) {
+        const k = tombstoneKey(t)
+        const cur = byKey.get(k)
+        if (cur === undefined || t.deletedAt > cur) byKey.set(k, t.deletedAt)
+      }
+    }
+    return byKey.get(ruleTripleKey(r))
+  }
+}
+
 // Fields whose change is a real EDIT of the rule's behaviour (2026-11-05).
 // Hit counters (matchCount / overrideCount / lastUsedAt) are deliberately
 // absent: they change on every batch and sync merges them separately (max).
+// So is `orphaned` (2026-11-06): reconcile sets / clears it from THIS
+// machine's folder tree — a per-device observation, never pushed. Stamping
+// it let a machine that merely failed to resolve a folder out-date (and keep
+// forever) a re-target made elsewhere, and its un-orphan re-publish a stale
+// copy over that re-target.
 const SEMANTIC_RULE_FIELDS = [
   'type',
   'signal',
@@ -126,18 +181,20 @@ const SEMANTIC_RULE_FIELDS = [
   'source',
   'autoDisabledReason',
   'autoDisabledAt',
-  'orphaned',
 ] as const
 
 function sameSemanticValue(
-  field: (typeof SEMANTIC_RULE_FIELDS)[number],
+  _field: (typeof SEMANTIC_RULE_FIELDS)[number],
   a: unknown,
   b: unknown,
 ): boolean {
-  // undefined / false are the same "not orphaned" state (mirrors diffSnapshots).
-  if (field === 'orphaned') return !!a === !!b
   // An explicitly-cleared optional (`autoDisabledAt: undefined`) equals absent.
   return (a ?? undefined) === (b ?? undefined)
+}
+
+/** Same behaviour: every SEMANTIC field equal (counters, stamps, orphaned ignored). */
+export function semanticFieldsEqual(a: Rule, b: Rule): boolean {
+  return SEMANTIC_RULE_FIELDS.every((f) => sameSemanticValue(f, a[f], b[f]))
 }
 
 /**
@@ -189,25 +246,86 @@ function withEditedAt(r: Rule, editedAt: number | undefined): Rule {
  * max(now, prev + 1), so an edit always supersedes the version it was based
  * on even when that version came from a machine whose clock runs ahead.
  * Exported for tests; production code reaches it only through mutateRules.
+ *
+ * Duplicate ids (2026-11-06): copies are paired by object identity first
+ * (copy-on-write — an untouched copy is the same object), then by occurrence
+ * order. Pairing every copy with the LAST stored copy re-stamped an untouched
+ * twin on every unrelated write, making it permanently "newest" in sync.
+ *
+ * `deletionFloor` (2026-11-06, clock skew): newest known deletion of a rule's
+ * canonical triple. A NEW rule, one switched back ON, or one an edit moved
+ * onto another canonical triple (S4 — e.g. a re-target onto a triple a
+ * fast-clock peer deleted) is stamped strictly after it — a tombstone minted
+ * against a fast-clock machine's timestamps can lie in this machine's future,
+ * and a rule stamped `now` would be suppressed by it after one sync round
+ * trip (the peer drops it and re-pushes the tombstone: gone everywhere).
+ *
+ * `orphanedAt` (S3) is maintained here too, derived from the stored version.
  */
-export function stampEditedAt(prev: Rule[], next: Rule[], now: number): Rule[] {
-  const prevById = new Map<string, Rule>()
-  for (const r of prev) prevById.set(r.id, r)
+export function stampEditedAt(
+  prev: Rule[],
+  next: Rule[],
+  now: number,
+  deletionFloor?: (r: Rule) => number | undefined,
+): Rule[] {
+  const prevRefs = new Set<Rule>(prev)
+  const prevById = new Map<string, Rule[]>()
+  for (const r of prev) {
+    const copies = prevById.get(r.id)
+    if (copies) copies.push(r)
+    else prevById.set(r.id, [r])
+  }
+  const above = (r: Rule, t: number): number => {
+    const d = deletionFloor?.(r)
+    return d !== undefined && Number.isFinite(d) && d >= t ? d + 1 : t
+  }
+  const occurrence = new Map<string, number>()
   let out: Rule[] | null = null
   for (let i = 0; i < next.length; i++) {
     const r = next[i]!
-    const p = prevById.get(r.id)
-    if (p === r) continue // copy-on-write: untouched rule keeps its ref
+    const occ = occurrence.get(r.id) ?? 0
+    occurrence.set(r.id, occ + 1)
+    if (prevRefs.has(r)) continue // copy-on-write: untouched rule keeps its ref
+    const copies = prevById.get(r.id)
+    const p = copies ? copies[Math.min(occ, copies.length - 1)] : undefined
+    const semantic = p !== undefined && isSemanticChange(p, r)
+    const o = withOrphanedAt(r, p, semantic, now)
     let stamped: Rule
-    if (!p) stamped = withEditedAt(r, now)
-    else if (isSemanticChange(p, r)) stamped = withEditedAt(r, Math.max(now, (p.editedAt ?? 0) + 1))
-    else stamped = withEditedAt(r, p.editedAt)
+    if (!p) stamped = withEditedAt(o, above(r, now))
+    else if (semantic) {
+      const t = Math.max(now, (p.editedAt ?? 0) + 1)
+      const floored = (!p.enabled && r.enabled) || ruleTripleKey(p) !== ruleTripleKey(r)
+      stamped = withEditedAt(o, floored ? above(r, t) : t)
+    } else stamped = withEditedAt(o, p.editedAt)
     if (stamped !== r) {
       out ??= next.slice()
       out[i] = stamped
     }
   }
   return out ?? next
+}
+
+/**
+ * The local-only orphanedAt of `r` (S3, 2026-11-06), derived from its stored
+ * version `p` like editedAt (a caller can neither forge nor erase it): set
+ * when `orphaned` turns on, carried while it stays on, dropped when it goes
+ * off. A rule orphaned before this build recorded it (a possible v1.0.8 orphan
+ * stamp in editedAt) gets one at its first genuine edit — the stamp it
+ * replaces bounds any orphan stamp, so from then on the merge trusts it.
+ */
+function withOrphanedAt(r: Rule, p: Rule | undefined, semanticEdit: boolean, now: number): Rule {
+  let want: number | undefined
+  if (r.orphaned) {
+    if (!p?.orphaned) want = now
+    else want = p.orphanedAt ?? (semanticEdit ? (p.editedAt ?? 0) : undefined)
+  }
+  if (want === undefined) {
+    if (!('orphanedAt' in r)) return r
+    const { orphanedAt: _drop, ...rest } = r
+    void _drop
+    return rest
+  }
+  return r.orphanedAt === want ? r : { ...r, orphanedAt: want }
 }
 
 // ---- CRUD ------------------------------------------------------------------
@@ -275,30 +393,49 @@ export class RuleNotFoundError extends Error {
 export type UpsertMode = 'create' | 'edit'
 
 /**
+ * The ONE user enable / disable transition (2026-11-06). toggleRule, the
+ * rule form (mergeEditableFields) and every bulk path (applyRuleBatch —
+ * multi-select, folder-group "disable all", resolveConflict disable_all,
+ * split-to-compound originals) go through it so they can't drift apart; the
+ * bulk path used to mirror an OLD toggleRule and ignore the closed-case
+ * exemption.
+ *   - enable: clears the auto-disable provenance, except that re-enabling a
+ *     'case_closed' rule keeps that reason as the user's exemption marker
+ *     (see applyClosedCaseRetirement) — otherwise the next preflight retires
+ *     it again.
+ *   - disable: a USER disable carries no auto provenance at all. A reason /
+ *     timestamp left on the enabled rule (an exemption marker, or a stale
+ *     reason the old drawer could save with enabled=true) made the user's
+ *     disable look like an engine one: revived by learning, purged by the
+ *     dormant sweep, re-enabled when the folder left the archive.
+ * Already in the requested state → the same rule object back (no-op).
+ */
+export function withToggle(before: Rule, enabled: boolean): Rule {
+  if (before.enabled === enabled) return before
+  return {
+    ...before,
+    enabled,
+    autoDisabledAt: undefined,
+    autoDisabledReason: enabled ? closedCaseExemptionOnEnable(before) : undefined,
+  }
+}
+
+/**
  * Overlay the fields the rule form owns onto the STORED rule (2026-11-05).
  * The Options page sends back its whole — possibly hours-old — copy;
  * writing that verbatim reset matchCount / overrideCount / lastUsedAt that
  * batches had bumped since the page loaded. Engine-owned fields (stats,
- * createdAt, source, sync stamps) always come from storage.
+ * createdAt, source, sync stamps) always come from storage. An enabled flip
+ * goes through withToggle (provenance / closed-case exemption).
  */
 function mergeEditableFields(stored: Rule, incoming: Rule): Rule {
   const next: Rule = {
-    ...stored,
+    ...withToggle(stored, incoming.enabled),
     type: incoming.type,
     signal: incoming.signal,
     targetFolderId: incoming.targetFolderId,
     targetFolderPath: incoming.targetFolderPath,
     confidence: incoming.confidence,
-    enabled: incoming.enabled,
-  }
-  if (!stored.enabled && incoming.enabled) {
-    // Re-enable clears the auto-disable provenance (same as toggleRule),
-    // except that a closed-case retirement leaves its reason behind as the
-    // user's exemption marker — see applyClosedCaseRetirement.
-    next.autoDisabledAt = undefined
-    next.autoDisabledReason = closedCaseExemptionOnEnable(stored)
-  } else if (stored.enabled && !incoming.enabled && isClosedCaseExempt(stored)) {
-    next.autoDisabledReason = undefined
   }
   if (
     stored.orphaned &&
@@ -312,21 +449,34 @@ function mergeEditableFields(stored: Rule, incoming: Rule): Rule {
 }
 
 /**
- * Clear tombstones for a triple the user is (re)creating — including ones
+ * Clear tombstones for triples the user is (re)creating — including ones
  * stored in a legacy, pre-canonical form (2026-11-05: normalizeSignal now
  * folds court-case forms / whitespace / '@', so a raw-key clear would miss a
- * tombstone written by an older build and leave the ghost behind).
+ * tombstone written by an older build and leave the ghost behind). One
+ * tombstone read for the whole set; the bulk handlers use it too (2026-11-06
+ * — split-to-compound cleared by raw key and left legacy-form ghosts).
  */
-async function clearTombstonesForRule(r: Rule): Promise<void> {
-  const signalNorm = normalizeSignal(r.type, r.signal)
-  const triples = [{ type: r.type, signalNorm, targetFolderPath: r.targetFolderPath }]
-  const want = `${r.type}::${signalNorm}::${r.targetFolderPath}`
+export async function clearTombstonesForRules(
+  rules: ReadonlyArray<Pick<Rule, 'type' | 'signal' | 'targetFolderPath'>>,
+): Promise<void> {
+  if (rules.length === 0) return
+  const triples: Array<{ type: RuleType; signalNorm: string; targetFolderPath: string }> = []
+  const wanted = new Set<string>()
+  for (const r of rules) {
+    const signalNorm = normalizeSignal(r.type, r.signal)
+    triples.push({ type: r.type, signalNorm, targetFolderPath: r.targetFolderPath })
+    wanted.add(`${r.type}::${signalNorm}::${r.targetFolderPath}`)
+  }
   for (const t of await getRuleTombstones()) {
-    if (t.signalNorm !== signalNorm && tombstoneKey(t) === want) {
+    if (wanted.has(tombstoneKey(t))) {
       triples.push({ type: t.type, signalNorm: t.signalNorm, targetFolderPath: t.targetFolderPath })
     }
   }
   await clearMatchingTombstones(triples)
+}
+
+async function clearTombstonesForRule(r: Rule): Promise<void> {
+  await clearTombstonesForRules([r])
 }
 
 /**
@@ -399,14 +549,9 @@ export async function deleteRule(id: string, opts?: { actor?: Actor }): Promise<
     // Tombstone the triple INSIDE the rules lock so auto-generators
     // (which also read tombstones under withRulesLock) can't race in
     // between rule-deletion and tombstone-write and auto-resurrect this.
-    await addRuleTombstones([
-      {
-        type: target.type,
-        signalNorm: normalizeSignal(target.type, target.signal),
-        targetFolderPath: target.targetFolderPath,
-        deletedAt: tombstoneDeletedAt(target),
-      },
-    ]).catch((e) =>
+    // It records the deleted spelling: a surviving canonical twin is not
+    // suppressed by it on any v1.0.9 machine (sync-engine `deletes`).
+    await addRuleTombstones([ruleTombstone(target)]).catch((e) =>
       console.warn('[mail-organizer] addRuleTombstones (delete)', e),
     )
     return { next, result: true }
@@ -435,10 +580,9 @@ export async function toggleRule(
   // when it was already true). Without this gate the history fills with
   // noise from idempotent toggle calls.
   //
-  // Side-effect on re-enable: clear `autoDisabledAt` + `autoDisabledReason`.
-  // Without this, a rule the user manually re-enabled would still wear the
-  // "已自動休眠" badge — visual lie. Once user takes manual action, the
-  // auto-disabled provenance is no longer current state.
+  // Provenance on the flip (enable clears it bar the closed-case exemption
+  // marker; a user disable strips it) lives in withToggle — shared with the
+  // rule form and the bulk handlers.
   const outcome = await mutateRules<{ rule: Rule | undefined; changed: boolean }>((rules) => {
     const idx = rules.findIndex((r) => r.id === id)
     if (idx < 0) return { next: rules, result: { rule: undefined, changed: false } }
@@ -446,26 +590,7 @@ export async function toggleRule(
     if (before.enabled === enabled) {
       return { next: rules, result: { rule: before, changed: false } }
     }
-    const updated: Rule = {
-      ...before,
-      enabled,
-      // On enable: clear auto-disable provenance. On disable (user
-      // chose to disable): leave any old auto-disable timestamp alone —
-      // doesn't make sense to "auto-disable" something the user
-      // explicitly disabled.
-      //
-      // Closed-case exemption (2026-11-05): re-enabling a 'case_closed'
-      // rule keeps that reason on the now-enabled rule as the marker
-      // applyClosedCaseRetirement honours ("the user wants this rule live
-      // even though its folder is archived"); disabling an exempt rule
-      // drops the marker so a later un-archive can't re-enable a rule the
-      // user turned off.
-      ...(enabled
-        ? { autoDisabledAt: undefined, autoDisabledReason: closedCaseExemptionOnEnable(before) }
-        : isClosedCaseExempt(before)
-          ? { autoDisabledReason: undefined }
-          : {}),
-    }
+    const updated = withToggle(before, enabled)
     const next = [...rules]
     next[idx] = updated
     return { next, result: { rule: updated, changed: true } }
@@ -774,6 +899,243 @@ const HIGH_ERROR_RATE_MIN_SAMPLES = 20
 const HIGH_ERROR_RATE_THRESHOLD = 0.5
 
 /**
+ * The fires / overrides the high-error-rate predicate may judge (2026-11-06).
+ * Before v1.0.8 a rule-routed row changed to 刪除 counted as an override, so
+ * an older library's overrideCount is inflated — and the fires-based
+ * predicate disabled broad rules on the first sweep that the old one kept
+ * (m8/o12, m15/o15), which the dormant purge then hard-deleted. A rule with
+ * an entry in this machine's local baseline (storage.ts RuleCounterBaseline:
+ * rules that predate it, counts at first sight) is judged only on what
+ * happened since — it needs HIGH_ERROR_RATE_MIN_SAMPLES fresh fires first.
+ * No entry → its whole record.
+ */
+function errorRateEvidence(
+  r: Pick<Rule, 'id' | 'matchCount' | 'overrideCount' | 'statsResetAt'>,
+  baseline: RuleCounterBaseline | null | undefined,
+): { fires: number; overrides: number } {
+  const m = r.matchCount ?? 0
+  const o = r.overrideCount ?? 0
+  const base = baseline?.counts[r.id]
+  // A NEWER counter epoch than the entry's means a revive reset the counters
+  // since (a fresh accuracy window): everything on them is new evidence. Only
+  // that is a reset (2026-11-06, R2) — counters that merely went DOWN (a
+  // replace-import of an older export, a restore) used to count as one, and
+  // the legacy record they carried was judged whole again.
+  if (!base || counterEpochOf(r) > (baseline?.epochs?.[r.id] ?? 0)) {
+    return { fires: m + o, overrides: o }
+  }
+  const overrides = Math.max(0, o - base[1])
+  return { fires: Math.max(0, m - base[0]) + overrides, overrides }
+}
+
+function isHighErrorRate(r: Rule, baseline: RuleCounterBaseline | null | undefined): boolean {
+  const { fires, overrides } = errorRateEvidence(r, baseline)
+  return fires >= HIGH_ERROR_RATE_MIN_SAMPLES && overrides / fires >= HIGH_ERROR_RATE_THRESHOLD
+}
+
+/** A rule's counter epoch (Rule.statsResetAt — set by revivedRule); 0 = none. */
+function counterEpochOf(r: Pick<Rule, 'statsResetAt'>): number {
+  const e = r.statsResetAt
+  return typeof e === 'number' && Number.isFinite(e) && e > 0 ? e : 0
+}
+
+/**
+ * The entry the sweep judges `r` from, given `baseline` (pure; the per-rule
+ * verdict of refreshCounterBaseline). undefined = no entry: a rule created
+ * after the baseline started is judged on its whole record.
+ *   - no entry yet, created before `capturedAt` → its current counts (first
+ *     sight — e.g. a legacy rule arriving later);
+ *   - a newer epoch than the entry's → [0, 0]: a revive opened a fresh
+ *     accuracy window, all of it counts;
+ *   - another epoch, or counters BELOW the entry without a newer epoch → the
+ *     current counts (2026-11-06, R2): they were replaced from elsewhere
+ *     (import, restore), nothing new was counted here. Re-based at the new
+ *     values, not at zero — zero judged the legacy record they carry whole.
+ */
+function judgedBase(
+  r: Rule,
+  baseline: RuleCounterBaseline,
+  capturedMs: number,
+): [number, number] | undefined {
+  const m = r.matchCount ?? 0
+  const o = r.overrideCount ?? 0
+  const base = baseline.counts[r.id]
+  if (!base) return Date.parse(r.createdAt) >= capturedMs ? undefined : [m, o]
+  const epoch = counterEpochOf(r)
+  const baseEpoch = baseline.epochs?.[r.id] ?? 0
+  if (epoch > baseEpoch) return [0, 0]
+  if (epoch !== baseEpoch || m < base[0] || o < base[1]) return [m, o]
+  return base
+}
+
+function baselineOf(
+  capturedAt: string,
+  counts: Record<string, [number, number]>,
+  epochs: Record<string, number>,
+): RuleCounterBaseline {
+  return Object.keys(epochs).length > 0 ? { capturedAt, counts, epochs } : { capturedAt, counts }
+}
+
+/**
+ * Bring the counter baseline up to date with the library (pure): every rule
+ * gets judgedBase's entry (with its epoch); entries of rules no longer
+ * stored are dropped. user_manual rules are never swept, so never baselined.
+ */
+function refreshCounterBaseline(
+  rules: readonly Rule[],
+  baseline: RuleCounterBaseline,
+): { baseline: RuleCounterBaseline; changed: boolean } {
+  const capturedMs = Date.parse(baseline.capturedAt)
+  const counts: Record<string, [number, number]> = {}
+  const epochs: Record<string, number> = {}
+  let changed = false
+  for (const r of rules) {
+    if (r.source === 'user_manual' || counts[r.id]) continue
+    const entry = judgedBase(r, baseline, capturedMs)
+    if (!entry) continue
+    const epoch = counterEpochOf(r)
+    counts[r.id] = entry
+    if (epoch > 0) epochs[r.id] = epoch
+    if (entry !== baseline.counts[r.id] || epoch !== (baseline.epochs?.[r.id] ?? 0)) changed = true
+  }
+  if (!changed) {
+    changed =
+      Object.keys(baseline.counts).some((id) => !counts[id]) ||
+      Object.keys(baseline.epochs ?? {}).some((id) => !epochs[id])
+  }
+  return {
+    baseline: changed ? baselineOf(baseline.capturedAt, counts, epochs) : baseline,
+    changed,
+  }
+}
+
+/**
+ * Counters that a write brought in from ELSEWHERE — a sync pull (merged with
+ * another machine's copy), a backup restore, an import — are covered by the
+ * baseline as they land (2026-11-06, R2, pure): the sweep judges only what
+ * this machine counted itself. Sync max-merges counters, so overrides a peer
+ * recorded before it ran a baseline-aware build (deletes counted as
+ * overrides) used to arrive here as "fresh" evidence; the peer's sweep
+ * judges its own. A rule new to this machine is covered whole; a rule whose
+ * counters were replaced (another epoch, or lower) is re-based at the new
+ * values; plain increments shift its entry by the same amounts, so what was
+ * this machine's evidence before stays exactly that. null = nothing to change.
+ */
+function coverArrivals(
+  before: readonly Rule[],
+  after: readonly Rule[],
+  baseline: RuleCounterBaseline,
+): RuleCounterBaseline | null {
+  const prevById = new Map<string, Rule>()
+  for (const r of before) if (!prevById.has(r.id)) prevById.set(r.id, r)
+  const capturedMs = Date.parse(baseline.capturedAt)
+  let counts: Record<string, [number, number]> | null = null
+  let epochs: Record<string, number> | null = null
+  const seen = new Set<string>()
+  for (const r of after) {
+    if (r.source === 'user_manual' || seen.has(r.id)) continue
+    seen.add(r.id)
+    const m = r.matchCount ?? 0
+    const o = r.overrideCount ?? 0
+    const epoch = counterEpochOf(r)
+    const prev = prevById.get(r.id)
+    let entry: [number, number]
+    if (!prev) {
+      entry = [m, o]
+    } else {
+      const pm = prev.matchCount ?? 0
+      const po = prev.overrideCount ?? 0
+      const prevEpoch = counterEpochOf(prev)
+      if (m === pm && o === po && epoch === prevEpoch) continue
+      if (epoch !== prevEpoch || m < pm || o < po) {
+        entry = [m, o]
+      } else {
+        const base = judgedBase(prev, baseline, capturedMs) ?? [0, 0]
+        entry = [base[0] + (m - pm), base[1] + (o - po)]
+      }
+    }
+    counts ??= { ...baseline.counts }
+    epochs ??= { ...(baseline.epochs ?? {}) }
+    counts[r.id] = entry
+    if (epoch > 0) epochs[r.id] = epoch
+    else delete epochs[r.id]
+  }
+  return counts ? baselineOf(baseline.capturedAt, counts, epochs!) : null
+}
+
+async function persistCounterBaseline(b: RuleCounterBaseline): Promise<void> {
+  await setRuleCounterBaseline(b).catch((e) =>
+    console.warn('[mail-organizer] counter baseline write failed (non-fatal)', e),
+  )
+}
+
+/** Apply coverArrivals to the stored baseline (if this machine keeps one). */
+async function coverArrivingCounters(before: readonly Rule[], after: readonly Rule[]): Promise<void> {
+  try {
+    const baseline = await getRuleCounterBaseline()
+    if (!baseline) return
+    const next = coverArrivals(before, after, baseline)
+    if (next) await setRuleCounterBaseline(next)
+  } catch (e) {
+    console.warn('[mail-organizer] counter baseline cover failed (non-fatal)', e)
+  }
+}
+
+/**
+ * Dedupe max-merges a group's counters into its survivor (mergeDuplicateStats),
+ * so the survivor's entry becomes the group's max too (2026-11-06, R2): a twin
+ * carrying inflated legacy overrides — [8, 25] merged into a survivor
+ * baselined at [30, 2] → [30, 25] — read as 23 fresh overrides. `baseline`
+ * must be refreshed on the PRE-dedupe library, so every pre-capture member
+ * has its entry; members created after it count from zero. Only members of
+ * the survivor's counter epoch count — the merge took counters from those only.
+ */
+function foldDedupedBaseline(
+  baseline: RuleCounterBaseline,
+  merges: readonly DedupeMerge[],
+): RuleCounterBaseline {
+  let counts: Record<string, [number, number]> | null = null
+  let epochs: Record<string, number> | null = null
+  for (const { survivor, members } of merges) {
+    if (survivor.source === 'user_manual') continue
+    const epoch = counterEpochOf(survivor)
+    let max: [number, number] | null = null
+    for (const mem of members) {
+      if (counterEpochOf(mem) !== epoch) continue
+      const b = baseline.counts[mem.id]
+      if (!b) continue
+      max = max ? [Math.max(max[0], b[0]), Math.max(max[1], b[1])] : [b[0], b[1]]
+    }
+    if (!max) continue
+    counts ??= { ...baseline.counts }
+    epochs ??= { ...(baseline.epochs ?? {}) }
+    counts[survivor.id] = max
+    if (epoch > 0) epochs[survivor.id] = epoch
+    else delete epochs[survivor.id]
+  }
+  return counts ? baselineOf(baseline.capturedAt, counts, epochs!) : baseline
+}
+
+/**
+ * The baseline a sweep judges with, and what to persist afterwards. `init`
+ * (the production sweep): no stored baseline yet → start one now, so every
+ * rule already in the library — any of which may carry pre-v1.0.8 counts —
+ * is judged only on later evidence. Without `init` and nothing stored (unit
+ * tests, a direct call) → null: whole records.
+ */
+function counterBaselineForSweep(
+  rules: readonly Rule[],
+  stored: RuleCounterBaseline | null,
+  init: boolean,
+  nowIso: string,
+): { baseline: RuleCounterBaseline | null; persist: RuleCounterBaseline | null } {
+  const base = stored ?? (init ? { capturedAt: nowIso, counts: {} } : null)
+  if (!base) return { baseline: null, persist: null }
+  const { baseline, changed } = refreshCounterBaseline(rules, base)
+  return { baseline, persist: changed || !stored ? baseline : null }
+}
+
+/**
  * Auto-disable reasons the learners may undo when they re-derive the same
  * (type, normalized signal, target) — fresh evidence the routing is right
  * (2026-11-05). Before, every learner treated ANY disabled copy as "already
@@ -805,21 +1167,111 @@ export function isRevivableAutoDisabled(
 }
 
 /**
+ * Retired by the engine because its routing was wrong for part of its
+ * anchor's mail (2026-11-06): 'superseded' (a narrower / replacement rule
+ * took over — 先廣後窄) or 'override' (a correction with nothing to replace
+ * it). On a plain domain / sender rule that is the anchor's conflict
+ * HISTORY: learning keeps the anchor narrow instead of re-minting or
+ * reviving a broad rule for it (execute.ts chooseLearningSignal).
+ */
+export function isConflictRetired(r: Pick<Rule, 'enabled' | 'autoDisabledReason'>): boolean {
+  return !r.enabled && (r.autoDisabledReason === 'superseded' || r.autoDisabledReason === 'override')
+}
+
+/**
+ * The anchors a rule routes on, as `${type}::${normalizeSignal}` keys
+ * (`domain::x.example` / `sender::a@x.example`): a plain domain / sender
+ * rule's own signal, or a compound's domain / sender conditions (2026-11-06).
+ * [] for other types and malformed compounds.
+ */
+export function ruleAnchorKeys(r: Pick<Rule, 'type' | 'signal'>): string[] {
+  if (r.type === 'domain' || r.type === 'sender') {
+    return [`${r.type}::${normalizeSignal(r.type, r.signal)}`]
+  }
+  if (r.type !== 'compound') return []
+  const out: string[] = []
+  for (const c of decodeCompound(r.signal)?.conditions ?? []) {
+    if (c.type === 'domain' || c.type === 'sender') {
+      out.push(`${c.type}::${normalizeSignal(c.type, c.value)}`)
+    }
+  }
+  return out
+}
+
+/**
+ * Would reviving `dormant` put it into a conflict (2026-11-06)? Checked
+ * against the rules that will be live once this call lands — the library's
+ * enabled, non-orphaned rules plus `inCall` (this call's new survivors and
+ * other tentative revives). The same-signal check against the library runs
+ * before this; here:
+ *   - in-call, same (type, signal), another target: an A filing would revive
+ *     broad→A while a B filing in the same batch mints domain→B;
+ *   - a plain domain / sender rule whose ANCHOR still routes elsewhere —
+ *     through a compound anchored on it too (先廣後窄: the compound that
+ *     superseded broad→A routes B; reviving A would send every new B-case
+ *     subject to A without reaching the AI). Only an AUTO full-subject
+ *     compound counts (isAnchorNarrowingCompound, R4): a case-number one or
+ *     the user's own exception routes ahead of the broad rule and leaves the
+ *     rest of the anchor's mail to it — counting them kept every dormant
+ *     domain rule of a client with any such compound dormant for good.
+ */
+function reviveWouldConflict(
+  dormant: Rule,
+  anchorTargets: () => ReadonlyMap<string, ReadonlySet<string>>,
+  inCall: readonly Rule[],
+): boolean {
+  const sig = `${dormant.type}::${normalizeSignal(dormant.type, dormant.signal)}`
+  const target = dormant.targetFolderPath
+  for (const o of inCall) {
+    if (o === dormant || o.targetFolderPath === target) continue
+    if (`${o.type}::${normalizeSignal(o.type, o.signal)}` === sig) return true
+  }
+  if (dormant.type !== 'domain' && dormant.type !== 'sender') return false
+  for (const t of anchorTargets().get(sig) ?? []) if (t !== target) return true
+  return inCall.some(
+    (o) =>
+      o !== dormant &&
+      o.targetFolderPath !== target &&
+      (o.type !== 'compound' || isAnchorNarrowingCompound(o)) &&
+      ruleAnchorKeys(o).includes(sig),
+  )
+}
+
+/**
+ * An AUTO compound that narrows a domain / sender anchor with a free-text
+ * subject — the trace a 先廣後窄 upgrade leaves (2026-11-06). Only these hold
+ * a broad rule on their anchor in check: a structural compound (case number
+ * — the case tiers route it ahead of any domain rule) and a hand-written one
+ * (a broad rule plus the user's own narrow exception is a legitimate
+ * library) leave the rest of the anchor's mail to the broad rule. Shared by
+ * the learners' narrowedByAnchor (execute.ts) and the revive guard (R4).
+ */
+export function isAnchorNarrowingCompound(r: Pick<Rule, 'type' | 'signal' | 'source'>): boolean {
+  return r.type === 'compound' && r.source !== 'user_manual' && isFullSubjectRule(r)
+}
+
+/**
  * A rule switched back on by learning. Clears the auto-disable provenance
  * (as toggleRule does). A 'high-error-rate' rule also restarts its accuracy
  * window (2026-11-05): the stored rate is what disabled it and cannot change
  * while the rule is off, so keeping it would let the very next sweep disable
  * it again — a revive/disable flap that also restarts its dormant clock. The
  * confirming filing counts as its first accepted fire.
+ *
+ * The reset opens a new counter epoch (`statsResetAt`, 2026-11-06): sync
+ * takes the counters of the copy with the newer epoch instead of the max, so
+ * the other machine's pre-reset counters can't come back and re-disable it.
  */
 export function revivedRule(r: Rule, nowIso: string): Rule {
   const freshWindow = r.autoDisabledReason === 'high-error-rate'
+  const nowMs = Date.parse(nowIso)
+  const epoch = Math.max(Number.isFinite(nowMs) ? nowMs : Date.now(), (r.statsResetAt ?? 0) + 1)
   return {
     ...r,
     enabled: true,
     autoDisabledAt: undefined,
     autoDisabledReason: undefined,
-    ...(freshWindow ? { matchCount: 1, overrideCount: 0, lastUsedAt: nowIso } : {}),
+    ...(freshWindow ? { matchCount: 1, overrideCount: 0, lastUsedAt: nowIso, statsResetAt: epoch } : {}),
   }
 }
 
@@ -870,6 +1322,8 @@ export function isFullSubjectRule(r: Pick<Rule, 'type' | 'signal'>): boolean {
  *      auto_scan is weakest since it's bulk-generated.)
  *   3. Tiebreak: higher matchCount (more "proven").
  *   4. Final tiebreak: older createdAt (most established).
+ *   Exception (2026-11-06, routingTwinOf): a DISABLED user_manual survivor
+ *   never absorbs a differently-spelled ENABLED twin — both stay.
  *
  * The survivor then absorbs the group's usage history (2026-11-05): max
  * lastUsedAt, max matchCount / overrideCount, min createdAt. Picking it
@@ -927,26 +1381,66 @@ function isoMs(iso: string | undefined): number {
 function mergeDuplicateStats(survivor: Rule, group: readonly Rule[]): Rule {
   let lastUsedAt = survivor.lastUsedAt
   let createdAt = survivor.createdAt
-  let matchCount = survivor.matchCount
-  let overrideCount = survivor.overrideCount
   for (const r of group) {
     const used = isoMs(r.lastUsedAt)
     if (Number.isFinite(used) && !(isoMs(lastUsedAt) >= used)) lastUsedAt = r.lastUsedAt
     const born = isoMs(r.createdAt)
     if (Number.isFinite(born) && !(isoMs(createdAt) <= born)) createdAt = r.createdAt
+  }
+  // Counters merge only within the newest accuracy window (statsResetAt,
+  // 2026-11-06): a revive restarts it, and a twin's pre-revive counts must
+  // not come back through dedupe any more than through sync — the next
+  // sweep would disable the revived rule again. No epoch anywhere = max.
+  const epochOf = (r: Rule): number =>
+    typeof r.statsResetAt === 'number' && Number.isFinite(r.statsResetAt) ? r.statsResetAt : 0
+  const all = [survivor, ...group]
+  const epoch = Math.max(...all.map(epochOf))
+  let matchCount = 0
+  let overrideCount = 0
+  let hasOverrideField = survivor.overrideCount !== undefined
+  for (const r of all) {
+    if (epochOf(r) !== epoch) continue
     if (r.matchCount > matchCount) matchCount = r.matchCount
-    if ((r.overrideCount ?? 0) > (overrideCount ?? 0)) overrideCount = r.overrideCount
+    if (r.overrideCount !== undefined) {
+      hasOverrideField = true
+      if (r.overrideCount > overrideCount) overrideCount = r.overrideCount
+    }
   }
   return {
     ...survivor,
     matchCount,
     createdAt,
     ...(lastUsedAt !== undefined ? { lastUsedAt } : {}),
-    ...(overrideCount !== undefined ? { overrideCount } : {}),
+    ...(hasOverrideField ? { overrideCount } : {}),
+    ...(epoch > 0 ? { statsResetAt: epoch } : {}),
   }
 }
 
-function dedupeTransform(rules: Rule[]): { next: Rule[]; report: DedupeReport } {
+/**
+ * The enabled copy a DISABLED user_manual survivor must not absorb
+ * (2026-11-06). Canonical keys (2026-11-05) now group spellings the matcher
+ * treats as equal — 「112年度訴字第304號」 / 「112訴304」, padded / '@'
+ * domains — that older builds kept apart. When the user disabled their
+ * full-form rule while a differently-spelled enabled twin was routing the
+ * case, F8 picked the disabled user_manual copy and the case silently
+ * stopped routing on upgrade. So the merge never crosses that boundary: the
+ * best enabled copy spelled differently survives too. Not when its own
+ * spelling group holds a user_manual copy — that (disabled) copy already
+ * outranked it before the canonical merge, and F8 forbids dropping it for an
+ * auto rule.
+ */
+function routingTwinOf(survivor: Rule, sorted: readonly Rule[]): Rule | undefined {
+  if (survivor.source !== 'user_manual' || survivor.enabled) return undefined
+  const twin = sorted.find((r) => r.enabled && r.signal !== survivor.signal)
+  if (!twin) return undefined
+  if (sorted.some((r) => r.signal === twin.signal && r.source === 'user_manual')) return undefined
+  return twin
+}
+
+/** One survivor of a dedupe (its merged copy) and the group it absorbed. */
+type DedupeMerge = { survivor: Rule; members: readonly Rule[] }
+
+function dedupeTransform(rules: Rule[]): { next: Rule[]; report: DedupeReport; merges: DedupeMerge[] } {
   const buckets = new Map<string, Rule[]>()
   for (const r of rules) {
     const key = ruleTripleKey(r)
@@ -961,26 +1455,52 @@ function dedupeTransform(rules: Rule[]): { next: Rule[]; report: DedupeReport } 
   // both copies together.
   const replacement = new Map<Rule, Rule>()
   const dropped = new Set<Rule>()
+  const merges: DedupeMerge[] = []
+  const merge = (keep: Rule, group: readonly Rule[]) => {
+    const merged = mergeDuplicateStats(keep, group)
+    replacement.set(keep, merged)
+    merges.push({ survivor: merged, members: group })
+  }
   for (const arr of buckets.values()) {
     if (arr.length === 1) continue
-    groupsAffected++
-    removed += arr.length - 1
     const sorted = [...arr].sort(compareDedupeSurvivor)
-    replacement.set(sorted[0]!, mergeDuplicateStats(sorted[0]!, arr))
-    for (const r of sorted.slice(1)) dropped.add(r)
+    const survivor = sorted[0]!
+    const twin = routingTwinOf(survivor, sorted)
+    const kept = twin ? 2 : 1
+    if (arr.length === kept) continue
+    groupsAffected++
+    removed += arr.length - kept
+    if (twin) {
+      // Each keeps the history of its own spelling group.
+      merge(survivor, arr.filter((r) => r.signal !== twin.signal))
+      merge(twin, arr.filter((r) => r.signal === twin.signal))
+    } else {
+      merge(survivor, arr)
+    }
+    for (const r of sorted) {
+      if (r !== survivor && r !== twin) dropped.add(r)
+    }
   }
-  if (removed === 0) return { next: rules, report: { removed: 0, groupsAffected: 0 } }
+  if (removed === 0) return { next: rules, report: { removed: 0, groupsAffected: 0 }, merges: [] }
   const next: Rule[] = []
   for (const r of rules) {
     if (dropped.has(r)) continue
     next.push(replacement.get(r) ?? r)
   }
-  return { next, report: { removed, groupsAffected } }
+  return { next, report: { removed, groupsAffected }, merges }
 }
 
 export async function dedupeRulesByKey(): Promise<DedupeReport> {
-  return mutateRules((rules) => {
-    const { next, report } = dedupeTransform(rules)
+  return mutateRules(async (rules) => {
+    const { next, report, merges } = dedupeTransform(rules)
+    // Keep this machine's counter baseline in step (R2): foldDedupedBaseline.
+    if (merges.length > 0) {
+      const stored = await getRuleCounterBaseline().catch(() => null)
+      if (stored) {
+        const folded = foldDedupedBaseline(refreshCounterBaseline(rules, stored).baseline, merges)
+        if (folded !== stored) await persistCounterBaseline(folded)
+      }
+    }
     return { next, result: report }
   })
 }
@@ -1043,6 +1563,14 @@ type StaleSweepOptions = {
   fullSubjectDays: number
   /** Active days, unique, sorted DESC (see buildActiveDaysDesc). */
   daysDesc: readonly string[]
+  /**
+   * THIS machine's own active days, same form (S8, 2026-11-06) — the clock
+   * for per-device auto_scan rules, whose lastUsedAt only moves with this
+   * machine's batches. Absent → daysDesc for every rule.
+   */
+  localDaysDesc?: readonly string[]
+  /** Local counter baseline for the high-error-rate predicate (2026-11-06). */
+  baseline?: RuleCounterBaseline | null
 }
 
 function buildActiveDaysDesc(
@@ -1050,6 +1578,24 @@ function buildActiveDaysDesc(
   rules: readonly Rule[],
 ): string[] {
   return [...new Set([...recordedDays, ...deriveActiveDaysFromRules(rules)])].sort().reverse()
+}
+
+/**
+ * The per-device clock (S8, 2026-11-06): this machine's recorded days plus
+ * the days its own auto_scan rules evidence. The synced ledger and the synced
+ * rules' lastUsedAt carry the BUSIEST machine's activity, which aged a machine
+ * idle for months out of its auto_scan rules on return (invariant 12).
+ * Undefined when the caller pinned one clock for every rule (`activeDays`
+ * given without `localActiveDays`).
+ */
+function buildLocalActiveDaysDesc(
+  options: { activeDays?: readonly string[]; localActiveDays?: readonly string[] },
+  storedLocal: readonly string[] | undefined,
+  rules: readonly Rule[],
+): string[] | undefined {
+  const local = options.localActiveDays ?? (options.activeDays ? undefined : storedLocal)
+  if (!local) return undefined
+  return buildActiveDaysDesc(local, rules.filter((r) => r.source === 'auto_scan'))
 }
 
 function staleTransform(
@@ -1066,11 +1612,13 @@ function staleTransform(
       next.push(r)
       continue
     }
+    // S8: per-device rules age on this machine's own clock.
+    const daysDesc = r.source === 'auto_scan' ? (o.localDaysDesc ?? o.daysDesc) : o.daysDesc
     if (!r.enabled) {
       // Dormant purge (2026-11-05) — see DORMANT_PURGE_REASONS. Hard
       // delete, no tombstone / audit, same as the stale branch.
       if (r.autoDisabledReason && DORMANT_PURGE_REASONS.has(r.autoDisabledReason)) {
-        const dormant = countActiveDaysAfter(o.daysDesc, r.autoDisabledAt, DORMANT_PURGE_ACTIVE_DAYS)
+        const dormant = countActiveDaysAfter(daysDesc, r.autoDisabledAt, DORMANT_PURGE_ACTIVE_DAYS)
         if (dormant !== null && dormant >= DORMANT_PURGE_ACTIVE_DAYS) {
           byReason.dormantPurged++
           continue
@@ -1095,21 +1643,20 @@ function staleTransform(
       // 使用日大部分由同步規則本身推導 → 各機器 sweep 判定大致相同、維持無
       // tombstone 硬刪的收斂性。
       const cutoff = isFullSubjectRule(r) ? o.fullSubjectDays : o.staleDays
-      const idle = countActiveDaysAfter(o.daysDesc, r.createdAt, cutoff)
+      const idle = countActiveDaysAfter(daysDesc, r.createdAt, cutoff)
       if (idle !== null && idle >= cutoff) {
         reason = 'stale'
       }
-    } else if (
-      fires >= HIGH_ERROR_RATE_MIN_SAMPLES &&
-      ruleErrorRate(r) >= HIGH_ERROR_RATE_THRESHOLD
-    ) {
+    } else if (isHighErrorRate(r, o.baseline)) {
+      // Over the fires since the local baseline when the rule has one
+      // (2026-11-06) — pre-v1.0.8 override counts include deletes.
       reason = 'high-error-rate'
     }
     // Last-used stale (added 2026-05-27): rule fired in the past but
     // has not been used for `staleDays` ACTIVE days. Catches "topic ran
     // for a few weeks then moved on" patterns.
     if (!reason && fires > 0) {
-      const idle = countActiveDaysAfter(o.daysDesc, r.lastUsedAt ?? r.createdAt, o.staleDays)
+      const idle = countActiveDaysAfter(daysDesc, r.lastUsedAt ?? r.createdAt, o.staleDays)
       if (idle !== null && idle >= o.staleDays) {
         reason = 'stale'
       }
@@ -1204,11 +1751,25 @@ export async function autoDisableStaleRules(
     /** Recorded active days (UTC 'YYYY-MM-DD'); defaults to the stored ledger.
      *  Always unioned with deriveActiveDaysFromRules(library). */
     activeDays?: readonly string[]
+    /** This machine's own days, for auto_scan rules (S8); defaults to the
+     *  stored local ledger — or to `activeDays` when only that is given. */
+    localActiveDays?: readonly string[]
   } = {},
 ): Promise<StaleAutoDisableReport> {
   const now = options.now ?? Date.now()
   const recordedDays = options.activeDays ?? (await getActiveDays())
-  const { report, events } = await mutateRules((rules) => {
+  const storedLocal = options.activeDays ? undefined : await getLocalActiveDays()
+  const { report, events } = await mutateRules(async (rules) => {
+    // Baseline read + written under the rules lock (2026-11-06): the sync
+    // pull covers arriving counters in it under the same lock
+    // (coverArrivingCounters) — a read outside could be overwritten stale.
+    const storedBaseline = await getRuleCounterBaseline().catch(() => null)
+    const { baseline, persist } = counterBaselineForSweep(
+      rules,
+      storedBaseline,
+      false,
+      new Date(now).toISOString(),
+    )
     // Computed ONCE from the pre-sweep library so deletions in this pass
     // can't shift the clock for rules evaluated later in the same pass.
     const out = staleTransform(rules, {
@@ -1217,7 +1778,10 @@ export async function autoDisableStaleRules(
       fullSubjectDays:
         options.fullSubjectNeverMatchedDays ?? FULL_SUBJECT_NEVER_MATCHED_DAYS_DEFAULT,
       daysDesc: buildActiveDaysDesc(recordedDays, rules),
+      localDaysDesc: buildLocalActiveDaysDesc(options, storedLocal, rules),
+      baseline,
     })
+    if (persist) await persistCounterBaseline(persist)
     return { next: out.next, result: out }
   })
   if (events.length > 0) {
@@ -1407,14 +1971,34 @@ export async function purgeExpiredClosedCaseRules(
 
 export type RuleSweepReport = {
   dedupe: DedupeReport
+  /** AUTO rules learned on a pseudo case number, hard-deleted (2026-11-06). */
+  pseudoCasePurged: number
   retirement: { retired: number; revived: number }
   closedCasePurged: number
   stale: StaleAutoDisableReport
 }
 
 /**
- * The whole daily sweep — dedupe → closed-case retire/revive → closed-case
- * purge → stale / error-rate / dormant retirement — as ONE mutateRules
+ * Hard-delete the AUTO rules learned on a pseudo case number (isPseudoCaseRule,
+ * 2026-11-06) — 「113度1」 out of 「113年度第1次董事會議程」. The fixed parser
+ * no longer matches them, but left enabled they still looked like a client's
+ * free-text "narrowing" compounds (isAnchorNarrowingCompound) and kept that
+ * client's broad rule from being learned or revived. Like the stale delete
+ * and dedupe: no tombstone, no audit — parser artifacts, not decisions; the
+ * fixed parser never re-learns them, and the predicate reads only synced
+ * fields, so every machine's sweep converges. user_manual is never touched.
+ */
+function pseudoCasePurgeTransform(rules: Rule[]): { next: Rule[]; purged: number } {
+  const next = rules.filter((r) => !isPseudoCaseRule(r))
+  return next.length === rules.length
+    ? { next: rules, purged: 0 }
+    : { next, purged: rules.length - next.length }
+}
+
+/**
+ * The whole daily sweep — dedupe → pseudo-case purge → closed-case
+ * retire/revive → closed-case purge → stale / error-rate / dormant
+ * retirement — as ONE mutateRules
  * transaction (2026-11-05): one library read, at most one write, so at most
  * one sync push per day instead of up to four. Each step is the same
  * transform its standalone export runs, applied in the same order the
@@ -1429,12 +2013,18 @@ export async function runRuleSweepPass(
     staleDays?: number
     fullSubjectNeverMatchedDays?: number
     activeDays?: readonly string[]
+    /** This machine's own days, for auto_scan rules (S8) — see autoDisableStaleRules. */
+    localActiveDays?: readonly string[]
     purgeDays?: number
+    /** Start this machine's counter baseline if it has none (the production
+     *  sweep, 2026-11-06 — see errorRateEvidence). */
+    initCounterBaseline?: boolean
   } = {},
 ): Promise<RuleSweepReport> {
   const now = options.now ?? Date.now()
   const nowIso = new Date(now).toISOString()
   const recordedDays = options.activeDays ?? (await getActiveDays())
+  const storedLocal = options.activeDays ? undefined : await getLocalActiveDays()
   const purgeMs = (options.purgeDays ?? CASE_CLOSED_PURGE_DAYS) * 86_400_000
   const step = <T>(name: string, fallback: T, fn: () => T): T => {
     try {
@@ -1444,12 +2034,39 @@ export async function runRuleSweepPass(
       return fallback
     }
   }
-  const { report, events } = await mutateRules((original) => {
+  const { report, events } = await mutateRules(async (original) => {
     let rules = original
-    const dedupe = step('dedupe', { next: rules, report: { removed: 0, groupsAffected: 0 } }, () =>
-      dedupeTransform(rules),
+    // Counter baseline FIRST, on the pre-dedupe library, read and written
+    // under the rules lock (2026-11-06, R2): dedupe max-merges a twin's
+    // counters into its survivor, so each member needs its own entry before
+    // the merge (foldDedupedBaseline); and the sync pull covers arriving
+    // counters in this baseline under the same lock (coverArrivingCounters).
+    const storedBaseline = await getRuleCounterBaseline().catch(() => null)
+    const counter = step(
+      'counter-baseline',
+      { baseline: storedBaseline, persist: null as RuleCounterBaseline | null },
+      () => counterBaselineForSweep(original, storedBaseline, options.initCounterBaseline === true, nowIso),
+    )
+    let baseline = counter.baseline
+    let persistBaseline = counter.persist
+    const dedupe = step(
+      'dedupe',
+      { next: rules, report: { removed: 0, groupsAffected: 0 }, merges: [] as DedupeMerge[] },
+      () => dedupeTransform(rules),
     )
     rules = dedupe.next
+    if (baseline && dedupe.merges.length > 0) {
+      const before = baseline
+      const folded = step('counter-baseline-dedupe', before, () => foldDedupedBaseline(before, dedupe.merges))
+      if (folded !== before) {
+        baseline = folded
+        persistBaseline = folded
+      }
+    }
+    const pseudoCase = step('pseudo-case-purge', { next: rules, purged: 0 }, () =>
+      pseudoCasePurgeTransform(rules),
+    )
+    rules = pseudoCase.next
     // Closed-case steps only run with a KNOWN prefix list: [] means "the user
     // un-designated every archive" and revives every retired rule, so an
     // unknown list (settings unreadable) must skip them, not default to [].
@@ -1482,14 +2099,18 @@ export async function runRuleSweepPass(
           // Clock from the PRE-pass library — same "computed once" rule as
           // the standalone sweep, so this pass's own deletions can't shift it.
           daysDesc: buildActiveDaysDesc(recordedDays, original),
+          localDaysDesc: buildLocalActiveDaysDesc(options, storedLocal, original),
+          baseline,
         }),
     )
     rules = stale.next
+    if (persistBaseline) await persistCounterBaseline(persistBaseline)
     return {
       next: rules,
       result: {
         report: {
           dedupe: dedupe.report,
+          pseudoCasePurged: pseudoCase.purged,
           retirement: { retired: retirement.retired.length, revived: retirement.revived.length },
           closedCasePurged: purge.purged,
           stale: stale.report,
@@ -1580,14 +2201,34 @@ export async function addRules(newRules: Rule[], opts?: { actor?: Actor }): Prom
  */
 export async function addRulesFilteringTombstones(
   candidates: Rule[],
-  opts?: { actor?: Actor },
-): Promise<{ added: Rule[]; dropped: number; reEnabled: Rule[] }> {
-  if (candidates.length === 0) return { added: [], dropped: 0, reEnabled: [] }
+  opts?: {
+    actor?: Actor
+    /**
+     * Called under the rules lock right before the write, with exactly what
+     * it adds and revives (2026-11-06, R8) — the batch finalizer persists it
+     * first, so a worker death between this write and its own step marker
+     * can't lose what the batch learned (undo / DoneScreen).
+     */
+    beforeWrite?: (planned: {
+      added: readonly Rule[]
+      reEnabled: readonly Rule[]
+      revivedFrom: readonly Rule[]
+    }) => Promise<void>
+  },
+): Promise<{
+  added: Rule[]
+  dropped: number
+  reEnabled: Rule[]
+  /** reEnabled[i] as it was BEFORE the revive (undo puts it back, 2026-11-06). */
+  revivedFrom: Rule[]
+}> {
+  if (candidates.length === 0) return { added: [], dropped: 0, reEnabled: [], revivedFrom: [] }
   // Pre-cap before any dedup / filter logic — keeps the rest of the
   // function dealing with already-capped rules.
   candidates = candidates.map(applyConfidenceCap)
   let survivors: Rule[] = []
   let reEnabledRules: Rule[] = []
+  let revivedFrom: Rule[] = []
   await mutateRules(async (rules) => {
     const tombstones = await getRuleTombstones()
     const afterTombstone = filterByTombstones(candidates, tombstones)
@@ -1606,7 +2247,10 @@ export async function addRulesFilteringTombstones(
     // ENABLED rule now routes the same (type, signal) elsewhere, the twin
     // stays dormant — e.g. a case number the user re-targeted A→B must not
     // get its A rule back from old mail still sitting in folder A
-    // (2026-11-05).
+    // (2026-11-05). Since 2026-11-06 also not into a conflict with this
+    // call's own candidates / revives, nor — for a plain domain / sender
+    // rule — with live rules (auto full-subject compounds included) on its
+    // anchor: see reviveWouldConflict.
     //
     // Key shape mirrors filterByTombstones: (type, signalNorm, target).
     const byKey = new Map<string, { enabled: boolean; revivable?: number }>()
@@ -1617,16 +2261,21 @@ export async function addRulesFilteringTombstones(
       const slot = byKey.get(key) ?? { enabled: false }
       if (r.enabled) {
         slot.enabled = true
-        const targets = enabledTargets.get(sig) ?? new Set<string>()
-        targets.add(r.targetFolderPath)
-        enabledTargets.set(sig, targets)
+        // An orphaned rule routes nothing (its folder is gone): it is no
+        // conflict for a revive (round 3 — an import could leave one live
+        // in front of the rule it switched off, and that rule never came back).
+        if (!r.orphaned) {
+          const targets = enabledTargets.get(sig) ?? new Set<string>()
+          targets.add(r.targetFolderPath)
+          enabledTargets.set(sig, targets)
+        }
       } else if (slot.revivable === undefined && isRevivableAutoDisabled(r)) {
         slot.revivable = idx
       }
       byKey.set(key, slot)
     })
     const seenInBatch = new Set<string>()
-    const reEnabledIndexes = new Map<number, Rule>()
+    const tentative = new Set<number>()
     const nowIso = new Date().toISOString()
     survivors = afterTombstone.filter((r) => {
       const sig = `${r.type}::${normalizeSignal(r.type, r.signal)}`
@@ -1637,14 +2286,7 @@ export async function addRulesFilteringTombstones(
           const conflicting = [...(enabledTargets.get(sig) ?? [])].some(
             (t) => t !== r.targetFolderPath,
           )
-          if (!conflicting && !reEnabledIndexes.has(existing.revivable)) {
-            // revivedRule also clears autoDisabledReason, honouring the
-            // types.ts contract ("Cleared along with autoDisabledAt on
-            // re-enable") like toggleRule — otherwise the rule would end up
-            // enabled with a stale reason that round-trips through
-            // export/sync and misreports the rule.
-            reEnabledIndexes.set(existing.revivable, revivedRule(rules[existing.revivable]!, nowIso))
-          }
+          if (!conflicting) tentative.add(existing.revivable)
         }
         return false
       }
@@ -1652,14 +2294,50 @@ export async function addRulesFilteringTombstones(
       seenInBatch.add(key)
       return true
     })
+    // Second pass (2026-11-06): a revive must not conflict with what this
+    // call itself adds or revives, nor — for a plain domain / sender rule —
+    // with live rules on its anchor (reviveWouldConflict). Built lazily: a
+    // call with no plain-anchor revive never decodes the compounds.
+    const reEnabledIndexes = new Map<number, Rule>()
+    if (tentative.size > 0) {
+      let anchorTargets: Map<string, Set<string>> | null = null
+      const liveAnchorTargets = () => {
+        if (anchorTargets) return anchorTargets
+        anchorTargets = new Map()
+        for (const r of rules) {
+          if (!r.enabled || r.orphaned) continue
+          // Structural / hand-written compounds don't hold the anchor (R4).
+          if (r.type === 'compound' && !isAnchorNarrowingCompound(r)) continue
+          for (const k of ruleAnchorKeys(r)) {
+            const set = anchorTargets.get(k) ?? new Set<string>()
+            set.add(r.targetFolderPath)
+            anchorTargets.set(k, set)
+          }
+        }
+        return anchorTargets
+      }
+      const inCall = [...survivors, ...[...tentative].map((i) => rules[i]!)]
+      for (const idx of tentative) {
+        if (reviveWouldConflict(rules[idx]!, liveAnchorTargets, inCall)) continue
+        // revivedRule also clears autoDisabledReason, honouring the types.ts
+        // contract ("Cleared along with autoDisabledAt on re-enable") like
+        // toggleRule — otherwise the rule would end up enabled with a stale
+        // reason that round-trips through export/sync and misreports it.
+        reEnabledIndexes.set(idx, revivedRule(rules[idx]!, nowIso))
+      }
+    }
     // Materialise reEnabledRules + write the modified rules array.
     let next = rules
     if (reEnabledIndexes.size > 0) {
       next = rules.map((r, i) => reEnabledIndexes.get(i) ?? r)
       reEnabledRules = Array.from(reEnabledIndexes.values())
+      revivedFrom = Array.from(reEnabledIndexes.keys(), (i) => rules[i]!)
     }
     if (survivors.length === 0 && reEnabledIndexes.size === 0) {
       return { next: rules, result: undefined }
+    }
+    if (opts?.beforeWrite) {
+      await opts.beforeWrite({ added: survivors, reEnabled: reEnabledRules, revivedFrom })
     }
     return {
       next: survivors.length > 0 ? [...next, ...survivors] : next,
@@ -1698,6 +2376,7 @@ export async function addRulesFilteringTombstones(
     added: survivors,
     dropped: candidates.length - survivors.length,
     reEnabled: reEnabledRules,
+    revivedFrom,
   }
 }
 
@@ -1739,6 +2418,70 @@ export function tombstoneKey(
   t: Pick<RuleTombstone, 'type' | 'signalNorm' | 'targetFolderPath'>,
 ): string {
   return `${t.type}::${normalizeSignal(t.type, t.signalNorm)}::${t.targetFolderPath}`
+}
+
+/**
+ * The tombstone recording the deletion of rule `r` (2026-11-06) — every
+ * delete path builds it here: canonical triple (tombstoneKey matches it),
+ * clock-skew-safe deletedAt (tombstoneDeletedAt), and the fingerprint of the
+ * rule's own spelling (RuleTombstone.spellingHash, S1).
+ */
+export function ruleTombstone(
+  r: Pick<Rule, 'type' | 'signal' | 'targetFolderPath' | 'createdAt' | 'editedAt'>,
+  now: number = Date.now(),
+): RuleTombstone {
+  return {
+    type: r.type,
+    signalNorm: normalizeSignal(r.type, r.signal),
+    targetFolderPath: r.targetFolderPath,
+    deletedAt: tombstoneDeletedAt(r, now),
+    spellingHash: spellingFingerprint(legacySignalNorm(r.type, r.signal)),
+  }
+}
+
+/**
+ * normalizeSignal as v1.0.7 and earlier wrote it into tombstones (before the
+ * 2026-11-05 canonical form folded court-case spellings / whitespace / '@').
+ * Tells a tombstone written for a rule's OWN spelling from one that merely
+ * collides with it canonically (sync adoption, RuleTombstone.spellingHash).
+ * FROZEN: it is v1.0.7's normal form, and fingerprints written by one build
+ * are compared with this function's output on another — never change it.
+ */
+export function legacySignalNorm(type: RuleType, signal: string): string {
+  if (typeof signal !== 'string') return ''
+  switch (type) {
+    case 'domain':
+      return (signal.startsWith('@') ? signal.slice(1) : signal).toLowerCase()
+    case 'sender':
+    case 'subject_keyword':
+      return signal.toLowerCase().trim()
+    case 'case_code':
+      return signal.toUpperCase().trim()
+    case 'compound': {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(signal)
+      } catch {
+        return signal
+      }
+      const conds = (parsed as { conditions?: unknown } | null)?.conditions
+      if (
+        !Array.isArray(conds) ||
+        !conds.every(
+          (c) => !!c && typeof c === 'object' && typeof (c as { type?: unknown }).type === 'string' &&
+            typeof (c as { value?: unknown }).value === 'string',
+        )
+      ) {
+        return signal
+      }
+      const list = conds as Array<{ type: string; value: string }>
+      const sorted = [...list].sort((a, b) =>
+        a.type !== b.type ? a.type.localeCompare(b.type) : a.value.toLowerCase().localeCompare(b.value.toLowerCase()),
+      )
+      return JSON.stringify(sorted.map((c) => ({ type: c.type, value: c.value.toLowerCase().trim() })))
+    }
+  }
+  return signal
 }
 
 /**
@@ -1808,6 +2551,27 @@ export type ReconcileSummary = {
   unorphaned: number
 }
 
+/** How to read `tree` (2026-11-06 r2) — see FolderCache.wellKnown. */
+export type ReconcileTreeOptions = {
+  /**
+   * Deleted Items ITSELF — never in `tree`, yet a user_manual / ai_overridden
+   * rule targeting it is a deliberate auto-trash rule: valid, never orphaned
+   * (preflight turns its hits into delete rows). Matched by id, or by its
+   * top-level path for a rule without a local id (synced from another
+   * mailbox / created without one). Every other target missing from a
+   * complete tree is orphaned — including a folder deleted in OWA, which
+   * sits in the trash with its id intact, and an AUTO rule on the trash.
+   */
+  trashFolder?: { id: string; path?: string }
+  /**
+   * False when `tree` can't be trusted to be exactly the filing targets — a
+   * well-known lookup failed (the trash subtree may be listed, a root may be
+   * unrecognised) or a legacy cache: every rule is then left exactly as it
+   * is — nothing orphaned, un-orphaned or re-pathed.
+   */
+  treeComplete?: boolean
+}
+
 /**
  * Sync each rule's stored `targetFolderPath` and `orphaned` flag against the
  * live folder tree. Detects three drifts:
@@ -1826,8 +2590,15 @@ export type ReconcileSummary = {
 export function reconcileRulesAgainstTree(
   rules: Rule[],
   tree: MailFolderNode[],
+  opts: ReconcileTreeOptions = {},
 ): { rules: Rule[]; summary: ReconcileSummary } {
+  // Untrustworthy tree → touch nothing (2026-11-06 r2): a degraded fetch
+  // used to rewrite a trashed case folder's rules to 刪除的郵件/甲.
+  if (opts.treeComplete === false) {
+    return { rules, summary: { pathsUpdated: 0, newlyOrphaned: 0, unorphaned: 0 } }
+  }
   const idx = indexFolderTree(tree)
+  const trash = opts.trashFolder
   let pathsUpdated = 0
   let newlyOrphaned = 0
   let unorphaned = 0
@@ -1839,6 +2610,28 @@ export function reconcileRulesAgainstTree(
     const resolved = byId ?? byPath
 
     if (!resolved) {
+      // Deleted Items itself: a valid (auto-trash) target outside the tree —
+      // as the USER's intent only (2026-11-06 r3): a hand-written rule, or
+      // one learned from the user overriding the AI. Learned / scanned ones
+      // (v1.0.7 learned them from AI moves into the trash; shipped v1.0.8
+      // orphaned them) stay orphaned instead of resuming auto-trashing.
+      if (
+        trash &&
+        (r.source === 'user_manual' || r.source === 'ai_overridden') &&
+        (r.targetFolderId === trash.id || (!!trash.path && r.targetFolderPath === trash.path))
+      ) {
+        let kept: Rule = r
+        if (kept.orphaned) {
+          unorphaned++
+          kept = { ...kept, orphaned: false }
+        }
+        if (trash.path && kept.targetFolderPath !== trash.path) {
+          pathsUpdated++
+          kept = { ...kept, targetFolderPath: trash.path }
+        }
+        if (kept.targetFolderId !== trash.id) kept = { ...kept, targetFolderId: trash.id }
+        return kept
+      }
       if (r.orphaned) return r // already marked, no change
       newlyOrphaned++
       return { ...r, orphaned: true }
@@ -1976,6 +2769,9 @@ type CompiledCompound = {
   /** Position in the specificity-sorted compound tier; candidates gathered
    *  from the anchor buckets are tried in this order. */
   order: number
+  /** user_manual with a subject condition naming a case id — matched in
+   *  tier 0, not tier 2 (2026-11-06). */
+  manualCase: boolean
 }
 
 type CompiledSubjectRule = { rule: Rule; subj: SubjectNeedle }
@@ -2037,7 +2833,8 @@ function emailFeatures(email: Email): EmailFeatures {
  */
 export type RuleIndex = {
   caseCodeRules: Rule[]
-  /** Specificity order: longest subject condition first (2026-11-05). */
+  /** Specificity order: structural case-id compounds, then user_manual, then
+   *  longest subject condition (see buildRuleIndex). */
   compoundRules: Rule[]
   /**
    * subject_keyword rules whose signal IS a court case number (優化
@@ -2057,8 +2854,17 @@ export type RuleIndex = {
   senderMap: Map<string, Rule[]>
   /** user_manual tier (2026-11-05) — checked before every auto broad rule. */
   manualDomainMap: Map<string, Rule[]>
+  /** …minus the subject rules naming a case id, which are tier 0. */
   manualSubjectKeywordRules: Rule[]
   manualSenderMap: Map<string, Rule[]>
+  /**
+   * Tier 0 (2026-11-06): user_manual subject_keyword rules whose signal
+   * CONTAINS a court case number or Latin case code, longest first — the
+   * user's exception inside a case, checked (after the tier-0 compounds)
+   * before every auto case rule. A pure court-case one stays in
+   * courtCaseSubjectRules too, for the body case pass.
+   */
+  manualCaseSubjectRules: Rule[]
   /** The mailbox owner's own domains (lowercased) — see buildRuleIndex. */
   ownDomains: ReadonlySet<string>
   // ---- compiled (internal) ----
@@ -2068,8 +2874,11 @@ export type RuleIndex = {
     byDomain: Map<string, CompiledCompound[]>
     unanchored: CompiledCompound[]
     size: number
+    /** How many are tier-0 (manualCase) entries. */
+    manualCaseCount: number
   }
   compiledCourtSubjects: CompiledSubjectRule[]
+  compiledManualCaseSubjects: CompiledSubjectRule[]
   compiledManualSubjects: CompiledSubjectRule[]
   compiledAutoSubjects: CompiledSubjectRule[]
 }
@@ -2095,6 +2904,37 @@ function longestSubjectCondition(conds: readonly CompiledCondition[]): number {
     if (c.type === 'subject_keyword' && c.subj.needle.length > n) n = c.subj.needle.length
   }
   return n
+}
+
+/** A whole-signal Latin case code (25A0067A) — CASE_CODE_RE, anchored. */
+const CASE_CODE_ANCHOR = /^\d{2}[A-Z]\d{4}[A-Z]$/i
+
+/**
+ * Compound whose subject condition IS a structural case identifier — a court
+ * case number (either form) or a Latin case code — rather than free text
+ * that merely contains one (2026-11-06).
+ */
+function hasStructuralSubjectCondition(conds: readonly CompiledCondition[]): boolean {
+  return conds.some(
+    (c) =>
+      c.type === 'subject_keyword' &&
+      (c.subj.court !== null || CASE_CODE_ANCHOR.test(c.subj.raw.trim())),
+  )
+}
+
+/** Text that CONTAINS a court case number (either form) or a Latin case code. */
+function namesCaseIdentifier(text: string): boolean {
+  return extractCourtCaseNumbers(text).length > 0 || extractCaseCodes(text).length > 0
+}
+
+/**
+ * Compound whose subject condition CONTAINS a case identifier —
+ * 「112訴204 帳單」 as well as 「112訴204」 itself (2026-11-06, R1).
+ */
+function subjectNamesCaseIdentifier(conds: readonly CompiledCondition[]): boolean {
+  return conds.some(
+    (c) => c.type === 'subject_keyword' && (c.subj.court !== null || namesCaseIdentifier(c.subj.raw)),
+  )
 }
 
 function pushTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
@@ -2149,14 +2989,29 @@ export function buildRuleIndex(
     manualDomainMap: new Map(),
     manualSubjectKeywordRules: [],
     manualSenderMap: new Map(),
+    manualCaseSubjectRules: [],
     ownDomains,
     compiledCaseCodes: [],
-    compiledCompounds: { bySender: new Map(), byDomain: new Map(), unanchored: [], size: 0 },
+    compiledCompounds: {
+      bySender: new Map(),
+      byDomain: new Map(),
+      unanchored: [],
+      size: 0,
+      manualCaseCount: 0,
+    },
     compiledCourtSubjects: [],
+    compiledManualCaseSubjects: [],
     compiledManualSubjects: [],
     compiledAutoSubjects: [],
   }
-  const compounds: Array<{ rule: Rule; conds: CompiledCondition[]; subjectLen: number }> = []
+  const compounds: Array<{
+    rule: Rule
+    conds: CompiledCondition[]
+    subjectLen: number
+    structural: boolean
+    manual: boolean
+    manualCase: boolean
+  }> = []
   for (const r of enabled) {
     const manual = r.source === 'user_manual'
     switch (r.type) {
@@ -2168,7 +3023,20 @@ export function buildRuleIndex(
         const decoded = decodeCompound(r.signal)
         if (!decoded || decoded.conditions.length === 0) break
         const conds = compileConditions(decoded.conditions)
-        compounds.push({ rule: r, conds, subjectLen: longestSubjectCondition(conds) })
+        // A hand-written compound naming a case id (「112訴204 帳單」) is the
+        // user's exception INSIDE that case: tier 0, ahead of every case rule
+        // — or the case rule took its mail, and correcting that taught the
+        // whole case to go to the exception's folder (R1). Ranked as
+        // structural too, which orders tier 0 like the compound tier.
+        const manualCase = manual && subjectNamesCaseIdentifier(conds)
+        compounds.push({
+          rule: r,
+          conds,
+          subjectLen: longestSubjectCondition(conds),
+          structural: hasStructuralSubjectCondition(conds) || manualCase,
+          manual,
+          manualCase,
+        })
         break
       }
       case 'domain': {
@@ -2178,13 +3046,17 @@ export function buildRuleIndex(
         else if (!ownDomains.has(d)) pushTo(index.domainMap, d, r)
         break
       }
-      case 'subject_keyword':
+      case 'subject_keyword': {
         // Pure court-case-number subject rules go in their own high-priority
-        // bucket (優化 2026-07); everything else is a plain subject rule.
+        // bucket (優化 2026-07) — any source: the body case pass reads it
+        // too. A hand-written one naming a case id is ALSO tier 0, like the
+        // compounds above (2026-11-06); everything else is a plain subject rule.
+        const manualCase = manual && namesCaseIdentifier(r.signal)
+        if (manualCase) index.manualCaseSubjectRules.push(r)
         if (courtCaseSignal(r.signal)) index.courtCaseSubjectRules.push(r)
-        else if (manual) index.manualSubjectKeywordRules.push(r)
-        else index.subjectKeywordRules.push(r)
+        else if (!manualCase) (manual ? index.manualSubjectKeywordRules : index.subjectKeywordRules).push(r)
         break
+      }
       case 'sender': {
         const s = r.signal.toLowerCase().trim()
         if (!s) break
@@ -2194,20 +3066,34 @@ export function buildRuleIndex(
     }
   }
   index.courtCaseSubjectRules.sort(subjectKeywordSort)
+  index.manualCaseSubjectRules.sort(subjectKeywordSort)
   index.manualSubjectKeywordRules.sort(subjectKeywordSort)
   index.subjectKeywordRules.sort(subjectKeywordSort)
-  // Compound specificity (2026-11-05): the LONGEST subject condition first,
-  // then more conditions, then effective confidence / recency. Sorting on
-  // confidence / recency alone let 「報告」→甲 claim 「RE: 乙案進度報告」
-  // just because it fired more recently than the 乙案 rule.
+  // Compound specificity (2026-11-05; structure + source 2026-11-06):
+  //   1. structural first — a subject condition that IS a court case number
+  //      / case code beats free text that merely contains one (「112訴204」
+  //      must not lose to a full-subject compound on 「112訴204 股權移轉案
+  //      進度報告」), mirroring the court-case tier above every
+  //      non-structural tier. A user_manual compound whose subject merely
+  //      CONTAINS one counts as structural too (R1, see above);
+  //   2. user_manual before auto — the matcher's hand-written-first rule,
+  //      inside this tier: (vendor + 請款) must not lose to an auto (vendor +
+  //      三月份請款單與發票明細), nor a manual compound with no subject
+  //      condition to any auto one that has one;
+  //   3. the LONGEST subject condition, then more conditions, then effective
+  //      confidence / recency. Confidence / recency alone let 「報告」→甲
+  //      claim 「RE: 乙案進度報告」 because it fired more recently.
   compounds.sort(
     (a, b) =>
+      Number(b.structural) - Number(a.structural) ||
+      Number(b.manual) - Number(a.manual) ||
       b.subjectLen - a.subjectLen ||
       b.conds.length - a.conds.length ||
       compareRulePriority(a.rule, b.rule),
   )
   compounds.forEach((c, order) => {
-    const entry: CompiledCompound = { rule: c.rule, conds: c.conds, order }
+    const entry: CompiledCompound = { rule: c.rule, conds: c.conds, order, manualCase: c.manualCase }
+    if (c.manualCase) index.compiledCompounds.manualCaseCount++
     index.compoundRules.push(c.rule)
     // Bucket by one REQUIRED condition (sender is the most selective): an
     // email can only satisfy the compound if it carries that anchor.
@@ -2229,6 +3115,7 @@ export function buildRuleIndex(
   const compileSubjects = (list: Rule[]): CompiledSubjectRule[] =>
     list.map((rule) => ({ rule, subj: compileSubjectNeedle(rule.signal) }))
   index.compiledCourtSubjects = compileSubjects(index.courtCaseSubjectRules)
+  index.compiledManualCaseSubjects = compileSubjects(index.manualCaseSubjectRules)
   index.compiledManualSubjects = compileSubjects(index.manualSubjectKeywordRules)
   index.compiledAutoSubjects = compileSubjects(index.subjectKeywordRules)
   return index
@@ -2287,9 +3174,10 @@ function compoundReason(c: CompiledCompound, f: EmailFeatures): string | null {
   return reasons.join(' + ')
 }
 
-function matchCompoundTier(index: RuleIndex, f: EmailFeatures): MatchOutcome | null {
+/** `tier0`: only the user_manual compounds naming a case id; else all the others. */
+function matchCompoundTier(index: RuleIndex, f: EmailFeatures, tier0: boolean): MatchOutcome | null {
   const c = index.compiledCompounds
-  if (c.size === 0) return null
+  if ((tier0 ? c.manualCaseCount : c.size - c.manualCaseCount) === 0) return null
   const candidates: CompiledCompound[] = [...c.unanchored]
   if (f.from) {
     const bySender = c.bySender.get(f.from)
@@ -2304,6 +3192,7 @@ function matchCompoundTier(index: RuleIndex, f: EmailFeatures): MatchOutcome | n
   }
   candidates.sort((a, b) => a.order - b.order)
   for (const cc of candidates) {
+    if (cc.manualCase !== tier0) continue
     const reason = compoundReason(cc, f)
     if (reason) return { rule: cc.rule, reason }
   }
@@ -2374,16 +3263,28 @@ function matchSenderTier(map: Map<string, Rule[]>, f: EmailFeatures): MatchOutco
  * subject) still come first, whatever their source. Inside the user_manual
  * tier the type order stays TYPE_PRIORITY's (domain → subject → sender), the
  * contract the 2026-05-22 incident pinned.
+ *
+ * Tier 0 (2026-11-06): a hand-written compound / subject_keyword rule whose
+ * subject CONTAINS a case id is the user's exception inside that case
+ * (「112訴204 帳單」 → 帳務). It used to lose to the auto case_code (tier 1)
+ * and the auto case-number rules (tiers 2–3), and correcting the misfile
+ * one-strike-disabled the case rule and taught the whole case to follow the
+ * exception. Hand-written case_code rules keep their place in tier 1; the
+ * order among auto rules is unchanged.
  */
 export function matchEmailWithIndex(email: Email, index: RuleIndex): MatchOutcome | null {
   const f = emailFeatures(email)
+  // 0. user_manual compound → subject_keyword naming a case id
+  const manualCase =
+    matchCompoundTier(index, f, true) ?? matchSubjectTier(index.compiledManualCaseSubjects, f)
+  if (manualCase) return manualCase
   // 1. case_code
   for (const c of index.compiledCaseCodes) {
     const reason = caseCodeReason(c.upper, c.rule.signal, f)
     if (reason) return { rule: c.rule, reason }
   }
   // 2. compound
-  const compound = matchCompoundTier(index, f)
+  const compound = matchCompoundTier(index, f, false)
   if (compound) return compound
   // 3. court-case subject rules (優化 2026-07) — a structural case-number
   // identifier outranks a broad plain-domain rule (same-client-multiple-
@@ -2710,27 +3611,41 @@ export function extractCaseCodes(text: string): string[] {
 //
 // Recognition strategy:
 //   - Compact form: year (1XX) + 1-5 Chinese chars (case type) + 1-5 digits
-//   - Full form:    year (1XX) + 年(度)? + Chinese chars + 字? + 第 + digits + 號?
+//   - Full form:    year (1XX) + 年(度)? + Chinese chars + 字 + 第 + digits + 號?
+//     字 is REQUIRED right before 第 (whitespace allowed) since 2026-11-06,
+//     as in every real court reference (「112年度訴字第304號」「最高法院112
+//     年度台上字第123號」). With 字 optional, any 「1XX年度<words>第N」 was a
+//     case: 「113年度財報第1季」 → 113財報1, 「113年度上午第1次」 → 113上午1.
+//     No character blacklist on the type instead: court 字別 use far more
+//     characters than legal words — 家財訴, 司執季, 執全明, 午字 (天干地支),
+//     報字 are all real — so 財 / 季 / 午 / 報 can't be refused safely.
 // Lookbehind/ahead negation prevents matching parts of a longer number
 // (avoids "2025年5月" → false match starting at "025").
 //
 // Date stopword filter: if the "case type" capture contains 年/月/日/時/分/秒,
 // we reject the match — it's almost certainly a date expression that
 // happened to fit the shape (e.g. "112年5月" looks like compact form).
+// 度 too (2026-11-06): when 年度 is followed by no real 字別 —
+// 「113年度第1次董事會議程」「113年度第1期財報」「113年度第1號公告」 — the full
+// form backtracks out of its optional 度 and captures 度 itself as the case
+// type, extracting 「113度1」 (and a first-sight case rule that swallowed
+// every 「113年度第1…」 mail of the client). No court 字別 contains 度. The
+// same filter guards every extractor below: full / compact, in text and
+// anchored (courtCaseSignal → normalizeSignal, body case extraction).
 
 // Case-type char class allows full-width / half-width parentheses so
 // 分案字別 like 「訴更(一)字」/「訴更（一）」 are captured; normalizeCaseType
 // strips the parens back out so the canonical compact form is 「訴更一」.
 const COURT_CASE_COMPACT_RE = /(?<!\d)(1\d{2})([一-龥（）()]{1,5})(\d{1,5})(?!\d)/g
-const COURT_CASE_FULL_RE = /(?<!\d)(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字?第(\d{1,5})號?/g
-const DATE_STOPWORD_RE = /[年月日時分秒週]/
+const COURT_CASE_FULL_RE = /(?<!\d)(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字\s*第(\d{1,5})號?/g
+const DATE_STOPWORD_RE = /[年月日時分秒週度]/
 
 // Anchored variants — used to test whether a whole SIGNAL string *is* a
 // court case number (vs merely contains one). A full-subject signal that
 // embeds a case number (e.g. 「112訴204 通知會議」) must NOT be treated as a
 // case-number signal — it keeps plain substring semantics.
 const COURT_CASE_COMPACT_ANCHOR = /^(1\d{2})([一-龥（）()]{1,5})(\d{1,5})$/
-const COURT_CASE_FULL_ANCHOR = /^(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字?第(\d{1,5})號?$/
+const COURT_CASE_FULL_ANCHOR = /^(1\d{2})年(?:度)?([一-龥（）()]{1,5}?)字\s*第(\d{1,5})號?$/
 
 /** Fold full-width digits (０-９, U+FF10–FF19) to ASCII so Taiwanese court
  *  e-notices that use full-width numerals normalize to the same canonical
@@ -2795,6 +3710,39 @@ export function courtCaseSignal(signal: string): string | null {
     if (cleanType) return `${year}${cleanType}${num}`
   }
   return null
+}
+
+/**
+ * A "case number" the parser produced before 2026-11-06 out of 年度 + no real
+ * 字別 (「113度1」 from 「113年度第1次董事會議程」, see DATE_STOPWORD_RE): the
+ * compact canonical form with 度 in the type.
+ *
+ * Only 度 can be told apart. The other pseudo cases the optional 字 let in —
+ * 「113財報1」 from 「113年度財報第1季」, 「113上午1」 from 「113年度上午第1次」
+ * — are well-formed compact cases (家財訴, 司執季, 午字 are real 字別, so no
+ * character proves a type fake). Rules learned on those stay: they no longer
+ * match anything (the full form now needs 字, and the compact text never
+ * appears in a subject), still count as structural (never as a client's
+ * narrowing), and the stale sweep removes them once 100 active days pass
+ * without a fire.
+ */
+function isPseudoCaseSignal(value: string): boolean {
+  const m = COURT_CASE_COMPACT_ANCHOR.exec(foldFullWidthDigits(value.trim()))
+  return !!m && m[2]!.includes('度')
+}
+
+/**
+ * An AUTO rule learned on such a pseudo case number — a subject_keyword whose
+ * signal is one, or a compound whose subject condition is (2026-11-06).
+ * user_manual rules never count: what the user wrote stays theirs.
+ */
+export function isPseudoCaseRule(r: Pick<Rule, 'type' | 'signal' | 'source'>): boolean {
+  if (r.source === 'user_manual' || typeof r.signal !== 'string') return false
+  if (r.type === 'subject_keyword') return isPseudoCaseSignal(r.signal)
+  if (r.type !== 'compound') return false
+  return (decodeCompound(r.signal)?.conditions ?? []).some(
+    (c) => c.type === 'subject_keyword' && isPseudoCaseSignal(c.value),
+  )
 }
 
 // ---- Body case-number gate (batch-3) ---------------------------------------

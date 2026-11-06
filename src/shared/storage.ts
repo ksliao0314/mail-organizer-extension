@@ -490,6 +490,38 @@ export async function addFolderToCache(
   })
 }
 
+/**
+ * Mark the cached folder tree out of date (2026-11-06 r2) — execute found a
+ * folder of it in the trash / Drafts / Outbox, or gone. The next
+ * getOrFetchFolderTree refetches instead of serving it until its TTL.
+ */
+export async function invalidateFolderCache(): Promise<void> {
+  await withFolderCacheLock(async () => {
+    const cache = await getFolderCache()
+    if (!cache || cache.invalidatedAt) return
+    await setFolderCache({ ...cache, invalidatedAt: new Date().toISOString() })
+  })
+}
+
+/**
+ * Store a freshly fetched tree (2026-11-06 r3) — under the same lock as
+ * invalidateFolderCache / addFolderToCache. An invalidation that landed
+ * after the fetch STARTED is kept: the tree may predate what execute found,
+ * so the next call refetches again. Returns what was stored.
+ */
+export async function storeFetchedFolderCache(fresh: FolderCache, fetchStartedAt: number): Promise<FolderCache> {
+  return withFolderCacheLock(async () => {
+    const current = await getFolderCache()
+    const invalidated = current?.invalidatedAt ? Date.parse(current.invalidatedAt) : Number.NaN
+    const next: FolderCache =
+      Number.isFinite(invalidated) && invalidated >= fetchStartedAt
+        ? { ...fresh, invalidatedAt: current!.invalidatedAt }
+        : fresh
+    await setFolderCache(next)
+    return next
+  })
+}
+
 export async function getMetrics(): Promise<Metrics> {
   const stored = await chrome.storage.local.get(KEY_METRICS)
   return { ...DEFAULT_METRICS, ...(stored[KEY_METRICS] ?? {}) }
@@ -720,11 +752,19 @@ export async function setLastHarvestAt(iso: string): Promise<void> {
 // UTC days on which this machine executed a batch. The stale sweep counts
 // rule age in these days instead of calendar days (see ACTIVE_DAYS_CAP), so
 // not using the tool for months no longer ages — and hard-deletes — the
-// learned library. Per-device; the sweep unions it with days derived from
-// the synced rules' own lastUsedAt / createdAt, which carries the other
-// machines' activity across.
+// learned library. The sweep unions it with days derived from the synced
+// rules' own lastUsedAt / createdAt, which carries the other machines'
+// activity across.
+//
+// Two keys (2026-11-06, S8): `activeDays` stays THIS machine's own ledger
+// (recordActiveDay), `fleetActiveDays` holds the days other machines'
+// ledgers brought in through sync. getActiveDays() is their union — the
+// fleet clock for synced rules and for the ledger a push carries;
+// getLocalActiveDays() is the per-device clock for auto_scan rules, which
+// only ever match during this machine's batches.
 
 const KEY_ACTIVE_DAYS = 'activeDays'
+const KEY_FLEET_ACTIVE_DAYS = 'fleetActiveDays'
 const KEY_LAST_SWEEP_AT = 'lastSweepAt'
 const withActiveDaysLock = createWriteMutex()
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/
@@ -738,11 +778,28 @@ export function utcDay(input: number | string | undefined | null): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-export async function getActiveDays(): Promise<string[]> {
-  const r = await chrome.storage.local.get(KEY_ACTIVE_DAYS)
-  const v = r[KEY_ACTIVE_DAYS]
+async function readDays(key: string): Promise<string[]> {
+  const r = await chrome.storage.local.get(key)
+  const v = r[key]
   if (!Array.isArray(v)) return []
   return v.filter((d): d is string => typeof d === 'string' && DAY_RE.test(d))
+}
+
+/**
+ * Every known active day — this machine's and the ones sync brought in —
+ * newest ACTIVE_DAYS_CAP, ascending. The clock for synced rules (so the
+ * no-tombstone stale deletes converge across machines) and the ledger a sync
+ * push carries.
+ */
+export async function getActiveDays(): Promise<string[]> {
+  const [local, fleet] = await Promise.all([readDays(KEY_ACTIVE_DAYS), readDays(KEY_FLEET_ACTIVE_DAYS)])
+  if (fleet.length === 0) return local
+  return [...new Set([...local, ...fleet])].sort().slice(-ACTIVE_DAYS_CAP)
+}
+
+/** Only the days THIS machine executed a batch (S8) — the clock for its auto_scan rules. */
+export async function getLocalActiveDays(): Promise<string[]> {
+  return readDays(KEY_ACTIVE_DAYS)
 }
 
 /** Record that a batch was executed on the UTC day of `at`. Idempotent per day. */
@@ -750,10 +807,33 @@ export async function recordActiveDay(at: number = Date.now()): Promise<void> {
   const day = utcDay(at)
   if (!day) return
   await withActiveDaysLock(async () => {
-    const days = await getActiveDays()
+    const days = await readDays(KEY_ACTIVE_DAYS)
     if (days.includes(day)) return
     const next = [...new Set([...days, day])].sort().slice(-ACTIVE_DAYS_CAP)
     await chrome.storage.local.set({ [KEY_ACTIVE_DAYS]: next })
+  })
+}
+
+/**
+ * Union another machine's active days into the fleet ledger (sync pull,
+ * 2026-11-06), newest ACTIVE_DAYS_CAP kept. The ledger was per-device, so
+ * the no-tombstone stale / dormant deletes reached different verdicts on
+ * different machines and a lagging machine kept re-pushing rules the active
+ * one had already swept. Kept apart from this machine's own ledger (S8).
+ * Writes nothing when no new day arrives.
+ */
+export async function mergeActiveDaysFromSync(days: readonly string[]): Promise<void> {
+  const incoming = days.filter((d) => typeof d === 'string' && DAY_RE.test(d))
+  if (incoming.length === 0) return
+  await withActiveDaysLock(async () => {
+    const [local, fleet] = await Promise.all([readDays(KEY_ACTIVE_DAYS), readDays(KEY_FLEET_ACTIVE_DAYS)])
+    const known = new Set([...local, ...fleet])
+    const fresh = incoming.filter((d) => !known.has(d))
+    if (fresh.length === 0) return
+    const current = [...new Set(fleet)].sort()
+    const next = [...new Set([...current, ...fresh])].sort().slice(-ACTIVE_DAYS_CAP)
+    if (next.length === current.length && next.every((d, i) => d === current[i])) return
+    await chrome.storage.local.set({ [KEY_FLEET_ACTIVE_DAYS]: next })
   })
 }
 
@@ -765,6 +845,77 @@ export async function getLastSweepAt(): Promise<number | null> {
 
 export async function setLastSweepAt(ms: number): Promise<void> {
   await chrome.storage.local.set({ [KEY_LAST_SWEEP_AT]: ms })
+}
+
+// ---- Rule counter baseline (2026-11-06) ------------------------------------
+//
+// Before v1.0.8 a rule-routed row changed to 刪除 counted as an override, so
+// libraries from older builds carry inflated overrideCounts — and v1.0.8's
+// high-error-rate predicate (fires ≥ 20, overrides / fires ≥ 0.5) disabled
+// broad rules on the first sweep that the old one kept, and the dormant purge
+// then hard-deleted them. The sweep judges such rules only on what happened
+// after this machine first saw them (rules.ts staleTransform) — and, since
+// 2026-11-06, only on increments counted HERE: counters that arrive from
+// elsewhere (sync pull, backup restore, import, a deduped twin) are covered
+// when they land (rules.ts coverArrivingCounters / foldDedupedBaseline). LOCAL ONLY:
+// never synced, backed up or exported — sync merges counters with max, and a
+// synced baseline would mix machines' histories.
+
+const KEY_RULE_COUNTER_BASELINE = 'ruleCounterBaseline'
+
+export type RuleCounterBaseline = {
+  /** When this machine started keeping the baseline (ISO). Rules created
+   *  before it are baselined at first sight; later ones count in full. */
+  capturedAt: string
+  /** ruleId → [matchCount, overrideCount] the sweep judges from (counts
+   *  first seen, arriving from elsewhere, or reset by a revive). */
+  counts: Record<string, [number, number]>
+  /** ruleId → the rule's counter epoch (Rule.statsResetAt) when its entry
+   *  was taken; absent = 0 (no epoch). Only a NEWER epoch — a revive — is a
+   *  counter reset (2026-11-06). */
+  epochs?: Record<string, number>
+}
+
+function sanitizeRuleCounterBaseline(raw: unknown): RuleCounterBaseline | null {
+  if (!raw || typeof raw !== 'object') return null
+  const { capturedAt, counts, epochs } = raw as {
+    capturedAt?: unknown
+    counts?: unknown
+    epochs?: unknown
+  }
+  if (typeof capturedAt !== 'string' || !Number.isFinite(Date.parse(capturedAt))) return null
+  const out: Record<string, [number, number]> = {}
+  if (counts && typeof counts === 'object') {
+    for (const [id, v] of Object.entries(counts as Record<string, unknown>)) {
+      if (
+        Array.isArray(v) &&
+        v.length === 2 &&
+        v.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0)
+      ) {
+        out[id] = [v[0] as number, v[1] as number]
+      }
+    }
+  }
+  const outEpochs: Record<string, number> = {}
+  if (epochs && typeof epochs === 'object') {
+    for (const [id, v] of Object.entries(epochs as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0 && out[id]) outEpochs[id] = v
+    }
+  }
+  return {
+    capturedAt,
+    counts: out,
+    ...(Object.keys(outEpochs).length > 0 ? { epochs: outEpochs } : {}),
+  }
+}
+
+export async function getRuleCounterBaseline(): Promise<RuleCounterBaseline | null> {
+  const r = await chrome.storage.local.get(KEY_RULE_COUNTER_BASELINE)
+  return sanitizeRuleCounterBaseline(r[KEY_RULE_COUNTER_BASELINE])
+}
+
+export async function setRuleCounterBaseline(b: RuleCounterBaseline): Promise<void> {
+  await chrome.storage.local.set({ [KEY_RULE_COUNTER_BASELINE]: b })
 }
 
 // ---- Mailbox identity (2026-11-05) -----------------------------------------
@@ -780,7 +931,12 @@ export async function setLastSweepAt(ms: number): Promise<void> {
 
 const KEY_MAILBOX_IDENTITY = 'mailboxIdentity'
 
-export type MailboxIdentity = { address: string; domain: string; at: string }
+/**
+ * `accountId` (2026-11-06): MSAL homeAccountId of the token the lookup ran
+ * with — the SW refetches when the signed-in account changes. Absent on
+ * identities cached before that.
+ */
+export type MailboxIdentity = { address: string; domain: string; at: string; accountId?: string }
 
 function sanitizeMailboxIdentity(raw: unknown): MailboxIdentity | null {
   if (!raw || typeof raw !== 'object') return null
@@ -795,6 +951,7 @@ function sanitizeMailboxIdentity(raw: unknown): MailboxIdentity | null {
     address,
     domain: declared || fromAddress,
     at: typeof r.at === 'string' ? r.at : '',
+    ...(typeof r.accountId === 'string' && r.accountId ? { accountId: r.accountId } : {}),
   }
 }
 
@@ -842,14 +999,55 @@ export async function addRuleTombstones(items: RuleTombstone[]): Promise<void> {
   if (items.length === 0) return
   await withTombstoneLock(async () => {
     const existing = await getRuleTombstones()
-    // Dedup by triple — if the same triple is already tombstoned, keep the
-    // newer deletedAt (so cleanup by age behaves correctly).
-    const key = (t: RuleTombstone) => `${t.type}::${t.signalNorm}::${t.targetFolderPath}`
-    const byKey = new Map<string, RuleTombstone>()
-    for (const t of existing) byKey.set(key(t), t)
-    for (const t of items) byKey.set(key(t), t)
-    await setRuleTombstones([...byKey.values()])
+    await setRuleTombstones(mergeTombstoneSlots(existing, items))
   })
+}
+
+/** The stored triple of a tombstone (its raw signalNorm, not re-canonicalized). */
+function storedTriple(t: RuleTombstone): string {
+  return `${t.type}::${t.signalNorm}::${t.targetFolderPath}`
+}
+
+/**
+ * A tombstone's storage slot (2026-11-06, round 3): its stored triple plus
+ * the spelling it records. Canonical twins (「112年度訴字第304號」 /
+ * 「112訴304」) share one triple now that every delete stores the canonical
+ * form, so each deletion needs its own slot to keep its spelling.
+ */
+export function tombstoneSlot(t: RuleTombstone): string {
+  return `${storedTriple(t)}#${t.spellingHash || ''}`
+}
+
+/**
+ * `incoming` merged into `existing` slot by slot (round 3) — the one rule every
+ * tombstone write follows:
+ *   - one entry per slot (tombstoneSlot). Keyed by the triple alone, deleting
+ *     the second twin overwrote the first deletion's spelling, and adoption
+ *     then read the user's own deletion of the manual twin as a canonical
+ *     collision and resurrected it on every machine.
+ *   - the newer deletedAt wins a slot (an older copy arriving later used to
+ *     overwrite it, despite the comment promising the opposite).
+ *   - an entry without a spelling that has the same triple and deletedAt as
+ *     one with a spelling is that same deletion re-pushed by a build that
+ *     drops spellings (v1.0.8): folded into it — as a spelling-less deletion
+ *     it would delete every spelling of the triple.
+ */
+export function mergeTombstoneSlots(
+  existing: readonly RuleTombstone[],
+  incoming: readonly RuleTombstone[],
+): RuleTombstone[] {
+  const bySlot = new Map<string, RuleTombstone>()
+  for (const t of [...existing, ...incoming]) {
+    const k = tombstoneSlot(t)
+    const cur = bySlot.get(k)
+    if (!cur || t.deletedAt > cur.deletedAt) bySlot.set(k, t)
+  }
+  const spelled = new Set<string>()
+  for (const t of bySlot.values()) if (t.spellingHash) spelled.add(`${storedTriple(t)}@${t.deletedAt}`)
+  const all = [...bySlot.values()]
+  return spelled.size === 0
+    ? all
+    : all.filter((t) => t.spellingHash || !spelled.has(`${storedTriple(t)}@${t.deletedAt}`))
 }
 
 /**
@@ -1412,6 +1610,29 @@ export async function recordSubjectFilings(
     }
     const pruned = pruneThreadMemory(map, SUBJECT_MEMORY_CAP)
     await chrome.storage.local.set({ [KEY_SUBJECT_MEMORY]: pruned })
+  })
+}
+
+/**
+ * Put the given subject-memory keys back to the given values (null = absent),
+ * under the same lock the filing writer uses (2026-11-06). Execute's crash
+ * replay redoes a batch's subject filings from the pre-batch values it
+ * persisted, instead of counting them a second time — a double count let the
+ * birth gate mint a full_subject rule on first sight.
+ */
+export async function restoreSubjectMemoryEntries(
+  entries: Record<string, ThreadMemoryEntry | null>,
+): Promise<void> {
+  const keys = Object.keys(entries)
+  if (keys.length === 0) return
+  await withSubjectMemoryLock(async () => {
+    const map = await getSubjectMemory()
+    for (const k of keys) {
+      const v = entries[k]
+      if (v) map[k] = v
+      else delete map[k]
+    }
+    await chrome.storage.local.set({ [KEY_SUBJECT_MEMORY]: map })
   })
 }
 

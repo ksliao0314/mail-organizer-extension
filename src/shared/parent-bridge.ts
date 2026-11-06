@@ -13,23 +13,43 @@
 // payloads — i.e. the user's folder names and paths.
 //
 // Now:
-//   - the FAB content script creates a MessageChannel per iframe load and
+//   - the FAB content script creates a MessageChannel per offer and
 //     transfers one port inside `parent-hello`, posted straight to
 //     iframe.contentWindow with targetOrigin = the extension origin;
-//   - we accept only the FIRST hello whose `event.source === window.parent`
-//     and that carries a port; any other hello is refused (its ports
-//     closed), so a late or foreign hello can't steal the channel;
+//   - every hello carries a one-time nonce the content script got from the
+//     service worker (2026-11-06). `event.source === window.parent` can't
+//     tell the content script from an Outlook PAGE script — they share that
+//     window — and these pages are web-accessible to Outlook, so a page
+//     script could embed this page itself, or race its own hello into the
+//     real panel before the content script's (offered on iframe `load`,
+//     while this listener runs from module evaluation). So a hello's port is
+//     accepted only after the SW confirms its nonce was issued to a content
+//     script in this frame's own tab (redeeming consumes it; see
+//     background/handlers/panel-pairing.ts). Page scripts can't reach
+//     chrome.runtime, so they can't mint one;
+//   - we accept only the FIRST verified hello from `window.parent`; any
+//     other hello is refused (its ports closed), so a late or foreign hello
+//     can't steal the channel;
 //   - everything afterwards travels over that port — nothing is broadcast
-//     to the host page, and there is no `iframe-ready` ping any more;
+//     to the host page, and NOTHING is sent before pairing: messages posted
+//     earlier wait in a bounded queue that only a verified port receives;
 //   - we ack over the port so the content script can stop re-offering.
 //
+// Pairing protects the data channel only. A page script can still embed
+// these (fully privileged) pages and overlay them — clickjacking — so when
+// framed, the UI itself renders only after pairing (2026-11-06,
+// components/ui/bridge-gate.tsx); onConnected() is its signal.
+//
 // The listener is installed at module-evaluation time from main.tsx
-// (init is idempotent) so a hello arriving before React mounts isn't lost;
-// messages posted before the handshake completes are queued (bounded).
+// (init is idempotent) so a hello arriving before React mounts isn't lost.
+
+import { send } from './send-message'
 
 const HELLO = 'mail-organizer/parent-hello'
 const ACK = 'mail-organizer/bridge-ack'
 const MAX_QUEUED = 20
+/** Real nonces are 32 hex chars — anything far longer is junk, not worth a SW round-trip. */
+const MAX_NONCE_LEN = 128
 
 /** The slice of `Window` the bridge touches — injectable for unit tests. */
 export type BridgeWindow = {
@@ -37,6 +57,12 @@ export type BridgeWindow = {
   addEventListener(type: 'message', listener: (e: MessageEvent) => void): void
   removeEventListener(type: 'message', listener: (e: MessageEvent) => void): void
 }
+
+/**
+ * Ask the service worker whether `nonce` was issued to the FAB content
+ * script of this frame's tab (and consume it). Injectable for unit tests.
+ */
+export type RedeemNonce = (nonce: string) => Promise<boolean>
 
 export type PostOptions = {
   /**
@@ -53,30 +79,39 @@ export type ParentBridge = {
   init(): () => void
   /** Send to the FAB content script. Returns true only if delivered now. */
   post(message: object, opts?: PostOptions): boolean
+  /** A verified FAB content script is on the other end (pairing completed). */
   isConnected(): boolean
+  /** This page is framed (the in-OWA panel / settings modal) rather than top-level. */
+  isEmbedded(): boolean
+  /**
+   * Called once when pairing completes (2026-11-06) — BridgeGate shows the
+   * framed UI only from then on. Returns an unsubscribe.
+   */
+  onConnected(listener: () => void): () => void
 }
 
-export function createParentBridge(win: BridgeWindow): ParentBridge {
+function closePorts(ports: readonly MessagePort[]): void {
+  for (const p of ports) {
+    try {
+      p.close()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+export function createParentBridge(win: BridgeWindow, redeemNonce: RedeemNonce): ParentBridge {
   let port: MessagePort | null = null
   let listening = false
   const queue: object[] = []
+  const connectedListeners = new Set<() => void>()
   const embedded = () => win.parent !== win
 
-  function onMessage(e: MessageEvent) {
-    const data = e.data as { type?: unknown } | null
-    if (!data || typeof data !== 'object' || data.type !== HELLO) return
-    const ports = e.ports ? Array.from(e.ports) : []
-    const offered = ports[0]
-    if (port || e.source !== win.parent || !offered) {
-      // Already paired, not from our parent window, or no channel offered —
-      // refuse, and release whatever was transferred so it can't linger.
-      for (const p of ports) {
-        try {
-          p.close()
-        } catch {
-          /* ignore */
-        }
-      }
+  function adopt(offered: MessagePort, verified: boolean) {
+    // Unverified, or another hello won the race while this one was being
+    // checked — release the port so it can't linger.
+    if (!verified || port) {
+      closePorts([offered])
       return
     }
     port = offered
@@ -86,6 +121,35 @@ export function createParentBridge(win: BridgeWindow): ParentBridge {
     } catch (err) {
       console.warn('[mail-organizer] parent bridge: port send failed', err)
     }
+    for (const listener of [...connectedListeners]) {
+      try {
+        listener()
+      } catch (err) {
+        console.warn('[mail-organizer] parent bridge: listener failed', err)
+      }
+    }
+  }
+
+  function onMessage(e: MessageEvent) {
+    const data = e.data as { type?: unknown; nonce?: unknown } | null
+    if (!data || typeof data !== 'object' || data.type !== HELLO) return
+    const ports = e.ports ? Array.from(e.ports) : []
+    const [offered, ...extra] = ports
+    closePorts(extra)
+    const nonce =
+      typeof data.nonce === 'string' && data.nonce.length <= MAX_NONCE_LEN ? data.nonce : ''
+    if (port || e.source !== win.parent || !offered || !nonce) {
+      // Already paired, not from our parent window, no channel or no nonce
+      // offered (the pre-2026-11-06 protocol) — refuse.
+      if (offered) closePorts([offered])
+      return
+    }
+    void Promise.resolve()
+      .then(() => redeemNonce(nonce))
+      .then(
+        (verified) => adopt(offered, verified === true),
+        () => adopt(offered, false),
+      )
   }
 
   function init(): () => void {
@@ -118,14 +182,37 @@ export function createParentBridge(win: BridgeWindow): ParentBridge {
     }
   }
 
-  return { init, post, isConnected: () => port !== null }
+  function onConnected(listener: () => void): () => void {
+    connectedListeners.add(listener)
+    return () => {
+      connectedListeners.delete(listener)
+    }
+  }
+
+  return { init, post, isConnected: () => port !== null, isEmbedded: embedded, onConnected }
+}
+
+/** The production redeemer: the SW checks the nonce against this frame's tab. */
+async function redeemWithServiceWorker(nonce: string): Promise<boolean> {
+  try {
+    const r = await send<{ valid?: boolean }>({ type: 'redeemPanelPairingNonce', nonce })
+    return r?.ok === true && r.data?.valid === true
+  } catch {
+    // SW unreachable / extension reloaded — can't verify, so don't pair.
+    return false
+  }
 }
 
 const defaultBridge: ParentBridge | null =
-  typeof window !== 'undefined' ? createParentBridge(window) : null
+  typeof window !== 'undefined' ? createParentBridge(window, redeemWithServiceWorker) : null
 
 export function initParentBridge(): () => void {
   return defaultBridge ? defaultBridge.init() : () => {}
+}
+
+/** This page's bridge (null outside a browser window) — for BridgeGate. */
+export function getParentBridge(): ParentBridge | null {
+  return defaultBridge
 }
 
 export function postToParent(message: object, opts?: PostOptions): boolean {

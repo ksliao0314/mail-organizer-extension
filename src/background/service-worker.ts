@@ -6,15 +6,48 @@
 // may call them; content scripts are limited to CONTENT_SCRIPT_MESSAGE_TYPES
 // (same file).
 
-import { OutlookApi, OutlookError, flattenFolderTree } from '@/shared/outlook-api'
+import {
+  OutlookApi,
+  OutlookError,
+  OutlookTokenUnavailableError,
+  flattenAiVisibleFolders,
+  flattenFolderTree,
+  joinFolderPath,
+} from '@/shared/outlook-api'
 import {
   ClassifierError,
   classifyBatch,
+  estimateUsageCostUsd,
   isKnownClaudeModel,
   withClaudeRetry,
   type ClassifierUsage,
 } from '@/shared/classifier'
 import {
+  AI_REFUSAL_ISOLATION_MAX_CALLS,
+  AI_REFUSAL_ISOLATION_MAX_CALLS_PER_RUN,
+  REFUSAL_SUSPICION_TTL_MS,
+} from '@/shared/constants'
+import {
+  addRefusedEmails,
+  clearRefusalSuspicion,
+  getRefusalSuspicion,
+  getRefusedEmailIds,
+  getRefusedEmails,
+  setRefusalSuspicion,
+  type RefusalSuspicion,
+  type RefusedEmailEntry,
+} from '@/shared/refusal-ledger'
+import {
+  batchRefusedReason,
+  classifyIsolatingRefusals,
+  createRefusalGate,
+  describeRefusals,
+  previouslyRefusedReason,
+  refusedEmailReason,
+  sharedPromptProbeEmail,
+} from './refusal-isolation'
+import {
+  ExecuteStartError,
   clearExecuteState,
   dismissUndo,
   executeUndo,
@@ -22,14 +55,15 @@ import {
   installUndoExpireListener,
   isExecuteBusy,
   isExecuteRunning,
+  launchExecute,
   recoverStaleExecuteState,
   requestCancel,
-  startExecute,
   startRetryFailed,
 } from './execute'
 import {
   clearScanState,
   getScanState,
+  isScanBusy,
   isScanRunning,
   recoverStaleScanState,
   requestScanCancel,
@@ -43,6 +77,7 @@ import {
   handleResolveConflict,
   handleSplitConflictToCompound,
 } from './handlers/rules-bulk'
+import { issuePanelPairingNonce, redeemPanelPairingNonce } from './handlers/panel-pairing'
 import {
   handleClearErrorLog,
   handleDisableSync,
@@ -81,6 +116,7 @@ import {
   AI_PARALLEL_CHUNKS,
   BATCH_SIZE_MAX,
   BATCH_SIZE_MIN,
+  FOLDER_CACHE_INCOMPLETE_TTL_MS,
   INBOX_PAGE_SIZE_MAX,
   INBOX_PAGE_SIZE_MIN,
   INBOX_SCAN_MAX_MESSAGES,
@@ -103,6 +139,7 @@ import {
   newRule,
   reconcileRulesAgainstTree,
   type ReconcileSummary,
+  type ReconcileTreeOptions,
   ruleBeatsThread,
   snapshotOf,
   toggleRule,
@@ -114,11 +151,13 @@ import {
   filterHarvestCandidates,
   harvestWindowStart,
   nextHarvestWatermark,
+  resumeHarvestWatermark,
   selectHarvestScanItems,
   type HarvestScanItem,
 } from '@/background/harvest'
 import {
   applyImport,
+  applyImportTakeovers,
   type ImportStrategy,
   parseRulesPayload,
   previewImport,
@@ -136,7 +175,6 @@ import {
   getFolderCache,
   getLastHarvestAt,
   getMetrics,
-  getMailboxIdentity,
   getMovedByUsLedger,
   getRecentlyProcessedIds,
   getRuleEvents,
@@ -155,15 +193,16 @@ import {
   recordSubjectFilings,
   setFolderActivityRefreshAt,
   setLastHarvestAt,
-  setFolderCache,
-  setMailboxIdentity,
+  storeFetchedFolderCache,
   setSettings,
   setWeeklyDigestState,
+  type MailboxIdentity,
 } from '@/shared/storage'
 import { computeRuleHealth } from '@/shared/rule-health'
 import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from '@/shared/normalize'
 import type {
   Email,
+  FolderCache,
   MailFolderNode,
   PlanItem,
   Rule,
@@ -171,6 +210,7 @@ import type {
   Settings,
 } from '@/shared/types'
 import { getLastTokenError, getOwaToken, peekCachedToken, pingOwa } from './token'
+import { resolveMailboxIdentity } from './mailbox-identity'
 
 const FOLDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CLASSIFY_STAGE_KEY = 'classifyStage'
@@ -270,6 +310,8 @@ export type FolderTreeStaleness = {
   lastError: string
   /** updatedAt of the cache being served instead. */
   cacheUpdatedAt: string
+  /** This streak already wrote its error-log entry. */
+  logged?: boolean
 }
 
 async function getFolderTreeStaleness(): Promise<FolderTreeStaleness | null> {
@@ -281,40 +323,138 @@ async function getFolderTreeStaleness(): Promise<FolderTreeStaleness | null> {
   }
 }
 
+/**
+ * A cache written before FolderCache.wellKnown existed — v1.0.8's
+ * excludedFolderIds, round 1's nonFiling, or an older one that lists every
+ * folder (trash subtree, Drafts, untagged Junk / Sent: all offered to the AI)
+ * (2026-11-06 r3). Refetched on first use, even while fresh; reconciled
+ * non-destructively if it has to be served.
+ */
+function isLegacyFolderCache(cache: FolderCache): boolean {
+  return !cache.wellKnown
+}
+
+/**
+ * How reconcile must read a cached tree (2026-11-06 r2). Deleted Items itself
+ * is a valid target outside the tree; anything else missing from a complete
+ * tree is orphaned. A tree built from a partial well-known lookup, or a
+ * legacy one (any cache without `wellKnown`) served because the refetch
+ * failed, is not trusted: reconcile leaves every rule as it is.
+ */
+function reconcileOptionsFor(cache: FolderCache | undefined): ReconcileTreeOptions {
+  if (!cache) return {}
+  if (cache.wellKnown) {
+    const trash = cache.wellKnown.roots.find((r) => r.role === 'deleteditems')
+    return {
+      ...(trash
+        ? { trashFolder: { id: trash.id, ...(trash.displayName ? { path: joinFolderPath(undefined, trash.displayName) } : {}) } }
+        : {}),
+      treeComplete: cache.wellKnown.complete,
+    }
+  }
+  return { treeComplete: false } // legacy (isLegacyFolderCache)
+}
+
+/** Deleted Items itself, as the cached tree's roots know it — see reconcileOptionsFor. */
+function trashFolderOf(cache: FolderCache | undefined): ReconcileTreeOptions['trashFolder'] {
+  return reconcileOptionsFor(cache).trashFolder
+}
+
+/**
+ * Top-level names of the folders the tree leaves out — Deleted Items, Drafts,
+ * Outbox (2026-11-06 r3). The AI can't see them, so a "new" top-level folder
+ * it names like one of them is that very folder: unresolved, not a create
+ * that execute refuses.
+ */
+function omittedRootNames(cache: FolderCache | undefined): string[] {
+  return (cache?.wellKnown?.roots ?? [])
+    .filter((r) => r.role === 'deleteditems' || r.role === 'drafts' || r.role === 'outbox')
+    .flatMap((r) => (r.displayName ? [r.displayName] : []))
+}
+
+/**
+ * A rule hit as a plan row (2026-11-06 r3): one routing to Deleted Items
+ * itself (the user's auto-trash rule) is a DELETE row, rule kept — as a
+ * 'move' its target, absent from the tree the popup has, read as
+ * 「執行時會失敗」 and grouped apart from the other deletes. Execute still
+ * counts the hit, and 撤回 counts it against the rule.
+ */
+function ruleRowFor(item: PlanItem, trash: ReconcileTreeOptions['trashFolder']): PlanItem {
+  if (item.action !== 'move' || !trash) return item
+  const toTrash =
+    (!!item.targetFolderId && item.targetFolderId === trash.id) ||
+    (!!trash.path && item.targetFolderPath === trash.path)
+  if (!toTrash) return item
+  const { targetFolderId: _id, targetFolderPath: _path, ...rest } = item
+  return { ...rest, action: 'delete' }
+}
+
+// Reconcile options of each tree getOrFetchFolderTree* handed out (keyed by
+// the tree array itself, so callers that only hold `tree` can look them up).
+const treeReconcileOptions = new WeakMap<MailFolderNode[], ReconcileTreeOptions>()
+
+function reconcileOptionsForTree(tree: MailFolderNode[]): ReconcileTreeOptions {
+  return treeReconcileOptions.get(tree) ?? {}
+}
+
+function servedTree(cache: FolderCache): MailFolderNode[] {
+  treeReconcileOptions.set(cache.tree, reconcileOptionsFor(cache))
+  return cache.tree
+}
+
 async function getOrFetchFolderTreeWithMeta(
   forceFresh: boolean,
 ): Promise<{ tree: MailFolderNode[]; stale: FolderTreeStaleness | null }> {
   const cache = await getFolderCache()
-  const cacheFresh = cache && Date.now() - new Date(cache.updatedAt).getTime() < FOLDER_CACHE_TTL_MS
+  // A tree built from a PARTIAL well-known lookup is only briefly fresh
+  // (2026-11-06 r2) — the next preflight refetches it instead of serving it
+  // for a day.
+  const ttl = cache?.wellKnown && !cache.wellKnown.complete ? FOLDER_CACHE_INCOMPLETE_TTL_MS : FOLDER_CACHE_TTL_MS
+  // Execute found the tree out of date (a folder trashed since): never fresh.
+  const cacheFresh = cache && !cache.invalidatedAt && Date.now() - new Date(cache.updatedAt).getTime() < ttl
+  // A v1.0.8 cache hid Junk Email / Sent Items (+ subfolders); a round-1 one
+  // listed the trash; an older one lists everything. Refetch any of them on
+  // first use rather than keep serving it for up to a day.
+  const legacy = !!cache && isLegacyFolderCache(cache)
 
-  if (!forceFresh && cacheFresh) {
-    return { tree: cache!.tree, stale: await getFolderTreeStaleness() }
+  if (!forceFresh && cacheFresh && !legacy) {
+    return { tree: servedTree(cache!), stale: await getFolderTreeStaleness() }
   }
 
   try {
-    const { tree, excludedFolderIds } = await api.fetchFolderTreeWithMeta()
-    await setFolderCache({ updatedAt: new Date().toISOString(), tree, excludedFolderIds })
+    const fetchStartedAt = Date.now()
+    // A role whose lookup fails keeps the previous fetch's root (2026-11-06 r3).
+    const { tree, wellKnown } = await api.fetchFolderTreeWithMeta({ previous: cache?.wellKnown })
+    // Under the folder-cache lock, keeping an invalidation execute made
+    // while this fetch ran (2026-11-06 r3) — the tree may predate it.
+    const fresh = await storeFetchedFolderCache({ updatedAt: new Date().toISOString(), tree, wellKnown }, fetchStartedAt)
     await chrome.storage.session.remove(FOLDER_TREE_STALE_KEY).catch(() => {})
-    return { tree, stale: null }
+    return { tree: servedTree(fresh), stale: null }
   } catch (e) {
     // Transient failures (network, 401, etc) shouldn't block the user when a
     // stale tree is still usable — keep serving it, but make it visible.
     if (cache) {
       const msg = e instanceof Error ? e.message : String(e)
       const prev = await getFolderTreeStaleness()
+      // No Outlook tab / token is a state, not an error (2026-11-06): the
+      // streak is still recorded, but only a real failure is logged (once).
+      // A record without `logged` predates the flag — it always logged.
+      const alreadyLogged = !!prev && prev.logged !== false
+      const shouldLog = !alreadyLogged && !(e instanceof OutlookTokenUnavailableError)
       const stale: FolderTreeStaleness = {
         since: prev?.since ?? Date.now(),
         lastError: msg.slice(0, 300),
         cacheUpdatedAt: cache.updatedAt,
+        logged: alreadyLogged || shouldLog,
       }
-      if (!prev) {
+      if (shouldLog) {
         await logError('outlook:folder-tree', msg, {
           ageMs: Date.now() - new Date(cache.updatedAt).getTime(),
           forceFresh,
         }).catch(() => {})
       }
       await chrome.storage.session.set({ [FOLDER_TREE_STALE_KEY]: stale }).catch(() => {})
-      return { tree: cache.tree, stale }
+      return { tree: servedTree(cache), stale }
     }
     throw e
   }
@@ -367,49 +507,22 @@ async function resolveOutlookBase(): Promise<string> {
 const api = new OutlookApi(
   async (opts) => {
     const r = await getOwaToken({ force: opts?.force })
-    if (!r.ok) throw new Error(r.message)
+    // The code rides along (2026-11-06) → OutlookTokenUnavailableError.tokenCode.
+    if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code })
     return r.secret
   },
   resolveOutlookBase,
 )
 
-// Own mailbox domain (2026-11-05). With internalDomains empty (the default),
-// learning used to mint `domain: <own domain>` from a colleague's mail, and
-// since domain rules match ANY address incl. To/Cc, that one rule claimed
-// nearly every inbound email. rules.ts now keeps own-domain addresses from
-// triggering AUTO domain rules (and learning never mints them) — given the
-// domain. Resolved from GET /me once and cached for a week; any failure falls
-// back to the cached value, or to none (the pre-fix behaviour).
-const MAILBOX_IDENTITY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
-let identityLookupFailedAt = 0
+// Own mailbox identity — resolution, the per-account failure memo and the
+// account check live in mailbox-identity.ts (2026-11-06 r2). Never throws.
+function resolveOwnIdentity(opts: { fetch?: boolean } = {}): Promise<MailboxIdentity | null> {
+  return resolveMailboxIdentity(api, opts)
+}
 
-// `fetch: false` = cache only: classify preflight refreshes the identity, so
-// the AI pass right after it and the background harvest never spend a call.
 async function resolveOwnDomains(opts: { fetch?: boolean } = {}): Promise<string[]> {
-  const cached = await getMailboxIdentity().catch(() => null)
-  const cachedAt = cached ? Date.parse(cached.at) : NaN
-  const fresh =
-    cached !== null && Number.isFinite(cachedAt) && Date.now() - cachedAt < MAILBOX_IDENTITY_MAX_AGE_MS
-  if (fresh || opts.fetch === false) return cached ? [cached.domain] : []
-  // A lookup that just failed isn't retried for an hour (SW lifetime), so a
-  // persistently failing /me can't add its timeout to every preflight.
-  if (Date.now() - identityLookupFailedAt < 60 * 60_000) return cached ? [cached.domain] : []
-  try {
-    // Bounded: a failing /me would otherwise sit in request()'s 5xx backoff
-    // (1 s + 3 s + 9 s) and hold up classify preflight — the identity is a
-    // nice-to-have, never worth that.
-    const address = (await api.getMyEmail(AbortSignal.timeout(3000))).trim().toLowerCase()
-    const at = address.lastIndexOf('@')
-    if (at > 0 && at < address.length - 1) {
-      const identity = { address, domain: address.slice(at + 1), at: new Date().toISOString() }
-      await setMailboxIdentity(identity)
-      return [identity.domain]
-    }
-  } catch (e) {
-    console.warn('[mail-organizer] mailbox identity lookup failed (non-fatal)', e)
-  }
-  identityLookupFailedAt = Date.now()
-  return cached ? [cached.domain] : []
+  const identity = await resolveOwnIdentity(opts)
+  return identity ? [identity.domain] : []
 }
 
 chrome.runtime.onInstalled.addListener((details) => {
@@ -712,8 +825,8 @@ async function recoverStaleStates(reason: string): Promise<void> {
  * OWA renderer, which hosts the content scripts — could send wipeAllRules,
  * exportDiagnostic (settings + full rule library), setSettings,
  * importRules… Non-extension-page senders may now only use
- * CONTENT_SCRIPT_MESSAGE_TYPES (shared/messages.ts; today just the FAB
- * visibility boolean). The in-OWA panel is NOT a content script: it is our
+ * CONTENT_SCRIPT_MESSAGE_TYPES (shared/messages.ts; today the FAB visibility
+ * flag, pairing nonce). The in-OWA panel is NOT a content script: it is our
  * popup page in an iframe (its sender.url is the chrome-extension:// page URL,
  * filled in by the browser process), so it keeps full access.
  */
@@ -760,7 +873,7 @@ chrome.runtime.onMessage.addListener(
     const msg = raw as PopupRequest
     void (async () => {
       try {
-        sendResponse(await handle(msg))
+        sendResponse(await handle(msg, sender))
       } catch (e) {
         // Surface unhandled handler errors in the centralised error log
         // (#2) so a silent failure shows up in the Options "錯誤紀錄"
@@ -829,6 +942,13 @@ type ClassifyRunRecord = {
   createdAt: number
   /** Set when classifyAi starts this run's loop; a second start would double-spend. */
   aiStartedAt?: number
+  /**
+   * Set when a popup surface's 繼續歸檔 took this run over as its plan
+   * (2026-11-06, 'adoptClassifyRun'). The surface whose DoneScreen
+   * prefetched the run cancels it on 回主畫面 with `unlessAdopted` — a no-op
+   * once another surface is showing it.
+   */
+  adoptedAt?: number
   /** Email ids submitted to execute while this run was current. */
   executedIds: string[]
 }
@@ -881,11 +1001,17 @@ function newClassifyRunId(): string {
 /**
  * Invalidate the current run (or only `runId`, when given — a stale cancel
  * must not kill a newer run started from another popup surface), abort its
- * loop and clear its progress + preflight cache.
+ * loop and clear its progress + preflight cache. `unlessAdopted` leaves a run
+ * that 繼續歸檔 took over alone (see ClassifyRunRecord.adoptedAt) — checked
+ * with no await before the drop, like the id check.
  */
-async function cancelClassifyRun(runId?: string): Promise<boolean> {
+async function cancelClassifyRun(
+  runId?: string,
+  opts?: { unlessAdopted?: boolean },
+): Promise<boolean> {
   const current = await loadClassifyRun()
   if (runId && current && current.runId !== runId) return false
+  if (opts?.unlessAdopted && current?.adoptedAt != null) return false
   const dropRun = setClassifyRun(null)
   abortClassifyLoopsExcept(null)
   await dropRun
@@ -915,14 +1041,29 @@ type PreflightCache = {
   tree: MailFolderNode[]
   rulePlan: PlanItem[]
   threadHints?: Record<string, string>
+  /** What the scan left out (preflight's banner counts), carried into progress. */
+  excluded?: ExcludedCounts
   createdAt: number
 }
+
+/**
+ * Inbox mail a batch left out, as the 已從收件夾排除 banner reports it:
+ * kept by the user (skip history), flagged in Outlook, refused by Claude
+ * before and routed by no rule. Stored on the AI progress (round 3) so a run
+ * adopted later — 繼續歸檔下一批 after a DoneScreen prefetch — shows it too.
+ */
+type ExcludedCounts = { kept: number; flagged: number; refused: number }
 
 /**
  * AI progress as stored. `aiPlan` holds the loop's output minus executed ids;
  * `aiSeq[k]` is the append position of `aiPlan[k]` in the loop's output and
  * `aiTotal` its length — the poll cursor, which stays valid while executed
  * items are filtered out of the stored list.
+ *
+ * No folder tree (2026-11-06, K6): it was re-written with every chunk (~190 KB
+ * at 800 folders) next to the same tree in preflightCache and folderCache.
+ * The 'full' view reads it from the folder cache; `folderTree` is only read
+ * from progress an older version wrote.
  */
 type StoredAiProgress = {
   runId: string
@@ -931,7 +1072,7 @@ type StoredAiProgress = {
   chunks: number
   completedChunks: number
   rulePlan: PlanItem[]
-  folderTree: MailFolderNode[]
+  folderTree?: MailFolderNode[]
   aiPlan: PlanItem[]
   aiSeq: number[]
   aiTotal: number
@@ -940,6 +1081,15 @@ type StoredAiProgress = {
   aiError?: { code: string; message: string } | null
   startedAt: number
   done: boolean
+  /** The preflight's exclusion counts (round 3), for whoever adopts the run. */
+  excluded?: ExcludedCounts
+  /**
+   * Only on a terminal state stored without its items (K6's 'bare' shape —
+   * session storage full): the counts those items had, minus executed mail,
+   * so the summary doesn't read 規則 0 / AI 0 next to rows the popup still
+   * shows (round 3). Such a run has nothing left to offer from storage.
+   */
+  counts?: { rule: number; ai: number; aiUnresolved: number; aiUnclassified: number }
 }
 
 type AiProgressView = 'full' | 'poll' | 'meta'
@@ -947,10 +1097,11 @@ type AiProgressView = 'full' | 'poll' | 'meta'
 /**
  * What getAiClassifyProgress returns (item 14). The popup used to receive the
  * whole folder tree (~190 KB at 800 folders) plus both full plans every
- * 500 ms. Now: 'full' (resume / consume — once) carries the plans + tree;
- * 'poll' carries only the AI items appended since the popup's cursor; 'meta'
- * carries counts only. Executed ids are filtered again here because an
- * execute that starts after the loop's last write has no write to ride on.
+ * 500 ms. Now: 'full' (resume / consume — once) carries the plans (+ the tree,
+ * added by the handler — see progressFolderTree); 'poll' carries only the AI
+ * items appended since the popup's cursor; 'meta' carries counts only.
+ * Executed ids are filtered again here because an execute that starts after
+ * the loop's last write has no write to ride on.
  */
 function viewAiProgress(
   p: StoredAiProgress,
@@ -973,23 +1124,41 @@ function viewAiProgress(
     completedEmails: p.completedEmails,
     chunks: p.chunks,
     completedChunks: p.completedChunks,
-    ruleCount: rulePlan.length,
-    aiCount: aiPlan.length,
-    aiUnresolvedCount: aiPlan.filter((x) => x.source === 'unresolved').length,
+    ruleCount: p.counts?.rule ?? rulePlan.length,
+    aiCount: p.counts?.ai ?? aiPlan.length,
+    aiUnresolvedCount: p.counts?.aiUnresolved ?? aiPlan.filter((x) => x.source === 'unresolved').length,
     // Never-classified placeholders (failed / refused chunks). A finished run
     // offering nothing else is residue: re-classifying that mail fresh beats
     // re-showing stale failure rows.
-    aiUnclassifiedCount: aiPlan.filter((x) => x.unclassified === true).length,
+    aiUnclassifiedCount: p.counts?.aiUnclassified ?? aiPlan.filter((x) => x.unclassified === true).length,
+    // The items behind the counts were not stored (see StoredAiProgress.counts):
+    // nothing to resume or adopt from storage.
+    ...(p.counts ? { planDropped: true as const } : {}),
     aiCursor: p.aiTotal ?? p.aiPlan.length,
     skippedByUser: p.skippedByUser,
     usage: p.usage,
     aiError: p.aiError,
     startedAt: p.startedAt,
     done: p.done,
+    ...(p.excluded ? { excluded: p.excluded } : {}),
   }
   if (view === 'meta') return meta
   if (view === 'poll') return { ...meta, aiPlan: aiPlan.filter((_, k) => aiSeq[k]! >= aiFrom) }
-  return { ...meta, rulePlan, aiPlan, folderTree: p.folderTree }
+  return { ...meta, rulePlan, aiPlan }
+}
+
+/**
+ * The folder tree for a 'full' progress view: the folder cache the preflight
+ * itself used (a tree refreshed since is fine — newer), or the one an older
+ * version stored inline. Never fetches; [] when there is none.
+ */
+async function progressFolderTree(p: StoredAiProgress): Promise<MailFolderNode[]> {
+  if (p.folderTree) return p.folderTree
+  try {
+    return (await getFolderCache())?.tree ?? []
+  } catch {
+    return []
+  }
 }
 
 // ---- Inbox paging (2026-11-05, inbox starvation) ---------------------------
@@ -1032,8 +1201,15 @@ async function scanInboxForBatch(opts: {
   select?: string
   skipIds: ReadonlySet<string>
   recentlyProcessed: ReadonlySet<string>
+  /** Ledgered as refused by the current model (refusal-ledger.ts). */
+  refusedIds?: ReadonlySet<string>
 }): Promise<{
   eligible: Email[]
+  /**
+   * The batch, in inbox order: the first batchSize eligible emails plus the
+   * refused-before ones among them (which take no slot; see below).
+   */
+  batch: Email[]
   preFilteredCount: number
   flaggedCount: number
   scanned: number
@@ -1044,6 +1220,7 @@ async function scanInboxForBatch(opts: {
   const budget = inboxScanBudget(opts.batchSize, opts.recentlyProcessed.size)
   const top = budget.pageSize
   const eligible: Email[] = []
+  const batch: Email[] = []
   let preFilteredCount = 0
   let flaggedCount = 0
   let scanned = 0
@@ -1088,6 +1265,19 @@ async function scanInboxForBatch(opts: {
         flaggedCount++
         continue
       }
+      // Refused by Claude before, with the current model (2026-11-06, K5):
+      // these never take a batch slot — an inbox topped by ≥ batchSize of
+      // them made every batch re-show only them while 繼續 spun in place. The
+      // ones inside the batch's window still ride along (round 3): rules and
+      // thread memory need no AI, so preflight routes them like any email
+      // and only keeps the rest out of the AI bucket (counted for the user).
+      // The ledger entry expires after REFUSED_EMAILS_TTL_MS, and switching
+      // models retries them.
+      if (opts.refusedIds?.has(m.Id)) {
+        if (eligible.length < opts.batchSize) batch.push(m)
+        continue
+      }
+      if (eligible.length < opts.batchSize) batch.push(m)
       eligible.push(m)
     }
     nextLink = page.nextLink
@@ -1099,12 +1289,30 @@ async function scanInboxForBatch(opts: {
   )
   return {
     eligible,
+    batch,
     preFilteredCount,
     flaggedCount,
     scanned,
     moreMayExist: eligible.length > opts.batchSize || nextLink != null,
   }
 }
+
+/** The current model's refused-email ids for the inbox scan; fail-soft (empty). */
+async function refusedIdsForScan(model: string): Promise<Set<string>> {
+  try {
+    return await getRefusedEmailIds(model)
+  } catch (e) {
+    console.warn('[mail-organizer] getRefusedEmailIds failed (non-fatal)', e)
+    return new Set()
+  }
+}
+
+/**
+ * A classify run whose progress could not be stored (session storage full,
+ * 2026-11-06 K6). Big batches are what fills it, hence the advice.
+ */
+const STORAGE_FAILED_MESSAGE =
+  '瀏覽器暫存空間不足，分類進度無法儲存，已停止送出其餘郵件。請到設定 → 分類引擎調低「每次處理筆數」後重新歸類'
 
 /** Banner text for a classify failure; the popup wraps it in 「AI 分類失敗：…」. */
 function describeClassifyFailure(e: unknown, leftUnclassified: number): string {
@@ -1133,7 +1341,10 @@ function describeClassifyFailure(e: unknown, leftUnclassified: number): string {
   }
 }
 
-async function handle(msg: PopupRequest): Promise<PopupResponse> {
+async function handle(
+  msg: PopupRequest,
+  sender?: chrome.runtime.MessageSender,
+): Promise<PopupResponse> {
   // No `await` may run before the switch: single-flight guards inside cases
   // (refreshFolderActivity) rely on check+set happening synchronously.
   switch (msg.type) {
@@ -1145,6 +1356,16 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       const settings = await getSettings()
       return { ok: true, data: { show: owaFabShown(settings) } }
     }
+
+    // In-OWA panel bridge pairing (2026-11-06): the FAB content script gets a
+    // one-time nonce for its iframe handshake; the panel frame (an extension
+    // page in the same tab) redeems it before trusting the hello's port.
+    // Both are keyed by sender.tab — see handlers/panel-pairing.ts.
+    case 'issuePanelPairingNonce':
+      return issuePanelPairingNonce(sender)
+
+    case 'redeemPanelPairingNonce':
+      return redeemPanelPairingNonce(msg.nonce, sender)
 
     // ---- Production handlers (used by popup #6) ----------------------------
 
@@ -1335,27 +1556,33 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       if (!folderId) {
         return { ok: false, code: 'NO_FOLDER_ID', message: '未提供資料夾 ID' }
       }
-      const owaTabs = await chrome.tabs.query({
-        url: [
-          'https://outlook.office.com/*',
-          'https://outlook.office365.com/*',
-          'https://outlook.cloud.microsoft/*',
-        ],
-      })
-      // Default host for the "no OWA tab open" fallback. office.com is the
-      // most-installed of the three.
-      let host = 'https://outlook.office.com'
-      if (owaTabs.length > 0 && owaTabs[0]!.url) {
+      const owaTabs = await chrome.tabs.query({ url: OWA_REST_HOST_PATTERNS })
+      const owaOriginOf = (url: string | undefined): string | null => {
+        if (!url) return null
         try {
-          host = new URL(owaTabs[0]!.url).origin
+          const origin = new URL(url).origin
+          return OWA_REST_HOST_PATTERNS.some((p) => p.startsWith(`${origin}/`)) ? origin : null
         } catch {
-          // malformed url, keep the fallback host
+          return null // malformed url
         }
       }
+      // The in-Outlook panel is our page in an iframe of an OWA tab
+      // (2026-11-06): navigate THAT tab. owaTabs[0] could be a different
+      // Outlook tab — another account even — which then fully reloaded. Only
+      // the toolbar popup / a standalone extension tab (no host OWA tab)
+      // falls back to an open Outlook tab, the active one first.
+      const hostTabId = sender?.tab?.id != null && (sender.frameId ?? 0) !== 0 ? sender.tab.id : undefined
+      const hostTab =
+        hostTabId === undefined
+          ? undefined
+          : (owaTabs.find((t) => t.id === hostTabId) ?? (owaOriginOf(sender!.tab!.url) ? sender!.tab! : undefined))
+      const tab = hostTab ?? owaTabs.find((t) => t.active) ?? owaTabs[0]
+      // Default host for the "no OWA tab open" fallback. office.com is the
+      // most-installed of the three.
+      const host = owaOriginOf(tab?.url) ?? 'https://outlook.office.com'
       const targetUrl = `${host}/mail/${encodeURIComponent(folderId)}`
-      if (owaTabs.length > 0) {
-        const tab = owaTabs[0]!
-        await chrome.tabs.update(tab.id!, { active: true, url: targetUrl })
+      if (tab?.id != null) {
+        await chrome.tabs.update(tab.id, { active: true, url: targetUrl })
         if (tab.windowId !== undefined) {
           await chrome.windows.update(tab.windowId, { focused: true })
         }
@@ -1462,13 +1689,18 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           }))
         if (convFilings.length > 0) await recordConversationFilings(convFilings, { harvested: true })
         if (subjectFilings.length > 0) await recordSubjectFilings(subjectFilings, { harvested: true })
-        // Advance the watermark ONLY after a COMPLETE paging run, and only to
-        // the scan START minus the margin (never the end-of-run clock): a
-        // page-capped or failed run leaves it untouched so the unseen part of
-        // the window is retried, and filings made during the run stay newer
-        // than the watermark.
-        if (listing.complete && targetFolders.size > 0) {
-          await setLastHarvestAt(nextHarvestWatermark(scanStartedAt))
+        // Advance the watermark: after a COMPLETE paging run to the scan
+        // START minus the margin (never the end-of-run clock — filings made
+        // during the run stay newer than it); after a PAGE-CAPPED run to
+        // where it stopped (2026-11-06: the listing is oldest first, so the
+        // next run resumes there — before, a capped run left it untouched and
+        // a busy window was re-read from the top forever). A failed run
+        // throws past this and leaves it untouched.
+        if (targetFolders.size > 0) {
+          const next = listing.complete
+            ? nextHarvestWatermark(scanStartedAt)
+            : resumeHarvestWatermark(listing.messages, since)
+          if (next) await setLastHarvestAt(next)
         }
         return {
           ok: true,
@@ -1623,9 +1855,10 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         // past kept / flagged mail) so the peek number predicts what classify
         // will actually act on — a peek of "0 封可處理" while older mail sat
         // below a page of flagged mail was the starvation bug's UI face.
-        const [skipHistory, recentlyProcessed] = await Promise.all([
+        const [skipHistory, recentlyProcessed, refusedIds] = await Promise.all([
           getSkipHistory(),
           getRecentlyProcessedIds(),
+          refusedIdsForScan(settings.claudeModel),
         ])
         const scan = await scanInboxForBatch({
           batchSize,
@@ -1633,6 +1866,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           select: 'Id,Flag',
           skipIds: new Set(Object.keys(skipHistory)),
           recentlyProcessed,
+          refusedIds,
         })
         return {
           ok: true,
@@ -1690,12 +1924,13 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         // Exclusion ledgers + paged scan: see scanInboxForBatch (ghost
         // over-fetch on the first page, @odata.nextLink past pages of kept /
         // flagged mail, capped).
-        const [skipHistory, recentlyProcessed] = await Promise.all([
+        const [skipHistory, recentlyProcessed, refusedIds] = await Promise.all([
           getSkipHistory(),
           getRecentlyProcessedIds(),
+          refusedIdsForScan(settings.claudeModel),
         ])
         const skipIds = new Set(Object.keys(skipHistory))
-        const scan = await scanInboxForBatch({ batchSize, skipIds, recentlyProcessed })
+        const scan = await scanInboxForBatch({ batchSize, skipIds, recentlyProcessed, refusedIds })
 
         // Reconcile rule paths against the live tree before matching: if a
         // folder was renamed/deleted in Outlook, update or mark orphan so
@@ -1714,7 +1949,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           unorphaned: 0,
         }
         let rules = await mutateRules<Rule[]>((current) => {
-          const recon = reconcileRulesAgainstTree(current, tree)
+          const recon = reconcileRulesAgainstTree(current, tree, reconcileOptionsForTree(tree))
           reconcileSummary = recon.summary
           if (
             recon.summary.pathsUpdated > 0 ||
@@ -1790,10 +2025,13 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         // invisible bookkeeping. (The OTHER entrance of "已歸檔的信混進下一批"
         // — resurrecting the executed batch's classify progress — is closed
         // by the run's executed-id exclusion, see recordClassifyRunExecuted.)
+        // Mail Claude refused before takes no slot and, unless a rule or
+        // thread memory routes it, no AI call either — it is counted below.
         const { preFilteredCount, flaggedCount } = scan
-        // Final slice keeps the batch contract (≤ batchSize) after the
-        // over-fetch / paging above.
-        const emails = scan.eligible.slice(0, batchSize)
+        let refusedCount = 0
+        // The batch keeps its contract (≤ batchSize emails that take a slot)
+        // after the over-fetch / paging above.
+        const emails = scan.batch
 
         await setClassifyStage({ stage: 'matching_rules', total: emails.length })
         const rulePlan: PlanItem[] = []
@@ -1863,11 +2101,27 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         // email with a memory entry means the entry was too ambiguous
         // (conflictCount>0) or its folder no longer resolves — exactly the
         // case where the AI would otherwise 0.5-guess.
+        //
+        // A hint only names a folder the AI is offered (round 3), like the
+        // exemplars, the case map and the recent-folders hint: auto-routing
+        // above may use any folder of the tree (Junk / Sent stay valid
+        // targets), but a hint naming 垃圾郵件 / 寄件備份, an excluded folder,
+        // or a deleted folder's stored path steered the AI to a target it may
+        // not use.
+        const hintablePaths = new Set(
+          flattenAiVisibleFolders(tree)
+            .map((n) => n.path)
+            .filter((p) => !settings.excludeFolderPrefixes.some((x) => p === x || p.startsWith(x + '/'))),
+        )
+        const hintPath = (e: { folderId: string; folderPath: string }): string | null => {
+          const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
+          return path && hintablePaths.has(path) ? path : null
+        }
         const softThreadHint = (m: Email): string | null => {
           if (m.ConversationId) {
             const e = convMemory[m.ConversationId]
             if (e) {
-              const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
+              const path = hintPath(e)
               if (path) {
                 if (e.harvested && (e.conflictCount ?? 0) === 0) {
                   return `依你既有的 Outlook 歸檔，此對話近期歸於「${path}」（僅供參考）`
@@ -1882,7 +2136,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           if (norm.length >= MIN_NORMALIZED_SUBJECT_LEN) {
             const e = subjectMemory[norm]
             if (e) {
-              const path = folderIndex.get(e.folderId)?.path ?? e.folderPath
+              const path = hintPath(e)
               if (path) {
                 return e.harvested
                   ? `依你既有的 Outlook 歸檔，同主旨郵件近期歸於「${path}」（僅供參考）`
@@ -1902,6 +2156,8 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         // for domain / sender (the two largest buckets in practice).
         // Own-domain addresses never trigger AUTO domain rules (2026-11-05).
         const ruleIndex = buildRuleIndex(rules, { ownDomains: await resolveOwnDomains() })
+        // Rule hits on Deleted Items itself become delete rows (ruleRowFor).
+        const trashFolder = reconcileOptionsForTree(tree).trashFolder
         // Rule precedence over thread memory is captured by the exported
         // `ruleBeatsThread` helper in shared/rules.ts so the contract has
         // a single source of truth and gets exercised by unit tests.
@@ -1922,7 +2178,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           // internal replies into the same folder as the external
           // first-touch email).
           if (outcome && ruleBeatsThread(outcome.rule)) {
-            rulePlan.push({
+            rulePlan.push(ruleRowFor({
               emailId: m.Id,
               emailSubject: m.Subject ?? '',
               emailFrom: m.From?.EmailAddress?.Address ?? '',
@@ -1945,7 +2201,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 lastUsedAt: outcome.rule.lastUsedAt,
                 enabled: outcome.rule.enabled,
               },
-            })
+            }, trashFolder))
             continue
           }
           if (threadHit) {
@@ -1982,7 +2238,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             continue
           }
           if (outcome) {
-            rulePlan.push({
+            rulePlan.push(ruleRowFor({
               emailId: m.Id,
               emailSubject: m.Subject ?? '',
               emailFrom: m.From?.EmailAddress?.Address ?? '',
@@ -2005,7 +2261,14 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 lastUsedAt: outcome.rule.lastUsedAt,
                 enabled: outcome.rule.enabled,
               },
-            })
+            }, trashFolder))
+          } else if (refusedIds.has(m.Id)) {
+            // Refused by Claude before (K5): rules and thread memory had their
+            // go above — the AI would only refuse it again. Left for manual
+            // handling and counted for the user (round 3: this used to happen
+            // before rule matching, so for up to 7 days even a user_manual
+            // rule or thread routing never got to such an email).
+            refusedCount++
           } else {
             unmatched.push(m)
             const hint = softThreadHint(m)
@@ -2029,6 +2292,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           tree,
           rulePlan,
           threadHints,
+          excluded: { kept: preFilteredCount, flagged: flaggedCount, refused: refusedCount },
           createdAt: Date.now(),
         }
         await chrome.storage.session.set({ [PREFLIGHT_CACHE_KEY]: cache })
@@ -2049,6 +2313,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             aiConfidenceThreshold: settings.aiConfidenceThreshold,
             preFilteredCount,
             flaggedCount,
+            refusedCount,
             requestedBatchSize: batchSize,
           },
         }
@@ -2141,21 +2406,31 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
        * storage call happen synchronously together, so a cancel that ran
        * before can't be undone by this write and a cancel after it removes
        * it. Returns null (and writes nothing) once the run is gone.
+       *
+       * `shape` (2026-11-06, K6) is for a terminal state that didn't fit in
+       * session storage: 'slim' drops the items' body previews (display only),
+       * 'bare' keeps the counts (round 3: explicitly — the summary read
+       * 規則 0 / AI 0) and the error but no items (the popup keeps what it
+       * already polled, and its own saved plan).
        */
       const writeProgress = (
         fields: Pick<StoredAiProgress, 'completedChunks' | 'done'> &
           Partial<Pick<StoredAiProgress, 'skippedByUser' | 'usage' | 'aiError'>>,
         planOut: PlanItem[] = aiPlan,
+        shape: 'full' | 'slim' | 'bare' = 'full',
       ): Promise<void> | null => {
         if (!ownsClassifyRun(runId)) return null
         const executed = new Set(classifyRun!.executedIds)
+        const shaped = (item: PlanItem): PlanItem =>
+          shape === 'slim' && item.bodyPreview ? { ...item, bodyPreview: '' } : item
         const keptAi: PlanItem[] = []
         const keptSeq: number[] = []
         planOut.forEach((item, k) => {
           if (executed.has(item.emailId)) return
-          keptAi.push(item)
+          keptAi.push(shaped(item))
           keptSeq.push(k)
         })
+        const keptRules = pf.rulePlan.filter((i) => !executed.has(i.emailId))
         const progress: StoredAiProgress = {
           runId,
           totalEmails: toClassify.length,
@@ -2163,22 +2438,76 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           // progress bar monotonic across a partial execute.
           completedEmails: aiPlan.length,
           chunks: chunks.length,
-          rulePlan: pf.rulePlan.filter((i) => !executed.has(i.emailId)),
-          folderTree: pf.tree,
-          aiPlan: keptAi,
-          aiSeq: keptSeq,
+          rulePlan: shape === 'bare' ? [] : keptRules.map(shaped),
+          aiPlan: shape === 'bare' ? [] : keptAi,
+          aiSeq: shape === 'bare' ? [] : keptSeq,
           aiTotal: planOut.length,
           startedAt: classifyStartedAt,
+          ...(pf.excluded ? { excluded: pf.excluded } : {}),
+          ...(shape === 'bare'
+            ? {
+                counts: {
+                  rule: keptRules.length,
+                  ai: keptAi.length,
+                  aiUnresolved: keptAi.filter((x) => x.source === 'unresolved').length,
+                  aiUnclassified: keptAi.filter((x) => x.unclassified === true).length,
+                },
+              }
+            : {}),
           ...fields,
         }
         return chrome.storage.session.set({ [AI_PROGRESS_KEY]: progress })
       }
 
-      // Initial progress snapshot (rulePlan + folderTree embedded so popup can
-      // resume from this state alone if it reopens mid-run)
+      // Initial progress snapshot (rulePlan embedded so the popup can resume
+      // from this state alone if it reopens mid-run; the tree comes from the
+      // folder cache). A session-storage failure here ends the run before it
+      // spends anything (K6) — leaving the loop registered made every retry
+      // of this run answer alreadyStarted.
       const initialWrite = writeProgress({ completedChunks: 0, done: chunks.length === 0 })
       await claimWrite
-      await initialWrite
+      try {
+        await initialWrite
+      } catch (e) {
+        classifyLoops.delete(runId)
+        await logError('classify:storage', e instanceof Error ? e.message : String(e), {
+          stage: 'initial',
+          emails: toClassify.length,
+        })
+        return { ok: false, code: 'STORAGE_FAILED', message: STORAGE_FAILED_MESSAGE }
+      }
+
+      // Set once the run's terminal (done:true) progress is stored.
+      let terminalWritten = false
+      /**
+       * Last resort for a run whose progress can't be written as is (K6): a
+       * terminal done:true state with `aiError`, shrinking the payload until it
+       * fits — so the popup stops waiting instead of polling done:false
+       * forever. The preflight cache goes first: nothing needs it any more.
+       */
+      const writeTerminalProgress = async (
+        fields: Pick<StoredAiProgress, 'completedChunks'> &
+          Partial<Pick<StoredAiProgress, 'skippedByUser' | 'usage'>> & {
+            aiError: { code: string; message: string }
+          },
+        planOut: PlanItem[] = aiPlan,
+      ): Promise<boolean> => {
+        // A newer run owns the session keys now. Otherwise the remove is
+        // issued right after the check, before a newer preflight could have
+        // written its cache (it claims the run synchronously, writes later).
+        if (!ownsClassifyRun(runId)) return true
+        await chrome.storage.session.remove(PREFLIGHT_CACHE_KEY).catch(() => {})
+        for (const shape of ['full', 'slim', 'bare'] as const) {
+          try {
+            await writeProgress({ ...fields, done: true }, planOut, shape)
+            terminalWritten = true
+            return true
+          } catch {
+            /* try a smaller shape */
+          }
+        }
+        return false
+      }
 
       // Run the AI loop in the background; popup polls.
       void (async () => {
@@ -2187,12 +2516,16 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           outputTokens: 0,
           cacheCreationTokens: 0,
           cacheReadTokens: 0,
+          costUsd: 0,
         }
         const addUsage = (u: ClassifierUsage) => {
           totalUsage.inputTokens += u.inputTokens
           totalUsage.outputTokens += u.outputTokens
           totalUsage.cacheCreationTokens += u.cacheCreationTokens
           totalUsage.cacheReadTokens += u.cacheReadTokens
+          // Per-attempt prices when the call reported them (a fallback model
+          // serves at its own rates), else the selected model's (2026-11-06).
+          totalUsage.costUsd = (totalUsage.costUsd ?? 0) + estimateUsageCostUsd(u, settings.claudeModel)
         }
         let aiError: { code: string; message: string } | null = null
         const threshold = settings.aiConfidenceThreshold
@@ -2234,6 +2567,47 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           } catch (e) {
             console.warn('[mail-organizer] getFolderActivity for AI hint failed', e)
           }
+          // The folder cache's well-known roots (2026-11-06 r3): body re-match
+          // hits on Deleted Items itself become delete rows (ruleRowFor), and
+          // the AI's top-level "new" folders named like an omitted root are
+          // unresolved (omittedRootNames).
+          const runFolderCache = await getFolderCache().catch(() => undefined)
+          const runTrashFolder = trashFolderOf(runFolderCache)
+          const reservedFolderNames = omittedRootNames(runFolderCache)
+          // Emails this model refused recently (2026-11-06): never re-sent —
+          // they become unclassified rows for manual handling. Fail-soft.
+          const refusedBefore = new Map<string, RefusedEmailEntry>()
+          try {
+            for (const [id, entry] of Object.entries(await getRefusedEmails())) {
+              if (entry.model === settings.claudeModel) refusedBefore.set(id, entry)
+            }
+          } catch (e) {
+            console.warn('[mail-organizer] getRefusedEmails failed (non-fatal)', e)
+          }
+          // Refusal isolation state (see refusal-isolation.ts). A refusal is
+          // only bisected — and a refused email only blamed (named +
+          // remembered) — once the run has proof the prompt every request
+          // shares is acceptable: a call that was answered, or (when the first
+          // refusal comes before any answer) ONE probe for the whole run with a
+          // harmless email. A refused probe means the shared prompt is the
+          // problem: nothing is isolated, and later runs with the same prompt
+          // skip the probe until a call is answered (refusalSuspicion, K1).
+          const isolationBudget = { remaining: AI_REFUSAL_ISOLATION_MAX_CALLS_PER_RUN }
+          let rememberedSuspicion: RefusalSuspicion | null = null
+          try {
+            rememberedSuspicion = await getRefusalSuspicion()
+          } catch (e) {
+            console.warn('[mail-organizer] getRefusalSuspicion failed (non-fatal)', e)
+          }
+          // Run-wide banner tallies, accumulated over every chunk (K4).
+          const refusedSeen: Array<{ subject: string; category: string | null }> = []
+          let unattributedStubs = 0
+          const unattributedCategories: Array<string | null> = []
+          let parseStubs = 0
+          let firstParseError: ClassifierError | null = null
+          // A failed progress write (session storage full): no new chunks are
+          // started, the terminal state is written as small as it takes (K6).
+          let storageFailure: { error: unknown } | null = null
 
           // Chunks run up to AI_PARALLEL_CHUNKS at a time (2026-11-05, 放寬並加速);
           // a 500-email batch was 20 strictly sequential Claude calls. Each chunk
@@ -2249,12 +2623,25 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             | { kind: 'aborted' }
           let throttled = false
           // Cold-cache gate: one request goes first; the rest wait until its
-          // response begins streaming, the point where its prompt-cache write
-          // (system + folder tree + rules, identical for every chunk of this
-          // run) becomes readable. Without it the first wave would each pay a
-          // 1h-TTL cache write for the same prefix and read none of it.
+          // answer begins streaming, by when its prompt-cache write (system +
+          // folder tree + rules, identical for every chunk of this run) is
+          // readable. Without it the first wave would each pay a 1h-TTL cache
+          // write for the same prefix and read none of it. A response refused
+          // before any answer never opens it, and a refusal before the run's
+          // first answer closes it again until something is answered (K1).
           let warm = false
-          let firstChunkLocalError: { code: string; message: string } | null = null
+          // The run's single verdict on refusals (K1): see the state comment
+          // above.
+          const refusalGate = createRefusalGate({
+            model: settings.claudeModel,
+            remembered: rememberedSuspicion,
+            remember: setRefusalSuspicion,
+            forget: clearRefusalSuspicion,
+            ttlMs: REFUSAL_SUSPICION_TTL_MS,
+            // The first answer — the probe's included, parsable or not — lifts
+            // the one-lane hold of an earlier refusal at once (round 3).
+            onProven: () => pump(),
+          })
 
           const processChunk = async (ci: number): Promise<ChunkOutcome> => {
             const chunk = chunks[ci]!
@@ -2310,13 +2697,16 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             // first + structural-only gating lives in matchBodyCaseWithIndex.
             const aiReps: Email[] = []
             const bodyRouted: PlanItem[] = []
+            const knownRefused: Array<{ email: Email; entry: RefusedEmailEntry }> = []
             for (const m of chunk) {
               const bodyOutcome = matchBodyCaseWithIndex(m, aiRuleIndex)
               if (!bodyOutcome) {
-                aiReps.push(m)
+                const prior = refusedBefore.get(m.Id)
+                if (prior) knownRefused.push({ email: m, entry: prior })
+                else aiReps.push(m)
                 continue
               }
-              const repItem: PlanItem = {
+              const repItem: PlanItem = ruleRowFor({
                 emailId: m.Id,
                 emailSubject: m.Subject ?? '',
                 emailFrom: m.From?.EmailAddress?.Address ?? '',
@@ -2339,7 +2729,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                   lastUsedAt: bodyOutcome.rule.lastUsedAt,
                   enabled: bodyOutcome.rule.enabled,
                 },
-              }
+              }, runTrashFolder)
               bodyRouted.push(repItem)
               const sibs = siblingsByRepId.get(m.Id)
               if (sibs) {
@@ -2349,37 +2739,84 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             // Ownership re-check right before spending tokens (item 1).
             if (!ownsRun()) return { kind: 'aborted' }
             let retriedMs = 0
-            try {
-              // Only the still-unmatched reps hit Claude; classifyBatch returns
-              // an empty result for aiReps=[] (no API call, no cost).
-              const result = await withClaudeRetry(
-                () =>
-                  classifyBatch(
-                    {
-                      emails: aiReps,
-                      folderTree: pf.tree,
-                      excludePrefixes: settings.excludeFolderPrefixes,
-                      rules: currentRules,
-                      threadHints: pf.threadHints,
-                      recentFolders,
+            // One Claude call for a subset of this chunk's reps, retried per
+            // withClaudeRetry. Every attempt's tokens are counted: answered,
+            // refused or unparsable, and streams that died after starting.
+            const classifyReps = async (reps: Email[]) => {
+              try {
+                // classifyBatch returns an empty result for reps=[] (no API
+                // call, no cost).
+                const result = await withClaudeRetry(
+                  () =>
+                    classifyBatch(
+                      {
+                        emails: reps,
+                        folderTree: pf.tree,
+                        reservedFolderNames,
+                        excludePrefixes: settings.excludeFolderPrefixes,
+                        rules: currentRules,
+                        threadHints: pf.threadHints,
+                        recentFolders,
+                      },
+                      settings,
+                      { signal: controller.signal, onResponseStart: () => markWarm() },
+                    ),
+                  {
+                    signal: controller.signal,
+                    onRetry: ({ attempt, waitMs, error }) => {
+                      retriedMs += waitMs
+                      if (error.usage) addUsage(error.usage)
+                      // Rate-limited / overloaded: stop fanning out for the rest
+                      // of the run (the in-flight calls finish on their own).
+                      if (error.code === 'HTTP_429' || error.code === 'HTTP_529') throttled = true
+                      console.warn(
+                        `[mail-organizer] Claude 暫時性錯誤 ${error.code}，` +
+                          `${Math.round(waitMs / 1000)}s 後重試 (#${attempt})`,
+                      )
                     },
-                    settings,
-                    { signal: controller.signal, onResponseStart: () => markWarm() },
-                  ),
-                {
-                  signal: controller.signal,
-                  onRetry: ({ attempt, waitMs, error }) => {
-                    retriedMs += waitMs
-                    // Rate-limited / overloaded: stop fanning out for the rest
-                    // of the run (the in-flight calls finish on their own).
-                    if (error.code === 'HTTP_429' || error.code === 'HTTP_529') throttled = true
-                    console.warn(
-                      `[mail-organizer] Claude 暫時性錯誤 ${error.code}，` +
-                        `${Math.round(waitMs / 1000)}s 後重試 (#${attempt})`,
-                    )
                   },
-                },
-              )
+                )
+                addUsage(result.usage)
+                if (reps.length > 0) refusalGate.noteSuccess(result.promptKey)
+                return result
+              } catch (e) {
+                // A parse failure or a refusal still consumed tokens.
+                if (e instanceof ClassifierError && e.usage) addUsage(e.usage)
+                if (e instanceof ClassifierError && e.code === 'REFUSAL') refusalGate.noteRefusal()
+                // An unparsable answer is still an answer: the shared prompt
+                // was accepted (round 3).
+                if (e instanceof ClassifierError && e.code === 'PARSE_ERROR' && reps.length > 0) {
+                  refusalGate.noteSuccess(e.promptKey)
+                }
+                throw e
+              }
+            }
+            // The run's probe, if this lane is the one that has to run it: the
+            // shared prompt with a harmless email, one extra call (K1 / K2).
+            const probeSharedPrompt = async () => {
+              isolationBudget.remaining--
+              await classifyReps([sharedPromptProbeEmail()])
+            }
+            // Only the still-unmatched reps hit Claude. A refusal is narrowed
+            // down to the refused email(s) by bisection — sequentially, in
+            // this chunk's lane — and everything else is classified normally
+            // (2026-11-06; refusal-isolation.ts). Bisecting, and blaming an
+            // email refused on its own, wait for the run's verdict (K1 / K2).
+            const iso = await classifyIsolatingRefusals(aiReps, classifyReps, {
+              maxExtraCalls: AI_REFUSAL_ISOLATION_MAX_CALLS,
+              runBudget: isolationBudget,
+              attributable: async (refusal) =>
+                (await refusalGate.verdict(refusal, probeSharedPrompt)) === 'isolate',
+              isCancelled: () => !ownsRun() || controller.signal.aborted,
+            })
+            // Cancelled / superseded (item 1): the run is gone — no stubs, no
+            // banner, no progress write; just stop spending.
+            if (iso.aborted || !ownsRun() || controller.signal.aborted) return { kind: 'aborted' }
+
+            const items: PlanItem[] = [...bodyRouted]
+            const already = new Set(bodyRouted.map((p) => p.emailId))
+            for (const answered of iso.answered) {
+              const result = answered.result
               if (result.truncated) {
                 // Audit: floor at 0. parsedCount is the PRE-dedup raw action
                 // count, so a max_tokens response whose salvaged prefix
@@ -2387,9 +2824,10 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 // this term negative — and a negative term would cancel a
                 // sibling chunk's real positive, silently suppressing the
                 // "部分 chunk 觸頂截斷" warning even though emails WERE cut.
-                truncatedCount += Math.max(0, aiReps.length - result.truncated.parsedCount)
+                truncatedCount += Math.max(0, answered.items.length - result.truncated.parsedCount)
               }
-              const chunkPlan = result.plan.map((p) => {
+              for (const p of result.plan) {
+                let repItem = p
                 if (p.action !== 'skip' && p.source === 'ai' && p.confidence < threshold) {
                   gatedCount++
                   // Preserve aiOriginal* so that downstream learning
@@ -2398,7 +2836,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                   // matched or overrode the AI's low-confidence guess.
                   // Without this, the user resolving the item would
                   // produce no rule at all — wasted intent signal.
-                  return {
+                  repItem = {
                     ...p,
                     action: 'skip' as const,
                     targetFolderId: undefined,
@@ -2409,69 +2847,130 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                     reason: `信心 ${p.confidence.toFixed(2)} < ${threshold} (自動保留)`,
                   }
                 }
-                return p
-              })
-              // Fan out each rep's decision to its thread siblings. After
-              // this step the plan length matches the email count the user
-              // expects (not the rep count).
-              const fannedOut: PlanItem[] = []
-              for (const repItem of chunkPlan) {
-                fannedOut.push(repItem)
-                const sibs = siblingsByRepId.get(repItem.emailId)
-                if (sibs) {
-                  for (const sib of sibs) fannedOut.push(inheritPlanItemForSibling(repItem, sib))
+                // Fan out each rep's decision to its thread siblings. After
+                // this step the plan length matches the email count the user
+                // expects (not the rep count).
+                items.push(repItem)
+                already.add(repItem.emailId)
+                for (const sib of siblingsByRepId.get(repItem.emailId) ?? []) {
+                  items.push(inheritPlanItemForSibling(repItem, sib))
+                  already.add(sib.Id)
                 }
               }
-              addUsage(result.usage)
-              return { kind: 'done', items: [...bodyRouted, ...fannedOut] }
-            } catch (e) {
-              // Cancelled / superseded (item 1): the run is gone — no stubs,
-              // no banner, no progress write; just stop spending.
-              if (
-                !ownsRun() ||
-                controller.signal.aborted ||
-                (e instanceof ClassifierError && e.code === 'ABORTED')
-              ) {
-                return { kind: 'aborted' }
-              }
-              const ce = e instanceof ClassifierError ? e : null
-              // A parse failure or a mid-stream refusal still consumed tokens.
-              if (ce?.usage) addUsage(ce.usage)
-              // Chunk-local vs run-fatal. PARSE_ERROR (a glitch in THIS
-              // chunk's response) and REFUSAL (item 9: a safety classifier
-              // declined THIS chunk's content) stub-skip just this chunk and
-              // keep classifying the rest. Everything else — retries exhausted
-              // (the service is still down / rate-limited), auth, invalid
-              // request, model unavailable — stops the run gracefully: every
-              // email that never got classified becomes an `unclassified`
-              // placeholder (never recorded in skipHistory, so it comes back
-              // next batch).
-              const chunkLocal = ce?.code === 'PARSE_ERROR' || ce?.code === 'REFUSAL'
-              if (!chunkLocal) return { kind: 'fatal', items: bodyRouted, error: e, retriedMs }
-              const stubReason = ce?.code === 'REFUSAL' ? ce.message : `AI 分類失敗：CLASSIFIER_${ce!.code}`
-              const stubs = unclassifiedStubs(aiReps, stubReason, new Set(bodyRouted.map((p) => p.emailId)))
-              firstChunkLocalError ??= {
-                code: `CLASSIFIER_${ce!.code}`,
-                message:
-                  ce?.code === 'REFUSAL'
-                    ? `Claude 拒絕分類其中 ${stubs.length} 封（類別：${ce.category ?? '未提供'}），已標為未分類`
-                    : describeClassifyFailure(e, stubs.length),
-              }
-              // The dispatcher's classify:api branch never sees these (the
-              // loop runs detached from any message), so log here (item 4).
-              await logError('classify:api', ce?.message ?? String(e), {
-                code: ce!.code,
-                ...(ce?.status !== undefined ? { status: ce.status } : {}),
-                ...(ce?.category !== undefined ? { category: ce.category } : {}),
+            }
+
+            // Refused before by this model (ledger): not sent again. (The inbox
+            // scan leaves ledgered mail out already; this catches an email
+            // ledgered after this run's preflight.)
+            for (const { email, entry } of knownRefused) {
+              items.push(
+                ...unclassifiedStubs(
+                  [email],
+                  previouslyRefusedReason(email.Subject, entry.category),
+                  already,
+                  { scope: 'email', category: entry.category },
+                ),
+              )
+              refusedSeen.push({ subject: email.Subject ?? '', category: entry.category })
+            }
+
+            // Refused now. `iso.refused` holds emails refused on their own
+            // after the run's verdict cleared the shared prompt: they are
+            // blamed — named and remembered. A refusal the verdict could not
+            // pin on single emails (the shared prompt is refused, or the probe
+            // could not run), and subsets the budget could not split, stay
+            // generic and are not remembered: a later batch tries again.
+            const culprits = iso.refused
+            const unblamed = iso.unisolated
+            let refusedStubs = 0
+            for (const { item: email, error } of culprits) {
+              const category = error.category ?? null
+              const stubs = unclassifiedStubs(
+                [email],
+                refusedEmailReason(email.Subject, category),
+                already,
+                { scope: 'email', category },
+              )
+              refusedStubs += stubs.length
+              items.push(...stubs)
+              refusedSeen.push({ subject: email.Subject ?? '', category })
+            }
+            // stop_details.recommended_model = the server-side fallback was
+            // skipped (its model was busy): a later retry may be served, so
+            // such a refusal is not remembered.
+            const toRemember = culprits.filter((c) => c.error.recommendedModel == null)
+            if (toRemember.length > 0) {
+              await addRefusedEmails(
+                toRemember.map((c) => ({
+                  emailId: c.item.Id,
+                  category: c.error.category ?? null,
+                  model: settings.claudeModel,
+                })),
+              ).catch((e) => console.warn('[mail-organizer] addRefusedEmails failed (non-fatal)', e))
+            }
+            let unblamedStubs = 0
+            for (const { items: reps, error } of unblamed) {
+              const category = error.category ?? null
+              const stubs = unclassifiedStubs(reps, batchRefusedReason(category), already, {
+                scope: 'batch',
+                category,
+              })
+              unblamedStubs += stubs.length
+              items.push(...stubs)
+              if (stubs.length > 0) unattributedCategories.push(category)
+            }
+            refusedStubs += unblamedStubs
+            unattributedStubs += unblamedStubs
+            // A parse failure is chunk-local too: those reps become stubs.
+            let chunkParseStubs = 0
+            for (const { items: reps, error } of iso.parseFailed) {
+              const stubs = unclassifiedStubs(reps, `AI 分類失敗：CLASSIFIER_${error.code}`, already)
+              chunkParseStubs += stubs.length
+              items.push(...stubs)
+            }
+            parseStubs += chunkParseStubs
+            if (chunkParseStubs > 0) firstParseError ??= iso.parseFailed[0]!.error
+
+            // The dispatcher's classify:api branch never sees these (the
+            // loop runs detached from any message), so log here (item 4).
+            // Never subjects: the error log stays free of mail content.
+            const refusals = [...iso.refused.map((r) => r.error), ...iso.unisolated.map((u) => u.error)]
+            if (refusals.length > 0) {
+              await logError('classify:api', refusals[0]!.message, {
+                code: 'REFUSAL',
+                category: refusals[0]!.category ?? null,
                 model: settings.claudeModel,
                 chunk: ci + 1,
                 chunks: chunks.length,
-                unclassified: stubs.length,
+                refused: culprits.length,
+                unclassified: refusedStubs,
+                isolationCalls: iso.calls - 1,
                 retriedMs,
                 fatal: false,
               })
-              return { kind: 'done', items: [...bodyRouted, ...stubs] }
             }
+            if (iso.parseFailed.length > 0) {
+              const first = iso.parseFailed[0]!.error
+              await logError('classify:api', first.message, {
+                code: first.code,
+                model: settings.claudeModel,
+                chunk: ci + 1,
+                chunks: chunks.length,
+                unclassified: chunkParseStubs,
+                retriedMs,
+                fatal: false,
+              })
+            }
+            // Run-fatal (retries exhausted, auth, invalid request, model
+            // unavailable): stop the run gracefully. What this chunk already
+            // has is kept; its never-classified reps become `unclassified`
+            // placeholders below (never recorded in skipHistory, so they come
+            // back next batch). A fatal error of the run's refusal probe is
+            // reported by the first chunk that sees it.
+            if (iso.fatal !== undefined) return { kind: 'fatal', items, error: iso.fatal, retriedMs }
+            const probeFailure = refusalGate.takeProbeFailure()
+            if (probeFailure) return { kind: 'fatal', items, error: probeFailure.error, retriedMs }
+            return { kind: 'done', items }
           }
 
           /** `unclassified` placeholders for reps (+ their thread siblings) not in `already`. */
@@ -2479,6 +2978,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             reps: Email[],
             reason: string,
             already: Set<string>,
+            refusal?: PlanItem['refusal'],
           ): PlanItem[] => {
             const stub = (m: Email): PlanItem => ({
               emailId: m.Id,
@@ -2491,6 +2991,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
               reason,
               source: 'unresolved',
               unclassified: true,
+              ...(refusal ? { refusal } : {}),
             })
             const out: PlanItem[] = []
             for (const m of reps) {
@@ -2514,6 +3015,10 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           let inFlight = 0
           let mergeChain: Promise<void> = Promise.resolve()
           // Merge every contiguous finished chunk, in order, then persist once.
+          // The chain never rejects (K6): one rejected write used to skip every
+          // later merge, reject `await mergeChain` and strand the run at
+          // done:false. A failed write now stops new chunks; merging goes on
+          // in memory, and the end of the run writes a terminal state.
           const mergeReady = () => {
             mergeChain = mergeChain.then(async () => {
               const before = merged
@@ -2524,9 +3029,13 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 ]
                 merged++
               }
-              if (merged > before) {
-                const w = writeProgress({ completedChunks: merged, done: false })
-                if (w) await w
+              if (merged > before && !storageFailure) {
+                try {
+                  const w = writeProgress({ completedChunks: merged, done: false })
+                  if (w) await w
+                } catch (e) {
+                  storageFailure = { error: e }
+                }
               }
             })
           }
@@ -2534,12 +3043,16 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           const allDone = new Promise<void>((r) => {
             resolveAll = r
           })
-          const lanes = () => (throttled || !warm ? 1 : Math.max(1, AI_PARALLEL_CHUNKS))
+          // One lane until the cold-cache gate opens, after a 429 / 529, and
+          // while a refusal has no answered call against it (K1).
+          const lanes = () =>
+            throttled || !warm || refusalGate.blocksFanOut() ? 1 : Math.max(1, AI_PARALLEL_CHUNKS)
           const pump = () => {
             while (
               ownsRun() &&
               !controller.signal.aborted &&
               fatalAt < 0 &&
+              !storageFailure &&
               nextChunk < chunks.length &&
               inFlight < lanes()
             ) {
@@ -2581,7 +3094,10 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 ? (outcomes[fatalAt] as { kind: 'fatal'; error: unknown; retriedMs: number })
                 : null
             const ce = fatal && fatal.error instanceof ClassifierError ? fatal.error : null
-            const stubReason = `AI 分類失敗：${ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED'}`
+            const stubReason =
+              !fatal && storageFailure
+                ? 'AI 分類未完成：分類進度無法儲存（瀏覽器暫存空間不足），下一批會重新分類'
+                : `AI 分類失敗：${ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED'}`
             const already = new Set(aiPlan.map((p) => p.emailId))
             let stubbed = 0
             for (let ci = merged; ci < chunks.length; ci++) {
@@ -2616,7 +3132,21 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
               })
             }
           }
-          aiError ??= firstChunkLocalError
+          // Refusals over the WHOLE run (K4: the banner used to carry only the
+          // first finished chunk's count): emails refused on their own (or
+          // skipped as refused before) are named — they need manual handling —
+          // and requests refused as a whole are counted with every category.
+          const refusalMessage = describeRefusals({
+            named: refusedSeen,
+            unattributed: unattributedStubs,
+            unattributedCategories,
+            shared: refusalGate.sharedConcluded(),
+          })
+          aiError ??= refusalMessage
+            ? { code: 'CLASSIFIER_REFUSAL', message: refusalMessage }
+            : firstParseError && parseStubs > 0
+              ? { code: 'CLASSIFIER_PARSE_ERROR', message: describeClassifyFailure(firstParseError, parseStubs) }
+              : null
 
           if (!ownsRun()) return
 
@@ -2648,31 +3178,90 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             }
           }
 
-          const finalWrite = writeProgress(
-            {
-              completedChunks: chunks.length,
-              skippedByUser: skipPlan.length,
-              usage: totalUsage,
-              aiError: banner,
-              done: true,
-            },
-            [...aiPlan, ...skipPlan],
-          )
-          if (finalWrite) await finalWrite
+          const finalPlan = [...aiPlan, ...skipPlan]
+          if (!storageFailure) {
+            try {
+              const finalWrite = writeProgress(
+                {
+                  completedChunks: chunks.length,
+                  skippedByUser: skipPlan.length,
+                  usage: totalUsage,
+                  aiError: banner,
+                  done: true,
+                },
+                finalPlan,
+              )
+              if (finalWrite) await finalWrite
+              terminalWritten = true
+            } catch (e) {
+              storageFailure = { error: e }
+            }
+          }
+          if (storageFailure) {
+            // Session storage is full (K6): new chunks stopped at the failed
+            // write; whatever was classified is offered if it still fits.
+            const failure = storageFailure.error
+            await logError('classify:storage', failure instanceof Error ? failure.message : String(failure), {
+              model: settings.claudeModel,
+              chunks: chunks.length,
+              merged,
+              emails: toClassify.length,
+            })
+            await writeTerminalProgress(
+              {
+                completedChunks: chunks.length,
+                skippedByUser: skipPlan.length,
+                usage: totalUsage,
+                aiError: { code: 'STORAGE_FAILED', message: STORAGE_FAILED_MESSAGE },
+              },
+              finalPlan,
+            )
+          }
         } finally {
           classifyLoops.delete(runId)
-          if (ownsRun()) {
-            // Issued together right after the ownership check: a newer run
-            // can't have written its preflight cache yet (preflight claims
-            // the run synchronously first), so this can only drop our own.
-            await Promise.all([
-              setClassifyStage({ stage: 'idle' }),
-              chrome.storage.session.remove(PREFLIGHT_CACHE_KEY),
-            ])
+          // Released even when the cleanup writes reject (2026-11-06 r2) — a
+          // leaked hold's heartbeat kept the worker alive all session.
+          try {
+            if (ownsRun()) {
+              // Issued together right after the ownership check: a newer run
+              // can't have written its preflight cache yet (preflight claims
+              // the run synchronously first), so this can only drop our own.
+              await Promise.all([
+                setClassifyStage({ stage: 'idle' }),
+                chrome.storage.session.remove(PREFLIGHT_CACHE_KEY),
+              ])
+            }
+          } catch (e) {
+            // Logged, not rethrown: the run's final result is already stored
+            // and must stay (K6); the hold is still released below (O3).
+            await logError('classify:loop', e instanceof Error ? e.message : String(e), {
+              phase: 'cleanup',
+            }).catch(() => {})
+          } finally {
+            await releaseKeepAlive()
           }
-          await releaseKeepAlive()
         }
-      })()
+      })().catch(async (e) => {
+        // Nothing may escape the detached loop unseen (K6): a throw outside
+        // the per-chunk handling (a session write for the stage display, a
+        // rules read…) used to be an unhandled rejection that left the run at
+        // done:false — the popup waited forever and every retry of the run
+        // answered alreadyStarted. Never the settings or the API key here.
+        await logError('classify:loop', e instanceof Error ? e.message : String(e), {
+          model: settings.claudeModel,
+          chunks: chunks.length,
+          emails: toClassify.length,
+        })
+        // A throw from the loop's cleanup after its final write keeps that result.
+        if (terminalWritten) return
+        await writeTerminalProgress({
+          completedChunks: chunks.length,
+          aiError: {
+            code: 'AI_FAILED',
+            message: 'AI 分類意外中斷（詳見設定頁的錯誤紀錄），未完成的郵件下一批會重新分類',
+          },
+        }).catch(() => {})
+      })
 
       return {
         ok: true,
@@ -2692,7 +3281,9 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       const prog = raw[AI_PROGRESS_KEY] as StoredAiProgress | undefined
       // Only the current run's progress exists for the popup.
       if (!prog || !run || prog.runId !== run.runId) return { ok: true, data: null }
-      return { ok: true, data: viewAiProgress(prog, run.executedIds, view, aiFrom) }
+      const data = viewAiProgress(prog, run.executedIds, view, aiFrom)
+      if (view !== 'full') return { ok: true, data }
+      return { ok: true, data: { ...data, folderTree: await progressFolderTree(prog) } }
     }
 
     case 'clearAiClassifyProgress': {
@@ -2705,10 +3296,27 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
     case 'cancelClassify': {
       // 取消 / 完成 / a superseding surface. With a runId only that run is
       // cancelled (stale cancels are no-ops); without one, the current run.
+      // unlessAdopted (2026-11-06): a DoneScreen dropping its own prefetch run
+      // spares it if 繼續歸檔 on another surface took it over meanwhile.
       const cancelled = await cancelClassifyRun(
         typeof msg.runId === 'string' ? msg.runId : undefined,
+        { unlessAdopted: msg.unlessAdopted === true },
       )
       return { ok: true, data: { cancelled } }
+    }
+
+    case 'adoptClassifyRun': {
+      // 繼續歸檔 took this run over as its plan (2026-11-06) — see
+      // ClassifyRunRecord.adoptedAt. Only the current run can be adopted.
+      const runId = typeof msg.runId === 'string' ? msg.runId : ''
+      const current = await loadClassifyRun()
+      if (!runId || !current || !ownsClassifyRun(runId)) {
+        return { ok: true, data: { adopted: false } }
+      }
+      if (classifyRun!.adoptedAt == null) {
+        await setClassifyRun({ ...classifyRun!, adoptedAt: Date.now() })
+      }
+      return { ok: true, data: { adopted: true } }
     }
 
     case 'savePopupState': {
@@ -2868,18 +3476,34 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       if (!resolvedTree) {
         return { ok: false, code: 'NO_TREE', message: '資料夾樹不存在，請回去重新分類' }
       }
-      // isExecuteBusy() is re-checked synchronously right before the call
+      // isExecuteBusy() is checked synchronously right before the call
       // (2026-11-05): startExecute claims the executor before ITS first
       // await, so check + claim are atomic and an overlapping start gets
-      // ALREADY_RUNNING instead of a misleading ok.
+      // ALREADY_RUNNING instead of a misleading ok. Claim FIRST, record the
+      // ids after (2026-11-06): the `await recordClassifyRunExecuted` used to
+      // sit between check and claim, so both of two overlapping starts got
+      // ok:true, the second never ran, and its ids were still marked executed
+      // — this run never offered them again.
       if ((await isExecuteRunning()) || isExecuteBusy()) {
         return { ok: false, code: 'ALREADY_RUNNING', message: '已有批次執行中' }
       }
+      // Answer once the batch's initial state is persisted (2026-11-06 r2):
+      // fire-and-forget answered ok even when that first write failed, and
+      // the popup polled a null state forever. The batch itself runs on in
+      // the background; the popup polls getExecuteState.
+      let launched: { done: Promise<void> }
+      try {
+        launched = await launchExecute(plan, resolvedTree, api)
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e)
+        // A persisted inProgress from a worker recovery hasn't swept yet.
+        if (!(e instanceof ExecuteStartError) && message === '已有批次執行中') {
+          return { ok: false, code: 'ALREADY_RUNNING', message }
+        }
+        return { ok: false, code: 'EXECUTE_START_FAILED', message }
+      }
+      void launched.done.catch((err) => console.error('[mail-organizer] startExecute failed', err))
       await recordClassifyRunExecuted(plan.map((p) => p.emailId)) // 2026-11-05: never re-offered by this run's progress
-      // Fire-and-forget; popup polls getExecuteState.
-      void startExecute(plan, resolvedTree, api).catch((err) =>
-        console.error('[mail-organizer] startExecute failed', err),
-      )
       return { ok: true, data: { started: true, total: plan.length } }
     }
 
@@ -2912,6 +3536,12 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       // twice). The run's executed-id exclusion now keeps moved mail out of
       // every read, so only a FINISHED run with nothing left to offer is
       // residue. A live run (done:false) is never purged.
+      //
+      // unlessRunning (2026-11-06): the popup's crash-recovery discard drops
+      // a FINISHED batch's state; a running batch is never discarded.
+      if (msg.unlessRunning === true && (isExecuteBusy() || (await isExecuteRunning()))) {
+        return { ok: true, data: { cleared: false } }
+      }
       const [run, raw] = await Promise.all([
         loadClassifyRun(),
         chrome.storage.session.get(AI_PROGRESS_KEY),
@@ -2922,13 +3552,20 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
           await chrome.storage.session.remove(AI_PROGRESS_KEY)
         } else if (prog.done) {
           const left = viewAiProgress(prog, run.executedIds, 'meta', 0)
-          if (left.ruleCount + left.aiCount - left.aiUnclassifiedCount === 0) {
+          // A run stored without its items (planDropped) offers nothing either.
+          if (
+            'planDropped' in left ||
+            left.ruleCount + left.aiCount - left.aiUnclassifiedCount === 0
+          ) {
             await cancelClassifyRun(run.runId)
           }
         }
       }
+      // Re-checked with no await before the removal: a batch claims the
+      // executor synchronously, so one started meanwhile is seen here.
+      if (msg.unlessRunning === true && isExecuteBusy()) return { ok: true, data: { cleared: false } }
       await clearExecuteState()
-      return { ok: true }
+      return { ok: true, data: { cleared: true } }
     }
 
     case 'getUndoSnapshot': {
@@ -3020,12 +3657,27 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         }
       }
 
+      // Own mailbox (2026-11-06): the identity cache is filled only by a
+      // classify preflight, so a fresh install — or an upgrader — scanning
+      // before classifying let Pass A mint `domain: <own domain>`. Never
+      // throws (bounded GET /me; falls back to the cache, or to none). The
+      // scan takes the resolved, account-checked identity whole (2026-11-06
+      // r2) — its own-address check read the raw cache.
+      const ownIdentity = await resolveOwnIdentity()
+      // Re-checked synchronously after the last await (2026-11-06 r2): a
+      // second start that overlapped this one's awaits got ok:true and then
+      // threw into the console. startInitialScan claims synchronously, so
+      // this check + its claim are atomic.
+      if (isScanBusy()) {
+        return { ok: false, code: 'ALREADY_RUNNING', message: '已有掃描中的批次' }
+      }
       void startInitialScan({
         rootPath,
         tree,
         api,
         excludePrefixes: settings.excludeFolderPrefixes,
         internalDomains: settings.internalDomains,
+        ownIdentity,
       }).catch((err) => console.error('[mail-organizer] startInitialScan failed', err))
       return { ok: true, data: { started: true, rootPath } }
     }
@@ -3369,7 +4021,8 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       // newly-added rules. Edit events aren't possible here because the
       // import key is (type, signal) — a "matching" rule keeps its old id
       // under merge (it's skipped, not edited).
-      const cachedTree = (await getFolderCache())?.tree
+      const cachedFolders = await getFolderCache()
+      const cachedTree = cachedFolders?.tree
       let auditEvents: RuleEvent[] = []
       // Track confidence-lowering by the cap so the user sees how
       // much trust their backup leaked. Backups from an older build
@@ -3380,6 +4033,9 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       // domain → 0.7".
       let cappedCount = 0
       let cappedMaxDelta = 0
+      // arrivingCounters (2026-11-06, R2): the file's matchCount /
+      // overrideCount were counted elsewhere — the counter baseline covers
+      // them, so a backup's legacy override record can't trip high-error-rate.
       const result = await mutateRules((existing) => {
         // Pre-cap imported rules — backups / shared JSON may carry
         // confidence above the per-type ceiling we now enforce
@@ -3399,14 +4055,33 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
         })
         const merged = applyImport(existing, cappedImported, strategy)
         const added = strategy === 'merge' ? merged.length - existing.length : cappedImported.length
+        // Of `skipped`: the signal already routes to ANOTHER folder locally
+        // (2026-11-06) — surfaced so the UI can say why they weren't added.
+        // Of `added`: imported rules that took a signal over from a local rule
+        // of lower priority / a switched-off one (R5).
+        const preview = strategy === 'merge' ? previewImport(existing, cappedImported) : null
+        const conflictSkipped = preview?.conflictCount ?? 0
+        const replacedLocal = preview?.replaceCount ?? 0
         const replaced = strategy === 'replace' ? existing.length : 0
         let orphanedCount = 0
         let next = merged
+        // Local rules switched off ('superseded') for an imported rule of
+        // higher priority (R5) — only AFTER the reconcile, and only for an
+        // imported rule whose folder resolved (round 3): switching a working
+        // local rule off for one whose folder no longer exists left nothing
+        // routing the signal. No folder tree → no takeover (can't confirm).
+        let superseded: Rule[] = []
         if (cachedTree && cachedTree.length > 0) {
-          const recon = reconcileRulesAgainstTree(merged, cachedTree)
+          const recon = reconcileRulesAgainstTree(merged, cachedTree, reconcileOptionsFor(cachedFolders))
           next = recon.rules
+          if (strategy === 'merge') {
+            const takeover = applyImportTakeovers(existing, cappedImported, next)
+            next = takeover.next
+            superseded = takeover.superseded
+          }
           orphanedCount = next.filter((r) => r.orphaned).length
         }
+        const supersededLocal = superseded.length
         const now = Date.now()
         const existingIds = new Set(existing.map((r) => r.id))
         const nextIds = new Set(next.map((r) => r.id))
@@ -3447,6 +4122,20 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             })
           }
         }
+        // Local rules the merge switched off for an imported rule of higher
+        // priority (R5) — a system toggle, like the learners' 'superseded'.
+        for (const r of superseded) {
+          events.push({
+            kind: 'toggle',
+            ruleId: r.id,
+            at: now,
+            actor: 'system',
+            enabled: false,
+            type: r.type,
+            signal: r.signal,
+            targetFolderPath: r.targetFolderPath,
+          })
+        }
         auditEvents = events
         return {
           next,
@@ -3455,10 +4144,13 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             replaced,
             total: next.length,
             skipped: parsed.rules.length - added,
+            conflictSkipped,
+            replacedLocal,
+            supersededLocal,
             orphanedCount,
           },
         }
-      })
+      }, { arrivingCounters: true })
       if (auditEvents.length > 0) {
         await recordRuleEvents(auditEvents).catch((e) =>
           console.warn('[mail-organizer] recordRuleEvents (importRules) failed', e),
@@ -3920,7 +4612,19 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
     }
 
     case 'getFolderTree': {
-      const tree = await getOrFetchFolderTree(msg.forceFresh === true)
+      let tree: MailFolderNode[]
+      try {
+        tree = await getOrFetchFolderTree(msg.forceFresh === true)
+      } catch (e) {
+        // No folder cache yet AND no Outlook token — no OWA tab, signed out,
+        // unreachable tab (2026-11-06): nothing to fetch with, so answer like
+        // getStatus does. Options asks on every open, and each answer used to
+        // land in the error log as a 401. Real failures still throw (logged).
+        if (e instanceof OutlookTokenUnavailableError) {
+          return { ok: false, code: e.tokenCode ?? 'NOT_ON_OWA', message: e.reason }
+        }
+        throw e
+      }
       return { ok: true, data: { tree, count: flattenFolderTree(tree).length } }
     }
 

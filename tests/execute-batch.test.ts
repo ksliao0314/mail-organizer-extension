@@ -4,27 +4,39 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import {
+  ExecuteStartError,
   executeUndo,
   getExecuteState,
+  launchExecute,
   recoverStaleExecuteState,
   requestCancel,
   startExecute,
   startRetryFailed,
 } from '@/background/execute'
+import { isKeepAliveHeartbeatActive } from '@/background/keep-alive'
 import { EXECUTE_PARALLEL_ITEMS } from '@/shared/constants'
-import { OutlookError, type OutlookApi } from '@/shared/outlook-api'
+import {
+  OutlookError,
+  OutlookTokenUnavailableError,
+  flattenFolderTree,
+  type OutlookApi,
+} from '@/shared/outlook-api'
 import { listRules, newRule } from '@/shared/rules'
 import {
+  getBatchStats,
   getConversationMemory,
+  getFolderActivity,
+  getFolderCache,
   getMetrics,
   getMovedByUsLedger,
   getRecentlyProcessedIds,
+  getSubjectMemory,
   getUndoSnapshot,
   setFolderCache,
   setRules,
   setSettings,
 } from '@/shared/storage'
-import type { ExecuteState, MailFolderNode, PlanItem, Rule } from '@/shared/types'
+import type { ExecuteState, FolderCache, MailFolderNode, PlanItem, Rule } from '@/shared/types'
 
 const ROOT = 'ROOT-FOLDER-ID-00000000000'
 const CASES = 'FOLDER-CASES-0000000000000'
@@ -367,7 +379,7 @@ describe('moves into Deleted Items & co. are refused (item 2)', () => {
   it('a target inside the trash subtree of an old cached tree is refused (ids resolved via API)', async () => {
     const api = {
       ...fakeApi(),
-      getWellKnownFolderIds: vi.fn(async () => new Map([['deleteditems', TRASH]])),
+      getWellKnownFolderId: vi.fn(async (role: string) => (role === 'deleteditems' ? TRASH : undefined)),
     } as FakeApi
     await startExecute([moveRow('e1', OLDCASE, { targetFolderPath: '刪除的郵件/甲' })], oldUnfilteredTree(), asApi(api))
     expect((await finalState()).results[0]!.status).toBe('error')
@@ -391,6 +403,348 @@ describe('moves into Deleted Items & co. are refused (item 2)', () => {
     await startExecute([moveRow('e1', OLDCASE)], tree(), asApi(api))
     expect((await finalState()).results[0]!.status).toBe('error')
     expect(api.moveMessage).not.toHaveBeenCalled()
+  })
+})
+
+// C2 (2026-11-06): v1.0.8 refused Junk Email and Sent Items (+ subfolders)
+// too, and said 「可能已被刪除」 for every refusal. O1 (2026-11-06 r2): the
+// tree leaves the trash / Drafts / Outbox out; their roots come with the
+// folder cache (FolderCache.wellKnown).
+describe('non-filing destinations (C2 / O1)', () => {
+  const JUNK = 'WELLKNOWN-JUNK-00000000000'
+  const JUNK_SUB = 'FOLDER-JUNK-SUB-0000000000'
+  const SENT = 'WELLKNOWN-SENT-00000000000'
+  const SENT_SUB = 'FOLDER-SENT-CLIENT-A-00000'
+  const DRAFTS = 'WELLKNOWN-DRAFTS-000000000'
+  const OUTBOX = 'WELLKNOWN-OUTBOX-000000000'
+  /** The tree as fetched now: Junk / Sent in (roots tagged), the trash / Drafts / Outbox out. */
+  function newTree(): MailFolderNode[] {
+    return [
+      ...tree(),
+      {
+        id: JUNK,
+        displayName: '垃圾郵件',
+        path: '垃圾郵件',
+        parentFolderId: ROOT,
+        wellKnown: 'junkemail',
+        children: [{ id: JUNK_SUB, displayName: '可疑', path: '垃圾郵件/可疑', parentFolderId: JUNK, children: [] }],
+      },
+      {
+        id: SENT,
+        displayName: '寄件備份',
+        path: '寄件備份',
+        parentFolderId: ROOT,
+        wellKnown: 'sentitems',
+        children: [{ id: SENT_SUB, displayName: '客戶A', path: '寄件備份/客戶A', parentFolderId: SENT, children: [] }],
+      },
+    ]
+  }
+  const roots = (): FolderCache['wellKnown'] => ({
+    complete: true,
+    roots: [
+      { id: TRASH, role: 'deleteditems', displayName: '刪除的郵件' },
+      { id: DRAFTS, role: 'drafts' },
+      { id: OUTBOX, role: 'outbox' },
+      { id: JUNK, role: 'junkemail' },
+      { id: SENT, role: 'sentitems' },
+    ],
+  })
+  async function seedNewCache() {
+    await setFolderCache({ updatedAt: new Date().toISOString(), tree: newTree(), wellKnown: roots() })
+  }
+
+  it('Junk / Sent Items and their subfolders are ordinary filing targets', async () => {
+    await seedNewCache()
+    const api = fakeApi()
+    const plan = [JUNK, JUNK_SUB, SENT, SENT_SUB].map((id, i) => moveRow(`e${i}`, id))
+    await startExecute(plan, newTree(), asApi(api))
+    const s = await finalState()
+    expect(s.results.map((r) => r.status)).toEqual(['moved', 'moved', 'moved', 'moved'])
+    expect(api.moveMessage).toHaveBeenCalledTimes(4)
+  })
+
+  it('a folder deleted into the trash is refused with a message that says so (live parent walk)', async () => {
+    await seedNewCache()
+    const api = {
+      ...fakeApi(),
+      getFolder: vi.fn(async (id: string) => ({ Id: id, DisplayName: '甲', ParentFolderId: TRASH })),
+    } as FakeApi
+    await startExecute([moveRow('e1', OLDCASE, { targetFolderPath: '案件/甲' })], newTree(), asApi(api))
+    const row = (await finalState()).results[0]!
+    expect(row.status).toBe('error')
+    expect(row.message).toContain('已在 Outlook 被刪除')
+    expect(row.message).not.toContain('可能已被刪除')
+    expect(api.moveMessage).not.toHaveBeenCalled()
+  })
+
+  it('Drafts is refused as Drafts', async () => {
+    await seedNewCache()
+    const api = fakeApi()
+    await startExecute([moveRow('e1', DRAFTS)], newTree(), asApi(api))
+    const row = (await finalState()).results[0]!
+    expect(row.status).toBe('error')
+    expect(row.message).toContain('「草稿」或「寄件匣」')
+    expect(api.moveMessage).not.toHaveBeenCalled()
+  })
+
+  it('new_folder never creates a folder inside the trash (a tree that still lists it)', async () => {
+    await seedNewCache()
+    const api = fakeApi()
+    const legacyTree: MailFolderNode[] = [
+      ...newTree(),
+      { id: TRASH, displayName: '刪除的郵件', path: '刪除的郵件', parentFolderId: ROOT, children: [] },
+    ]
+    await startExecute(
+      [
+        {
+          ...moveRow('e1', A),
+          action: 'new_folder',
+          targetFolderId: undefined,
+          targetFolderPath: undefined,
+          suggestedParentPath: '刪除的郵件',
+          suggestedFolderName: '新案',
+        },
+      ],
+      legacyTree,
+      asApi(api),
+    )
+    const row = (await finalState()).results[0]!
+    expect(row.status).toBe('error')
+    expect(row.message).toContain('不能在「已刪除的郵件」裡建立新資料夾')
+    expect(api.createChildFolder).not.toHaveBeenCalled()
+  })
+
+  it('a v1.0.8 cache (all five roots "excluded") no longer blocks Sent Items once the names resolve', async () => {
+    await setFolderCache({
+      updatedAt: new Date().toISOString(),
+      tree: tree(),
+      excludedFolderIds: [TRASH, JUNK, SENT, DRAFTS, OUTBOX],
+    })
+    const ids: Record<string, string> = { deleteditems: TRASH, drafts: DRAFTS }
+    const api = {
+      ...fakeApi(),
+      getWellKnownFolderId: vi.fn(async (role: string) => ids[role]),
+      getFolder: vi.fn(async (id: string) => ({ Id: id, DisplayName: 'x', ParentFolderId: id === SENT_SUB ? SENT : ROOT })),
+    } as FakeApi
+    await startExecute([moveRow('e1', SENT_SUB), moveRow('e2', DRAFTS)], tree(), asApi(api))
+    const s = await finalState()
+    expect(s.results.map((r) => r.status)).toEqual(['moved', 'error'])
+  })
+
+  it('an incomplete cache looks up just the missing roots, each alone, once per batch', async () => {
+    await setFolderCache({
+      updatedAt: new Date().toISOString(),
+      tree: newTree(),
+      wellKnown: { complete: false, roots: [{ id: DRAFTS, role: 'drafts' }] },
+    })
+    const getWellKnownFolderId = vi.fn(async (role: string) => (role === 'deleteditems' ? TRASH : undefined))
+    const api = { ...fakeApi(), getWellKnownFolderId } as FakeApi
+    await startExecute([moveRow('e1', TRASH), moveRow('e2', DRAFTS), moveRow('e3', A)], newTree(), asApi(api))
+    expect((await finalState()).results.map((r) => r.status)).toEqual(['deleted', 'error', 'moved'])
+    // Drafts was known: only the trash and Outbox were asked for.
+    expect(getWellKnownFolderId.mock.calls.map((c) => c[0]).sort()).toEqual(['deleteditems', 'outbox'])
+  })
+
+  // O1a (2026-11-06 r2): a move into 刪除的郵件 was learned like a filing — an
+  // ai_confirmed domain rule → trash, conversation / subject memory → trash
+  // (follow-ups auto-routed there at 0.95), folder activity and the AI's
+  // recent-folders hint.
+  describe('Deleted Items itself as a target runs as a delete (O1a)', () => {
+    const trashRow = (id: string, over: Partial<PlanItem> = {}) =>
+      moveRow(id, TRASH, { targetFolderPath: '刪除的郵件', conversationId: `conv-${id}`, ...over })
+
+    it('an AI / user move: deleted, nothing learned or remembered, undo returns it to the inbox', async () => {
+      await seedNewCache()
+      const api = fakeApi()
+      await startExecute(
+        [trashRow('e1', { source: 'ai', aiOriginalAction: 'move', aiOriginalTargetFolderPath: '刪除的郵件' })],
+        newTree(),
+        asApi(api),
+      )
+      const s = await finalState()
+      expect(s.results[0]).toMatchObject({ status: 'deleted', newMessageId: 'del-e1' })
+      expect(s.summary).toMatchObject({ moved: 0, deleted: 1 })
+      expect(api.moveToDeletedItems).toHaveBeenCalledWith('e1', expect.anything())
+      expect(api.moveMessage).not.toHaveBeenCalled()
+      expect(await listRules()).toEqual([]) // no ai_confirmed `domain client.example → 刪除的郵件`
+      expect(await getConversationMemory()).toEqual({})
+      expect(await getSubjectMemory()).toEqual({})
+      expect(await getFolderActivity()).toEqual([])
+      const snap = await getUndoSnapshot()
+      expect(snap?.moves).toEqual([expect.objectContaining({ newMessageId: 'del-e1', deleted: true })])
+      expect(await executeUndo(asApi(api))).toMatchObject({ restored: 1 })
+      expect(api.moveMessage).toHaveBeenCalledWith('del-e1', 'inbox')
+    })
+
+    it('a rule-routed one still counts the rule hit', async () => {
+      await seedNewCache()
+      const trashRule: Rule = {
+        ...newRule({
+          type: 'sender',
+          signal: 'spam@x.example',
+          targetFolderId: TRASH,
+          targetFolderPath: '刪除的郵件',
+          confidence: 0.75,
+          source: 'user_manual',
+        }),
+        id: 'R-trash',
+      }
+      await setRules([trashRule])
+      await startExecute([trashRow('e1', { source: 'rule', ruleId: 'R-trash' })], newTree(), asApi(fakeApi()))
+      expect((await finalState()).results[0]!.status).toBe('deleted')
+      const [r] = await listRules()
+      expect(r!.matchCount).toBe(1)
+      expect(await getConversationMemory()).toEqual({})
+    })
+  })
+
+  // O1f (2026-11-06 r2): the top-level 409 / lost-response recovery adopted a
+  // hidden 「草稿」 without any check — and spliced it into the cached tree.
+  describe('new_folder never adopts a non-filing folder (O1f)', () => {
+    const topLevel = (name: string): PlanItem => ({
+      ...moveRow('e1', A),
+      action: 'new_folder',
+      targetFolderId: undefined,
+      targetFolderPath: undefined,
+      suggestedParentPath: undefined,
+      suggestedFolderName: name,
+    })
+
+    it('a 409 against Drafts itself is refused, never moved into or spliced', async () => {
+      await seedNewCache()
+      const api = fakeApi()
+      api.createTopFolder.mockRejectedValueOnce(new OutlookError(409, 'ErrorFolderExists'))
+      api.listTopFolders.mockResolvedValueOnce([{ Id: DRAFTS, DisplayName: '草稿' }] as never)
+      await startExecute([topLevel('草稿')], newTree(), asApi(api))
+      const row = (await finalState()).results[0]!
+      expect(row.status).toBe('error')
+      expect(row.message).toContain('「草稿」或「寄件匣」')
+      expect(api.moveMessage).not.toHaveBeenCalled()
+      expect(flattenFolderTree((await getFolderCache())!.tree).some((n) => n.id === DRAFTS)).toBe(false)
+    })
+
+    it('a lost create response that finds the trash itself is refused too', async () => {
+      await seedNewCache()
+      const api = fakeApi()
+      api.createTopFolder.mockRejectedValueOnce(new OutlookError(0, 'Network error on POST', undefined, true))
+      api.listTopFolders.mockResolvedValueOnce([{ Id: TRASH, DisplayName: '刪除的郵件' }] as never)
+      await startExecute([topLevel('刪除的郵件')], newTree(), asApi(api))
+      const row = (await finalState()).results[0]!
+      expect(row.status).toBe('error')
+      expect(row.message).toContain('和「已刪除的郵件」同名')
+      expect(api.moveMessage).not.toHaveBeenCalled()
+      expect(api.moveToDeletedItems).not.toHaveBeenCalled()
+    })
+
+    it('an in-batch twin that is a well-known root (a tree listing Outbox) is refused', async () => {
+      await seedNewCache()
+      const api = fakeApi()
+      const listingOutbox: MailFolderNode[] = [
+        ...newTree(),
+        { id: OUTBOX, displayName: '寄件匣', path: '寄件匣', parentFolderId: ROOT, children: [] },
+      ]
+      await startExecute([topLevel('寄件匣')], listingOutbox, asApi(api))
+      expect((await finalState()).results[0]!.status).toBe('error')
+      expect(api.moveMessage).not.toHaveBeenCalled()
+      expect(api.createTopFolder).not.toHaveBeenCalled()
+    })
+  })
+})
+
+// O4 (2026-11-06 r2): with no Outlook token (no / frozen OWA tab) every item
+// waited out its own ~10 s token timeout — ≈ 28 minutes of identical error
+// rows for 500 items.
+describe('token outage stops the batch (O4)', () => {
+  const outage = () => new OutlookTokenUnavailableError('Outlook 分頁沒有回應(可能被瀏覽器凍結或正忙)。', 'TAB_UNREACHABLE')
+
+  it('the first token failure stops the batch; every unrun row says why and stays retryable', async () => {
+    const api = fakeApi()
+    api.moveMessage.mockImplementation(async () => {
+      throw outage()
+    })
+    const plan = Array.from({ length: 12 }, (_, i) => moveRow(`e${i}`, i % 2 ? A : B))
+    await startExecute(plan, tree(), asApi(api))
+    const s = await finalState()
+    // Only the moves already started when it hit — not one per item.
+    expect(api.moveMessage.mock.calls.length).toBeLessThanOrEqual(EXECUTE_PARALLEL_ITEMS)
+    expect(s.results.every((r) => r.status === 'error')).toBe(true)
+    expect(new Set(s.results.map((r) => r.message)).size).toBe(1)
+    expect(s.results[0]!.message).toContain('無法取得 Outlook 授權')
+    expect(s.results[0]!.message).toContain('重試失敗項目')
+    expect(s.summary).toMatchObject({ errors: 12, cancelled: 0 })
+
+    // Once the tab is back, 「重試失敗項目」 takes every row.
+    api.moveMessage.mockImplementation(async (id: string, dest: string) => ({ Id: `new-${id}`, ParentFolderId: dest }))
+    expect(await startRetryFailed(asApi(api), async () => tree())).toEqual({ ok: true, started: 12 })
+    expect((await waitIdle()).summary.moved).toBe(12)
+  })
+
+  it('a user cancel still wins for the rows that never ran', async () => {
+    const api = fakeApi()
+    api.moveMessage.mockImplementation(async () => {
+      void requestCancel()
+      throw outage()
+    })
+    await startExecute(Array.from({ length: 8 }, (_, i) => moveRow(`e${i}`, A)), tree(), asApi(api))
+    const s = await finalState()
+    expect(s.results.some((r) => r.status === 'cancelled')).toBe(true)
+  })
+})
+
+// O2 (2026-11-06 r2): the start answered ok before the batch's first state
+// write; when that write failed the popup polled a null state forever.
+describe('launch waits for the initial state write (O2)', () => {
+  let restore: (() => void) | null = null
+  afterEach(() => restore?.())
+
+  it('a failing first write rejects the launch with a clear error; nothing moved, claim released', async () => {
+    const sessionSet = chrome.storage.session.set as unknown as Mock
+    const original = sessionSet.getMockImplementation()!
+    sessionSet.mockImplementation(async (items: Record<string, unknown>) => {
+      if ('executeState' in items) throw new Error('QUOTA_BYTES quota exceeded')
+      return original(items)
+    })
+    restore = () => sessionSet.mockImplementation(original)
+    const api = fakeApi()
+    await expect(launchExecute([moveRow('e1', A)], tree(), asApi(api))).rejects.toBeInstanceOf(ExecuteStartError)
+    expect(api.moveMessage).not.toHaveBeenCalled()
+    expect(await getExecuteState()).toBeNull()
+
+    restore()
+    restore = null
+    const { done } = await launchExecute([moveRow('e1', A)], tree(), asApi(api))
+    // Resolved once the state is durable — before the batch is done.
+    expect((await getExecuteState())?.total).toBe(1)
+    await done
+    expect((await finalState()).summary.moved).toBe(1)
+  })
+
+  it('a malformed plan rejects without leaving the executor claimed', async () => {
+    await expect(launchExecute([null as unknown as PlanItem], tree(), asApi(fakeApi()))).rejects.toThrow()
+    await startExecute([moveRow('e1', A)], tree(), asApi(fakeApi()))
+    expect((await finalState()).summary.moved).toBe(1)
+  })
+})
+
+// O3 (2026-11-06 r2): an awaited storage call ahead of releaseKeepAlive() in
+// 撤回's finally — when it rejected, the hold leaked and the 20 s heartbeat
+// kept the worker alive for the rest of the session.
+describe('撤回 releases its keep-alive hold even when cleanup fails (O3)', () => {
+  let restore: (() => void) | null = null
+  afterEach(() => restore?.())
+
+  it('clearUndoSnapshot rejecting no longer leaks the hold', async () => {
+    const api = fakeApi()
+    await startExecute([moveRow('e1', A)], tree(), asApi(api))
+    const localRemove = chrome.storage.local.remove as unknown as Mock
+    const original = localRemove.getMockImplementation()!
+    localRemove.mockImplementation(async (keys: string | string[]) => {
+      if ([keys].flat().includes('undoSnapshot')) throw new Error('storage unavailable')
+      return original(keys)
+    })
+    restore = () => localRemove.mockImplementation(original)
+    await expect(executeUndo(asApi(api))).rejects.toThrow('storage unavailable')
+    expect(isKeepAliveHeartbeatActive()).toBe(false)
   })
 })
 
@@ -610,5 +964,564 @@ describe('SW-death recovery replays the post-loop bookkeeping (item 7)', () => {
     const [rule] = await listRules()
     expect(rule!.matchCount).toBe(1)
     expect((await getMetrics()).moved).toBe(1)
+  })
+})
+
+// C4 (2026-11-06): the whole-state write is throttled, so after an SW death an
+// item whose move was already on the wire could still read 'queued' →
+// recovery said 「此筆未開始」 and skipped its bookkeeping. Now an in-flight
+// record is persisted before every non-idempotent request.
+describe('in-flight marker before non-idempotent requests (C4)', () => {
+  it('each move goes out only after its index is persisted — while its row may still read queued', async () => {
+    // The storage mock keeps object references; snapshot what was WRITTEN.
+    const sessionSet = chrome.storage.session.set as unknown as Mock
+    const original = sessionSet.getMockImplementation()!
+    let written: ExecuteState | undefined
+    sessionSet.mockImplementation(async (items: Record<string, unknown>) => {
+      if (items.executeState) written = structuredClone(items.executeState) as ExecuteState
+      return original(items)
+    })
+    const api = fakeApi()
+    const plan = Array.from({ length: 5 }, (_, i) => moveRow(`e${i}`, i % 2 ? A : B))
+    const seen: Array<{ marked: boolean; persisted: string | undefined }> = []
+    api.moveMessage.mockImplementation(async (id: string, dest: string) => {
+      const rec = (await chrome.storage.session.get('executeInFlight')).executeInFlight as
+        | { indexes: number[] }
+        | undefined
+      const idx = plan.findIndex((p) => p.emailId === id)
+      seen.push({ marked: !!rec?.indexes.includes(idx), persisted: written?.results[idx]?.status })
+      return { Id: `new-${id}`, ParentFolderId: dest }
+    })
+    try {
+      await startExecute(plan, tree(), asApi(api))
+    } finally {
+      sessionSet.mockImplementation(original)
+    }
+    expect(seen).toHaveLength(5)
+    expect(seen.every((x) => x.marked)).toBe(true)
+    expect(seen.some((x) => x.persisted === 'queued')).toBe(true) // the gap the marker covers
+    expect((await chrome.storage.session.get('executeInFlight')).executeInFlight).toBeUndefined()
+  })
+
+  it('a folder create is marked too', async () => {
+    const api = fakeApi()
+    let markedAtCreate = false
+    api.createChildFolder.mockImplementation(async (parent: string, name: string) => {
+      const rec = (await chrome.storage.session.get('executeInFlight')).executeInFlight as
+        | { indexes: number[] }
+        | undefined
+      markedAtCreate = !!rec?.indexes.includes(0)
+      return { Id: `CREATED-${name}-000000000000000`, DisplayName: name, ParentFolderId: parent }
+    })
+    await startExecute(
+      [
+        {
+          ...moveRow('e1', A),
+          action: 'new_folder',
+          targetFolderId: undefined,
+          suggestedParentPath: '案件',
+          suggestedFolderName: '丙',
+        },
+      ],
+      tree(),
+      asApi(api),
+    )
+    expect(markedAtCreate).toBe(true)
+  })
+
+  it('recovery: a marked row that never reached a final status is "may have completed", kept out of recentlyProcessed', async () => {
+    const plan = ['e1', 'e2', 'e3', 'e4', 'e5'].map((id) => moveRow(id, A))
+    const startedAt = Date.now() - 5_000
+    const row = (i: number, status: ExecuteState['results'][number]['status']) => ({
+      emailId: plan[i]!.emailId,
+      subject: 's',
+      action: 'move' as const,
+      status,
+    })
+    const state: ExecuteState = {
+      inProgress: true,
+      cancelRequested: false,
+      startedAt,
+      total: 5,
+      current: 2,
+      plan,
+      results: [
+        { ...row(0, 'moved'), newMessageId: 'new-e1', destinationFolderId: A, destinationFolderPath: '案件/甲' },
+        row(1, 'queued'), // marked: its move was on the wire
+        row(2, 'processing'), // marked
+        row(3, 'queued'), // never sent
+        row(4, 'processing'), // started, nothing sent yet
+      ],
+      summary: { moved: 1, deleted: 0, foldersCreated: 0, skipped: 0, cancelled: 0, errors: 0 },
+      rulesAdded: 0,
+    }
+    await chrome.storage.session.set({ executeState: state, executeInFlight: { startedAt, indexes: [0, 1, 2] } })
+    expect(await recoverStaleExecuteState()).toEqual({ recovered: true, stuck: 4 })
+    const s = await finalState()
+    expect(s.results.map((r) => r.status)).toEqual(['moved', 'skipped', 'skipped', 'cancelled', 'error'])
+    expect(s.results[1]!.message).toContain('可能已完成,請到 Outlook 確認')
+    expect(s.summary).toMatchObject({ moved: 1, skipped: 2, cancelled: 1, errors: 1 })
+    const processed = await getRecentlyProcessedIds()
+    expect(processed.has('e1')).toBe(true)
+    expect(processed.has('e2') || processed.has('e3')).toBe(false)
+    expect((await chrome.storage.session.get('executeInFlight')).executeInFlight).toBeUndefined()
+  })
+})
+
+// C8 (2026-11-06): a death between a counting write and the finalize marker's
+// `done` replayed the step — rule hits, metrics, timesFiled counted twice.
+describe('finalize counting is exactly-once across a worker death (C8)', () => {
+  const domainRule = (matchCount: number): Rule => ({
+    ...newRule({
+      type: 'domain',
+      signal: 'client.example',
+      targetFolderId: A,
+      targetFolderPath: '案件/甲',
+      confidence: 0.7,
+      source: 'ai_confirmed',
+    }),
+    id: 'R1',
+    matchCount,
+  })
+  const memory = (timesFiled: number) => ({
+    c1: {
+      folderId: A,
+      folderPath: '案件/甲',
+      lastFiledAt: '2026-11-05T00:00:00.000Z',
+      timesFiled,
+      conflictCount: 0,
+      stableStreak: timesFiled,
+    },
+  })
+
+  async function seedDeadBatchAfterIntents(opts: { landed: boolean }) {
+    await setRules([domainRule(opts.landed ? 6 : 5)])
+    await chrome.storage.local.set({
+      metrics: { moved: opts.landed ? 11 : 10, deleted: 0, foldersCreated: 0, errors: 0 },
+      conversationMemory: memory(opts.landed ? 3 : 2),
+    })
+    const plan: PlanItem[] = [moveRow('e1', A, { source: 'rule', ruleId: 'R1', conversationId: 'c1' })]
+    const startedAt = Date.now() - 5_000
+    const state: ExecuteState = {
+      inProgress: true,
+      cancelRequested: false,
+      startedAt,
+      total: 1,
+      current: 0,
+      plan,
+      results: [
+        {
+          emailId: 'e1',
+          subject: plan[0]!.emailSubject,
+          action: 'move',
+          status: 'moved',
+          newMessageId: 'new-e1',
+          destinationFolderId: A,
+          destinationFolderPath: '案件/甲',
+        },
+      ],
+      summary: { moved: 1, deleted: 0, foldersCreated: 0, skipped: 0, cancelled: 0, errors: 0 },
+      rulesAdded: 0,
+    }
+    await chrome.storage.session.set({
+      executeState: state,
+      // The worker died after recording its intents (and, if `landed`, after
+      // the counting writes themselves) but before any step was marked done.
+      executeFinalize: {
+        startedAt,
+        done: [],
+        intents: {
+          ruleHits: { pre: { R1: 5 }, inc: { R1: 1 } },
+          convMemory: { pre: { c1: 2 }, inc: { c1: 1 } },
+          metrics: { pre: { moved: 10 }, inc: { moved: 1 } },
+        },
+      },
+    })
+  }
+
+  it('writes that already landed are not applied again', async () => {
+    await seedDeadBatchAfterIntents({ landed: true })
+    await recoverStaleExecuteState()
+    expect((await listRules())[0]!.matchCount).toBe(6)
+    expect((await getMetrics()).moved).toBe(11)
+    expect((await getConversationMemory()).c1!.timesFiled).toBe(3)
+  })
+
+  it('writes that never landed are applied exactly once', async () => {
+    await seedDeadBatchAfterIntents({ landed: false })
+    await recoverStaleExecuteState()
+    expect((await listRules())[0]!.matchCount).toBe(6)
+    expect((await getMetrics()).moved).toBe(11)
+    expect((await getConversationMemory()).c1!.timesFiled).toBe(3)
+  })
+
+  it('the normal path records each intent BEFORE its counting write', async () => {
+    await setRules([domainRule(0)])
+    const localSet = chrome.storage.local.set as unknown as Mock
+    const original = localSet.getMockImplementation()!
+    const intentsAtWrite: Record<string, string[]> = {}
+    localSet.mockImplementation(async (items: Record<string, unknown>) => {
+      for (const k of ['rules', 'metrics', 'conversationMemory']) {
+        if (k in items && !(k in intentsAtWrite)) {
+          const m = (await chrome.storage.session.get('executeFinalize')).executeFinalize as
+            | { intents?: Record<string, unknown> }
+            | undefined
+          intentsAtWrite[k] = Object.keys(m?.intents ?? {})
+        }
+      }
+      return original(items)
+    })
+    try {
+      await startExecute(
+        [moveRow('e1', A, { source: 'rule', ruleId: 'R1', conversationId: 'c1' })],
+        tree(),
+        asApi(fakeApi()),
+      )
+    } finally {
+      localSet.mockImplementation(original)
+    }
+    expect(intentsAtWrite.rules).toContain('ruleHits')
+    expect(intentsAtWrite.conversationMemory).toContain('convMemory')
+    expect(intentsAtWrite.metrics).toContain('metrics')
+    expect((await listRules())[0]!.matchCount).toBe(1)
+    expect((await getMetrics()).moved).toBe(1)
+  })
+
+  it('the batch stats row is appended once', async () => {
+    await seedDeadBatchAfterIntents({ landed: true })
+    const startedAt = ((await chrome.storage.session.get('executeState')).executeState as ExecuteState).startedAt
+    const statAt = new Date(startedAt + 1000).toISOString()
+    await chrome.storage.local.set({
+      batchStats: [{ at: statAt, planned: { rule: 1, thread: 0, ai: 0, unresolved: 0 }, moved: 1, deleted: 0, overrides: { rule: 0, ai: 0, thread: 0 }, gateResolved: 0 }],
+    })
+    const fin = (await chrome.storage.session.get('executeFinalize')).executeFinalize as Record<string, unknown>
+    await chrome.storage.session.set({ executeFinalize: { ...fin, statAt } })
+    await recoverStaleExecuteState()
+    expect(await getBatchStats()).toHaveLength(1)
+  })
+})
+
+// Gap 1 (2026-11-06 r2): a folder deleted in OWA AFTER the last tree fetch is
+// still in the cached tree (up to 24 h) — execute trusted it, and mail filed
+// there sat in the trash until the trash was emptied. An old cached tree's
+// folders are now verified live (parent chain up to a known root, memoized
+// per batch) before anything is filed into them.
+describe('an old cached tree is verified live before filing into it (gap 1)', () => {
+  const DRAFTS = 'WELLKNOWN-DRAFTS-000000000'
+  const OUTBOX = 'WELLKNOWN-OUTBOX-000000000'
+  async function seedCache(ageMs: number) {
+    await setFolderCache({
+      updatedAt: new Date(Date.now() - ageMs).toISOString(),
+      tree: tree(),
+      wellKnown: {
+        complete: true,
+        roots: [
+          { id: TRASH, role: 'deleteditems' },
+          { id: DRAFTS, role: 'drafts' },
+          { id: OUTBOX, role: 'outbox' },
+        ],
+      },
+    })
+  }
+  /** Live now: 甲 (A) was deleted in OWA — it sits in the trash; 乙 (B) is still under 案件. */
+  function liveApi(parents: Record<string, string> = { [A]: TRASH, [B]: CASES, [CASES]: ROOT }) {
+    const getFolder = vi.fn(async (id: string) => ({ Id: id, DisplayName: 'x', ParentFolderId: parents[id] }))
+    return { ...fakeApi(), getFolder }
+  }
+
+  it('a folder trashed since the fetch is refused — one GET per distinct folder — and the cache invalidated', async () => {
+    await seedCache(30 * 60_000)
+    const api = liveApi()
+    await startExecute([moveRow('e1', A), moveRow('e2', A), moveRow('e3', B), moveRow('e4', B)], tree(), asApi(api))
+    const s = await finalState()
+    expect(s.results.map((r) => r.status)).toEqual(['error', 'error', 'moved', 'moved'])
+    expect(s.results[0]!.message).toContain('已在 Outlook 被刪除')
+    expect(api.moveMessage).toHaveBeenCalledTimes(2)
+    // 甲, 乙 and their shared parent 案件 — each fetched exactly once, even
+    // with the parallel workers asking at the same time.
+    expect(api.getFolder.mock.calls.map((c) => c[0]).sort()).toEqual([A, B, CASES].sort())
+    // The next preflight refetches the tree (and reconcile orphans 甲's rules).
+    expect((await getFolderCache())?.invalidatedAt).toBeTruthy()
+  })
+
+  it('a just-fetched tree is trusted: no GETs at all', async () => {
+    await seedCache(60_000)
+    const api = liveApi()
+    await startExecute([moveRow('e1', A), moveRow('e2', B)], tree(), asApi(api))
+    expect((await finalState()).results.map((r) => r.status)).toEqual(['moved', 'moved'])
+    expect(api.getFolder).not.toHaveBeenCalled()
+  })
+
+  it('a failed lookup can’t tell — the move goes ahead as before, the cache stays as it is', async () => {
+    await seedCache(30 * 60_000)
+    const api = {
+      ...fakeApi(),
+      getFolder: vi.fn(async () => {
+        throw new OutlookError(503, 'Service Unavailable')
+      }),
+    }
+    await startExecute([moveRow('e1', A)], tree(), asApi(api))
+    expect((await finalState()).results[0]!.status).toBe('moved')
+    expect((await getFolderCache())?.invalidatedAt).toBeUndefined()
+  })
+
+  it('a target gone since the fetch (404 on the first hop) is DESTINATION_GONE, before any move', async () => {
+    await seedCache(30 * 60_000)
+    const api = {
+      ...fakeApi(),
+      getFolder: vi.fn(async () => {
+        throw notFound('folder')
+      }),
+    }
+    await startExecute([moveRow('e1', A)], tree(), asApi(api))
+    const row = (await finalState()).results[0]!
+    expect(row.status).toBe('error')
+    expect(row.message).toContain('目標資料夾已不存在')
+    expect(api.moveMessage).not.toHaveBeenCalled()
+  })
+
+  it('a whole subtree trashed (its parent deleted) is caught too', async () => {
+    await seedCache(30 * 60_000)
+    const api = liveApi({ [A]: CASES, [CASES]: TRASH })
+    await startExecute([moveRow('e1', A)], tree(), asApi(api))
+    expect((await finalState()).results[0]!.status).toBe('error')
+    expect(api.moveMessage).not.toHaveBeenCalled()
+  })
+
+  it('a folder this batch creates is trusted — no GET for it', async () => {
+    await seedCache(30 * 60_000)
+    const api = liveApi()
+    await startExecute(
+      [
+        {
+          ...moveRow('e1', B),
+          action: 'new_folder',
+          targetFolderId: undefined,
+          targetFolderPath: undefined,
+          suggestedParentPath: '案件',
+          suggestedFolderName: '丙',
+        },
+        moveRow('e2', 'pending:e1', { targetFolderPath: '案件/丙' }),
+      ],
+      tree(),
+      asApi(api),
+    )
+    expect((await finalState()).results.map((r) => r.status)).toEqual(['folder_created', 'moved'])
+    expect(api.getFolder.mock.calls.map((c) => c[0])).toEqual([CASES]) // the parent, checked once
+  })
+})
+
+// Gap 2 (2026-11-06 r2): 撤回 had no token circuit breaker — with no Outlook
+// token every move it replays waited out its own ~10 s token timeout.
+describe('撤回 stops on a token outage (gap 2)', () => {
+  const outage = () => new OutlookTokenUnavailableError('請先打開並登入 outlook.office.com 分頁', 'NOT_ON_OWA')
+  const undoCalls = (api: ReturnType<typeof fakeApi>) => api.moveMessage.mock.calls.filter((c) => c[1] === 'inbox')
+
+  it('the first token failure stops it; the rest share one message saying 撤回 can’t be retried', async () => {
+    const api = fakeApi()
+    await startExecute([moveRow('e1', A), moveRow('e2', B), moveRow('e3', A)], tree(), asApi(api))
+    api.moveMessage.mockImplementation(async (id: string, dest: string) => {
+      if (dest === 'inbox') throw outage()
+      return { Id: `new-${id}`, ParentFolderId: dest }
+    })
+    const r = await executeUndo(asApi(api))
+    expect(undoCalls(api)).toHaveLength(1)
+    expect(r).toMatchObject({ attempted: 3, restored: 0, failed: 3 })
+    expect(new Set(r.errors.map((x) => x.message))).toEqual(new Set([r.message]))
+    expect(r.message).toContain('撤回無法重試')
+    expect(r.message).toContain('請先打開並登入 outlook.office.com 分頁')
+  })
+
+  it('stopping part-way keeps what was already restored', async () => {
+    const api = fakeApi()
+    await startExecute([moveRow('e1', A), moveRow('e2', B), moveRow('e3', A)], tree(), asApi(api))
+    let n = 0
+    api.moveMessage.mockImplementation(async (id: string, dest: string) => {
+      if (dest === 'inbox' && ++n === 2) throw outage()
+      return { Id: `back-${id}`, ParentFolderId: dest }
+    })
+    const r = await executeUndo(asApi(api))
+    expect(undoCalls(api)).toHaveLength(2)
+    expect(r).toMatchObject({ attempted: 3, restored: 1, failed: 2 })
+  })
+})
+
+// ---- Round 3 (2026-11-06 r3) ------------------------------------------------
+
+// Item 3: with Deleted Items unidentifiable both when the tree was fetched and
+// at execute, a rule move to the trash ran as an ordinary filing — learned,
+// remembered, 近日活動.
+describe('a destination that may be the trash itself is filed but not learned from (r3 item 3)', () => {
+  const DRAFTS = 'WELLKNOWN-DRAFTS-000000000'
+  const OUTBOX = 'WELLKNOWN-OUTBOX-000000000'
+  async function seedTrashlessCache() {
+    await setFolderCache({
+      updatedAt: new Date().toISOString(),
+      tree: tree(),
+      wellKnown: { complete: false, roots: [{ id: DRAFTS, role: 'drafts' }, { id: OUTBOX, role: 'outbox' }] },
+    })
+  }
+
+  it('the trash lookup is retried alone; still unknown → moved, but no hit, memory, activity or rule', async () => {
+    await seedTrashlessCache()
+    const trashRule: Rule = {
+      ...newRule({ type: 'sender', signal: 'spam@x.example', targetFolderId: TRASH, targetFolderPath: '刪除的郵件', confidence: 0.75, source: 'user_manual' }),
+      id: 'R-trash',
+    }
+    await setRules([trashRule])
+    const getWellKnownFolderId = vi.fn(async (role: string) => {
+      if (role === 'deleteditems') throw new OutlookError(503, 'Service Unavailable')
+      return undefined
+    })
+    const api = {
+      ...fakeApi(),
+      getWellKnownFolderId,
+      // The trash is a top-level folder: its live parent is the mailbox root.
+      getFolder: vi.fn(async (id: string) => ({ Id: id, DisplayName: 'x', ParentFolderId: ROOT })),
+    }
+    await startExecute(
+      [
+        moveRow('e1', TRASH, { targetFolderPath: '刪除的郵件', source: 'rule', ruleId: 'R-trash', conversationId: 'c1' }),
+        moveRow('e2', TRASH, {
+          targetFolderPath: '刪除的郵件',
+          conversationId: 'c2',
+          aiOriginalAction: 'move',
+          aiOriginalTargetFolderPath: '刪除的郵件',
+        }),
+      ],
+      tree(),
+      asApi(api),
+    )
+    const s = await finalState()
+    expect(s.results.map((r) => [r.status, r.unverifiedTarget])).toEqual([
+      ['moved', true],
+      ['moved', true],
+    ])
+    expect(getWellKnownFolderId).toHaveBeenCalledWith('deleteditems')
+    expect((await listRules()).map((r) => [r.id, r.matchCount])).toEqual([['R-trash', 0]]) // no hit, nothing learned
+    expect(await getConversationMemory()).toEqual({})
+    expect(await getSubjectMemory()).toEqual({})
+    expect(await getFolderActivity()).toEqual([])
+    // Still undoable (the mail did move).
+    expect((await getUndoSnapshot())?.moves).toHaveLength(2)
+  })
+})
+
+// Item 4: live verification mapped a token outage to "can't tell" and
+// memoized it — the POST then ran and tripped the breaker a full token wait
+// late; an item already past runOne's entry check still sent its POST.
+describe('a token outage during live verification trips the breaker at once (r3 item 4)', () => {
+  async function seedOldCache() {
+    await setFolderCache({
+      updatedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+      tree: tree(),
+      wellKnown: { complete: true, roots: [{ id: TRASH, role: 'deleteditems' }] },
+    })
+  }
+  const outage = () => new OutlookTokenUnavailableError('Outlook 分頁沒有回應', 'TAB_UNREACHABLE')
+
+  it('no POST goes out — not for that folder, not for an item already past the guard', async () => {
+    await seedOldCache()
+    let releaseA: () => void = () => {}
+    const gateA = new Promise<void>((r) => (releaseA = r))
+    const getFolder = vi.fn(async (id: string) => {
+      if (id === B) throw outage()
+      if (id === A) await gateA // still verifying when B trips the breaker
+      return { Id: id, DisplayName: 'x', ParentFolderId: id === CASES ? ROOT : CASES }
+    })
+    const api = { ...fakeApi(), getFolder }
+    const run = startExecute([moveRow('e1', A), moveRow('e2', B), moveRow('e3', B)], tree(), asApi(api))
+    await vi.waitFor(async () => expect((await getExecuteState())?.results[1]?.status).toBe('error'))
+    releaseA()
+    await run
+    const s = await finalState()
+    expect(s.results.map((r) => r.status)).toEqual(['error', 'error', 'error'])
+    expect(new Set(s.results.map((r) => r.message)).size).toBe(1)
+    expect(s.results[0]!.message).toContain('無法取得 Outlook 授權')
+    expect(api.moveMessage).not.toHaveBeenCalled()
+    expect(getFolder.mock.calls.filter((c) => c[0] === B)).toHaveLength(1) // memoized rejection
+  })
+})
+
+// Item 7: a failed start had already dismissed the previous batch's 撤回 and
+// (for 重試) wiped its failed rows, while the message said to try again.
+describe('a start whose first write fails leaves the previous batch alone (r3 item 7)', () => {
+  let restore: (() => void) | null = null
+  afterEach(() => restore?.())
+  function failStateWrites() {
+    const sessionSet = chrome.storage.session.set as unknown as Mock
+    const original = sessionSet.getMockImplementation()!
+    sessionSet.mockImplementation(async (items: Record<string, unknown>) => {
+      if ('executeState' in items) throw new Error('QUOTA_BYTES quota exceeded')
+      return original(items)
+    })
+    restore = () => sessionSet.mockImplementation(original)
+  }
+
+  it('the previous batch’s 撤回 survives a failed start', async () => {
+    await startExecute([moveRow('e1', A)], tree(), asApi(fakeApi()))
+    expect(await getUndoSnapshot()).toBeTruthy()
+    failStateWrites()
+    await expect(launchExecute([moveRow('e2', B)], tree(), asApi(fakeApi()))).rejects.toBeInstanceOf(ExecuteStartError)
+    expect(await getUndoSnapshot()).toBeTruthy()
+  })
+
+  it('a failed 重試 start keeps the failed rows, so 重試 can be pressed again', async () => {
+    const api = fakeApi()
+    api.moveMessage.mockRejectedValueOnce(new OutlookError(403, 'denied'))
+    await startExecute([moveRow('e1', A), moveRow('e2', B)], tree(), asApi(api))
+    failStateWrites()
+    const r = await startRetryFailed(asApi(api), async () => tree())
+    expect(r).toMatchObject({ ok: false, code: 'EXECUTE_START_FAILED' })
+    expect(r.ok ? '' : r.message).toContain('請再試一次')
+    const prev = await finalState()
+    expect(prev.results.map((x) => x.status)).toEqual(['error', 'moved'])
+    restore!()
+    restore = null
+    expect(await startRetryFailed(asApi(api), async () => tree())).toEqual({ ok: true, started: 1 })
+    expect((await waitIdle()).summary.moved).toBe(1)
+  })
+})
+
+// Item 9: auto-trash rule hits are delete rows now (preflight); execute must
+// count their hit, and 撤回 must count against the rule — and nothing else
+// (H2: a delete taught nothing).
+describe('a rule-routed delete (auto-trash rule) (r3 item 9)', () => {
+  function trashRule(): Rule {
+    return {
+      ...newRule({ type: 'sender', signal: 'spam@x.example', targetFolderId: TRASH, targetFolderPath: '刪除的郵件', confidence: 0.75, source: 'user_manual' }),
+      id: 'R-trash',
+    }
+  }
+  const deleteRow = (id: string): PlanItem => ({
+    ...moveRow(id, A),
+    action: 'delete',
+    targetFolderId: undefined,
+    targetFolderPath: undefined,
+    source: 'rule',
+    ruleId: 'R-trash',
+    originalRuleId: 'R-trash',
+    conversationId: `conv-${id}`,
+  })
+
+  it('counts the rule hit, and its 撤回 entry carries the rule', async () => {
+    await setRules([trashRule()])
+    await startExecute([deleteRow('e1')], tree(), asApi(fakeApi()))
+    expect((await finalState()).results[0]!.status).toBe('deleted')
+    expect((await listRules())[0]!.matchCount).toBe(1)
+    expect((await getUndoSnapshot())?.moves).toEqual([
+      expect.objectContaining({ newMessageId: 'del-e1', deleted: true, ruleId: 'R-trash' }),
+    ])
+  })
+
+  it('撤回 counts as an override against the auto-trash rule — and teaches nothing else', async () => {
+    await setRules([trashRule()])
+    const api = fakeApi()
+    await startExecute([deleteRow('e1')], tree(), asApi(api))
+    expect(await executeUndo(asApi(api))).toMatchObject({ restored: 1 })
+    const [r] = await listRules()
+    expect(r!.overrideCount).toBe(1)
+    expect(r!.enabled).toBe(true)
+    expect(await getConversationMemory()).toEqual({})
   })
 })

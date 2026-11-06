@@ -10,6 +10,9 @@
 // Item 16 — runSweep does dedupe + closed-case retire/purge + stale in ONE
 //           rules transaction: ≤ 1 write (so ≤ 1 sync push) per sweep.
 // Item 10 — a malformed compound no longer aborts the sweep.
+// B9 (2026-11-06) — canonical dedupe must not let a DISABLED user_manual
+//           spelling absorb the ENABLED differently-spelled twin that was
+//           routing the case.
 
 import { describe, expect, it } from 'vitest'
 import { generateAiOverrideRules } from '@/background/execute'
@@ -22,14 +25,21 @@ import {
   filterByTombstones,
   findConflicts,
   listRules,
+  matchEmail,
   newRule,
   normalizeSignal,
   runRuleSweepPass,
   tombstoneKey,
   upsertRule,
 } from '@/shared/rules'
-import { addRuleTombstones, getRuleTombstones, setRules, setSettings } from '@/shared/storage'
-import type { PlanItem, Rule } from '@/shared/types'
+import {
+  addRuleTombstones,
+  getRuleTombstones,
+  setRuleCounterBaseline,
+  setRules,
+  setSettings,
+} from '@/shared/storage'
+import type { Email, PlanItem, Rule } from '@/shared/types'
 import { dailyActiveDays } from './helpers/active-days'
 
 const FID = 'AAMkADcwMWM5ZTE4LWYwZWMtNGUxYS1hZGMwLTdhNGE3'
@@ -74,6 +84,18 @@ describe('dedupe merges usage history into the survivor (item 9)', () => {
     expect(kept!.createdAt).toBe('2026-01-05T00:00:00.000Z')
   })
 
+  it('counters come from the newest accuracy window (statsResetAt) — a revive is not undone by a twin', async () => {
+    const revived = rule({ matchCount: 1, overrideCount: 0, statsResetAt: Date.parse('2026-11-05T00:00:00.000Z') })
+    const oldTwin = rule({ matchCount: 10, overrideCount: 15, lastUsedAt: '2026-10-01T00:00:00.000Z' })
+    await setRules([oldTwin, revived])
+    await dedupeRulesByKey()
+    const [kept] = await listRules()
+    expect(kept!.matchCount).toBe(1)
+    expect(kept!.overrideCount).toBe(0)
+    expect(kept!.statsResetAt).toBe(Date.parse('2026-11-05T00:00:00.000Z'))
+    expect(kept!.lastUsedAt).toBe('2026-10-01T00:00:00.000Z') // usage history still merges
+  })
+
   it('repro: the merged survivor is no longer stale-swept right after dedupe', async () => {
     const now = Date.parse('2026-11-20T03:00:00.000Z')
     const staleTwin = rule({ matchCount: 9, lastUsedAt: new Date(now - 150 * DAY).toISOString() })
@@ -83,6 +105,48 @@ describe('dedupe merges usage history into the survivor (item 9)', () => {
     const report = await autoDisableStaleRules({ now, activeDays: dailyActiveDays(now, 200) })
     expect(report.byReason.stale).toBe(0) // was 1: the survivor kept the 150-day-old lastUsedAt
     expect(await listRules()).toHaveLength(1)
+  })
+
+  // B9 (2026-11-06): canonical keys group spellings older builds kept apart.
+  it('a DISABLED user_manual full-form rule never absorbs the ENABLED compact twin that routes the case', async () => {
+    const userOff = rule({
+      type: 'subject_keyword',
+      signal: '112年度訴字第304號',
+      source: 'user_manual',
+      enabled: false,
+    })
+    const routing = rule({ type: 'subject_keyword', signal: '112訴304', matchCount: 7 })
+    const routingCopy = rule({ type: 'subject_keyword', signal: '112訴304', matchCount: 2, overrideCount: 3 })
+    await setRules([userOff, routing, routingCopy])
+    expect(await dedupeRulesByKey()).toEqual({ removed: 1, groupsAffected: 1 })
+    const after = await listRules()
+    expect(after.map((r) => r.id).sort()).toEqual([userOff.id, routing.id].sort()) // F8: the user rule stays
+    const twin = after.find((r) => r.id === routing.id)!
+    expect(twin).toMatchObject({ enabled: true, matchCount: 7, overrideCount: 3 }) // absorbs its own spelling group
+    // …so the case keeps routing (it silently stopped before).
+    const out = matchEmail(
+      {
+        Id: 'm1',
+        Subject: '臺北地院 112年度訴字第304號 開庭通知',
+        BodyPreview: '',
+        From: { EmailAddress: { Address: 'clerk@court.example' } },
+        ToRecipients: [],
+        ReceivedDateTime: '2026-11-01T00:00:00Z',
+        ParentFolderId: 'inbox',
+      } as Email,
+      after,
+    )
+    expect(out?.rule.id).toBe(routing.id)
+    // Stable: the next sweep's dedupe changes nothing.
+    expect(await dedupeRulesByKey()).toEqual({ removed: 0, groupsAffected: 0 })
+  })
+
+  it('F8 unchanged for an identically-spelled twin: the disabled user_manual rule wins', async () => {
+    const userOff = rule({ type: 'subject_keyword', signal: '112訴304', source: 'user_manual', enabled: false })
+    const auto = rule({ type: 'subject_keyword', signal: '112訴304', matchCount: 7 })
+    await setRules([userOff, auto])
+    await dedupeRulesByKey()
+    expect((await listRules()).map((r) => r.id)).toEqual([userOff.id])
   })
 
   it('duplicate ids across triples: the losing copy is still removed', async () => {
@@ -186,6 +250,10 @@ describe('runSweep is one rules transaction (item 16)', () => {
     // closedCasePrefixes must be a subset of excludeFolderPrefixes — storage
     // enforces that invariant on every read/write since 2026-11-05.
     await setSettings({ excludeFolderPrefixes: ['05已完成案件'], closedCasePrefixes: ['05已完成案件'] })
+    // This machine's counter baseline predates every rule below (2026-11-06),
+    // so their whole records count — without it the first sweep would start
+    // one and judge them only on later fires (tests/counter-baseline.test.ts).
+    await setRuleCounterBaseline({ capturedAt: '2025-12-01T00:00:00.000Z', counts: {} })
     const dupA = rule({ signal: 'dup.example', matchCount: 1, lastUsedAt: new Date(now - DAY).toISOString() })
     const dupB = rule({ signal: 'dup.example', matchCount: 1, lastUsedAt: new Date(now - DAY).toISOString() })
     const toRetire = rule({ signal: 'archived.example', targetFolderPath: '05已完成案件/某案' })
@@ -247,5 +315,59 @@ describe('runSweep is one rules transaction (item 16)', () => {
     const report = await autoDisableStaleRules({ now, activeDays: dailyActiveDays(now, 200) })
     expect(report.byReason.stale).toBe(1)
     expect((await listRules()).map((r) => r.id)).toEqual([broken.id])
+  })
+})
+
+// 2026-11-06: the parser read 「113年度第1次董事會議程」 as court case 「113度1」
+// and the learners minted case rules on it. The fixed parser no longer
+// matches them, but left enabled such a compound still looked like a free-
+// text "narrowing" of the client (it kept the client's broad rule from being
+// learned or revived). The sweep removes them, like other dead rules.
+describe('rules learned on a 年度 pseudo case number are purged by the sweep', () => {
+  const pseudoCompound = (over: Partial<Rule> = {}) =>
+    rule({
+      id: 'pseudo-compound',
+      type: 'compound',
+      signal: encodeCompound([
+        { type: 'domain', value: 'client.example' },
+        { type: 'subject_keyword', value: '113度1' },
+      ]),
+      targetFolderPath: '03/董事會',
+      matchCount: 4,
+      lastUsedAt: new Date().toISOString(),
+      ...over,
+    })
+
+  it('repro: the AUTO ones go (any state); real case rules and hand-written ones stay', async () => {
+    const realCase = rule({
+      id: 'real',
+      type: 'compound',
+      signal: encodeCompound([
+        { type: 'domain', value: 'client.example' },
+        { type: 'subject_keyword', value: '112訴304' },
+      ]),
+      lastUsedAt: new Date().toISOString(),
+    })
+    const pseudoSubject = rule({ id: 'pseudo-subject', type: 'subject_keyword', signal: '１１３度２', source: 'ai_overridden' })
+    const dormantPseudo = pseudoCompound({
+      id: 'pseudo-dormant',
+      targetFolderPath: '03/股東會',
+      enabled: false,
+      autoDisabledReason: 'override',
+      autoDisabledAt: '2026-11-01T00:00:00.000Z',
+    })
+    const mine = rule({ id: 'mine', type: 'subject_keyword', signal: '113度1', source: 'user_manual' })
+    await setRules([pseudoCompound(), realCase, pseudoSubject, dormantPseudo, mine])
+    const report = await runRuleSweepPass({})
+    expect(report.pseudoCasePurged).toBe(3)
+    expect((await listRules()).map((r) => r.id).sort()).toEqual(['mine', 'real'])
+    // A matching 「113年度第1期財報」 no longer reaches the board folder through it.
+    expect(matchEmail({ Id: 'm', Subject: '113年度第1期財報', BodyPreview: '', From: { EmailAddress: { Address: 'ir@client.example' } } } as Email, await listRules())).toBeNull()
+  })
+
+  it('the daily sweep counts them with the dead rules it deleted', async () => {
+    await setRules([pseudoCompound()])
+    expect((await runSweep({ force: true })).staleDeletedCount).toBe(1)
+    expect(await listRules()).toEqual([])
   })
 })

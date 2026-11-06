@@ -209,6 +209,17 @@ describe('buildEmailBlock', () => {
     expect(block).toMatch(/識別碼:.*112訴204/)
   })
 
+  // 2026-11-06: the hint uses the same extractor — a 年度 period / meeting /
+  // session number is no court case (字 is required before 第, and 度 is no
+  // case type), so the AI isn't told one is there.
+  it('surfaces no case number for 年度 period / meeting numbers', () => {
+    const block = buildEmailBlock([
+      email({ Id: 'e1', Subject: '113年度財報第1季', BodyPreview: '113年度第1次董事會議程如附件' }),
+      email({ Id: 'e2', Subject: '113年度上午第1次全體會議' }),
+    ])
+    expect(block).not.toContain('識別碼')
+  })
+
   it('detects a case number from the body preview when the subject has none', () => {
     const block = buildEmailBlock([
       email({ Id: 'e', Subject: '開庭通知', BodyPreview: '案號 112訴204 敬請出席' }),
@@ -598,6 +609,33 @@ describe('buildEmailBlock subject truncation', () => {
 // tests/exemplars.test.ts; here we verify the GATE actually omits the
 // examples block from the outgoing request body when the flag is off.
 
+// Folders the prompt fixtures' rules and hints point at. Exemplars, the case
+// map and the active-folders hint only name folders the AI is offered
+// (2026-11-06 r2), so those targets must exist in the tree.
+function promptTree(): MailFolderNode[] {
+  const leaf = (id: string, path: string): MailFolderNode => ({
+    id,
+    displayName: path.split('/').pop()!,
+    path,
+    children: [],
+  })
+  return [
+    ...tree(),
+    {
+      id: 'f3',
+      displayName: '03',
+      path: '03',
+      children: [
+        { ...leaf('f3c', '03/案件'), children: [leaf('f3c1', '03/案件/敏感客戶')] },
+        leaf('f3a', '03/甲案'),
+        leaf('f3b', '03/乙案'),
+        leaf('f3d', '03/丙案'),
+        leaf('f3e', '03/丁案'),
+      ],
+    },
+  ]
+}
+
 const exemplarRule = (overrides: Partial<Rule> = {}): Rule => ({
   id: 'r-' + Math.random().toString(36).slice(2),
   type: 'domain',
@@ -636,6 +674,7 @@ describe('classifyBatch exemplars opt-out', () => {
   async function captureRequestBody(
     settings: Settings,
     rules: Rule[],
+    folderTree: MailFolderNode[] = tree(),
   ): Promise<string> {
     let capturedBody = ''
     vi.stubGlobal(
@@ -654,7 +693,7 @@ describe('classifyBatch exemplars opt-out', () => {
             From: { EmailAddress: { Address: 'x@y.com' } },
           } as Email,
         ],
-        folderTree: tree(),
+        folderTree,
         excludePrefixes: [],
         rules,
       },
@@ -682,7 +721,7 @@ describe('classifyBatch exemplars opt-out', () => {
       claudeApiKey: 'sk-ant-test',
       aiIncludeFewShotExamples: true,
     }
-    const body = await captureRequestBody(settings, [exemplarRule()])
+    const body = await captureRequestBody(settings, [exemplarRule()], promptTree())
     // With the flag on AND a high-confidence high-matchCount user_manual
     // rule (qualifies for selectExemplars), the target path SHOULD be
     // in the request body.
@@ -738,7 +777,7 @@ describe('classifyBatch batch-2 prompt wiring', () => {
             From: { EmailAddress: { Address: 'court@example.gov' } },
           } as Email,
         ],
-        folderTree: tree(),
+        folderTree: promptTree(),
         excludePrefixes: [],
         // A court-case subject rule so buildCaseMapBlock emits a row.
         rules: [

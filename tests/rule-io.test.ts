@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyImport,
+  applyImportTakeovers,
   parseRulesPayload,
   previewImport,
   RULE_PAYLOAD_TYPE,
@@ -345,10 +346,61 @@ describe('import merge keys on id, then the canonical triple (item 11)', () => {
     expect(applyImport(existing, imported, 'merge')).toHaveLength(1)
   })
 
-  it('a same-signal rule for a DIFFERENT target is a distinct rule and is added', () => {
-    const existing = [rule({ signal: 'client.example', targetFolderPath: 'X/A' })]
-    const imported = [rule({ signal: 'client.example', targetFolderPath: 'X/B' })]
-    expect(applyImport(existing, imported, 'merge')).toHaveLength(2)
+  // B8 (2026-11-06) — this used to assert the opposite: keying the merge on
+  // the target added the backup's old mapping next to the one the user
+  // replaced it with (a conflict, and the replaced mapping came back).
+  it('a same-signal rule for a DIFFERENT target is skipped (and reported as a conflict)', () => {
+    const existing = [rule({ signal: 'client.example', targetFolderPath: 'X/B' })]
+    const imported = [
+      rule({ signal: ' @Client.Example ', targetFolderPath: 'X/A' }), // the replaced mapping
+      rule({ signal: 'other.example', targetFolderPath: 'X/A' }),
+    ]
+    const merged = applyImport(existing, imported, 'merge')
+    expect(merged.map((r) => `${r.signal}→${r.targetFolderPath}`)).toEqual([
+      'client.example→X/B',
+      'other.example→X/A',
+    ])
+    expect(previewImport(existing, imported)).toMatchObject({
+      duplicateCount: 1,
+      conflictCount: 1,
+      newCount: 1,
+    })
+  })
+
+  // R5 (2026-11-06) narrowed this: it used to assert that a disabled local
+  // rule also blocks imported USER_MANUAL rules. It still blocks imported
+  // auto rules (the dormant mapping must not come back through a file)…
+  it('a disabled local rule for the signal still blocks imported AUTO rules; same-target duplicates are not conflicts', () => {
+    const existing = [rule({ signal: 'client.example', targetFolderPath: 'X/B', enabled: false })]
+    const imported = [
+      rule({ signal: 'client.example', targetFolderPath: 'X/A', source: 'ai_confirmed' }),
+      rule({ signal: 'client.example', targetFolderPath: 'X/B', source: 'ai_confirmed' }),
+    ]
+    expect(applyImport(existing, imported, 'merge')).toEqual(existing)
+    expect(previewImport(existing, imported)).toMatchObject({ duplicateCount: 2, conflictCount: 1 })
+  })
+
+  // …but an imported user_manual rule comes in over a switched-off local one.
+  it('an imported user_manual rule is added over a DISABLED local rule for its signal (R5)', () => {
+    const existing = [rule({ signal: 'client.example', targetFolderPath: 'X/B', enabled: false })]
+    const imported = [rule({ signal: 'client.example', targetFolderPath: 'X/A' })]
+    const merged = applyImport(existing, imported, 'merge')
+    expect(merged.map((r) => `${r.enabled}:${r.targetFolderPath}`)).toEqual(['false:X/B', 'true:X/A'])
+    expect(previewImport(existing, imported)).toMatchObject({
+      duplicateCount: 0,
+      newCount: 1,
+      replaceCount: 1,
+      supersedeCount: 0,
+    })
+  })
+
+  it("within the file itself, only exact (signal, target) duplicates collapse", () => {
+    const imported = [
+      rule({ signal: 'client.example', targetFolderPath: 'X/A' }),
+      rule({ signal: 'client.example', targetFolderPath: 'X/A' }),
+      rule({ signal: 'client.example', targetFolderPath: 'X/B' }),
+    ]
+    expect(applyImport([], imported, 'merge').map((r) => r.targetFolderPath)).toEqual(['X/A', 'X/B'])
   })
 
   it('duplicate ids inside the file collapse to the first copy (merge and replace)', () => {
@@ -356,6 +408,100 @@ describe('import merge keys on id, then the canonical triple (item 11)', () => {
     const b = rule({ id: 'dup', signal: 'b.com' })
     expect(applyImport([], [a, b], 'merge').map((r) => r.signal)).toEqual(['a.com'])
     expect(applyImport([], [a, b], 'replace').map((r) => r.signal)).toEqual(['a.com'])
+  })
+})
+
+// R5 (2026-11-06): B8 let ANY stored rule for the signal win, so an imported
+// user_manual rule lost to an auto_scan one (or a switched-off one) and the
+// user's hand-written mapping never arrived.
+describe('import merge honours source priority (R5)', () => {
+  const NOW = '2026-11-06T00:00:00.000Z'
+  // Round 3: the takeovers moved out of applyImport into applyImportTakeovers,
+  // which runs on the RECONCILED library (here: nothing orphaned unless the
+  // test marks it). The tests below used to call applyImport alone.
+  const mergeWithTakeovers = (existing: Rule[], imported: Rule[], reconcile = (rs: Rule[]) => rs) =>
+    applyImportTakeovers(existing, imported, reconcile(applyImport(existing, imported, 'merge')), NOW).next
+
+  it('repro: an imported user_manual rule takes the signal over from a local auto rule pointing elsewhere', () => {
+    const local = rule({ id: 'scan', source: 'auto_scan', signal: 'client.example', targetFolderPath: 'X/Old' })
+    const imported = rule({ id: 'mine', signal: 'client.example', targetFolderPath: 'X/New' })
+    const merged = mergeWithTakeovers([local], [imported])
+    expect(merged).toHaveLength(2) // was 1: the import was skipped
+    expect(merged.find((r) => r.id === 'mine')).toMatchObject({ enabled: true, source: 'user_manual' })
+    // No two live rules routing one signal apart: the auto one steps aside.
+    expect(merged.find((r) => r.id === 'scan')).toMatchObject({
+      enabled: false,
+      autoDisabledReason: 'superseded',
+      autoDisabledAt: NOW,
+    })
+    expect(previewImport([local], [imported])).toMatchObject({
+      newCount: 1,
+      duplicateCount: 0,
+      conflictCount: 0,
+      replaceCount: 1,
+      supersedeCount: 1,
+    })
+  })
+
+  it('a same-target lower-priority local rule is left for dedupe (not switched off)', () => {
+    const local = rule({ id: 'ai', source: 'ai_confirmed', signal: 'client.example', targetFolderPath: 'X/A' })
+    const imported = rule({ id: 'mine', signal: 'client.example', targetFolderPath: 'X/A' })
+    const merged = mergeWithTakeovers([local], [imported])
+    expect(merged.map((r) => `${r.id}:${r.enabled}`)).toEqual(['ai:true', 'mine:true'])
+    expect(previewImport([local], [imported])).toMatchObject({ replaceCount: 1, supersedeCount: 0 })
+  })
+
+  it('priority runs user_manual > ai_overridden > ai_confirmed > auto_scan; equal or higher local priority still wins', () => {
+    const confirmed = rule({ id: 'c', source: 'ai_confirmed', signal: 'client.example', targetFolderPath: 'X/A' })
+    const overridden = rule({ id: 'o', source: 'ai_overridden', signal: 'client.example', targetFolderPath: 'X/B' })
+    // Higher imported priority → in, the local one superseded.
+    expect(mergeWithTakeovers([confirmed], [overridden]).map((r) => `${r.id}:${r.enabled}`)).toEqual([
+      'c:false',
+      'o:true',
+    ])
+    // Lower / equal imported priority → skipped as a conflict.
+    expect(previewImport([overridden], [confirmed])).toMatchObject({ newCount: 0, conflictCount: 1 })
+    const twin = rule({ id: 'c2', source: 'ai_confirmed', signal: 'client.example', targetFolderPath: 'X/B' })
+    expect(previewImport([confirmed], [twin])).toMatchObject({ newCount: 0, conflictCount: 1 })
+    // A local user_manual rule beats every imported auto rule.
+    const manual = rule({ id: 'm', signal: 'client.example', targetFolderPath: 'X/M' })
+    expect(mergeWithTakeovers([manual], [overridden])).toEqual([manual])
+  })
+
+  it('a local user_manual rule is never switched off, and a disabled import displaces nothing', () => {
+    const orphanedManual = rule({ id: 'm', signal: 'client.example', targetFolderPath: 'X/Gone', orphaned: true })
+    const imported = rule({ id: 'mine', signal: 'client.example', targetFolderPath: 'X/New' })
+    const merged = mergeWithTakeovers([orphanedManual], [imported])
+    expect(merged[0]).toEqual(orphanedManual) // in, but the stored hand-written rule is untouched
+    expect(merged).toHaveLength(2)
+
+    const local = rule({ id: 'scan', source: 'auto_scan', signal: 'other.example', targetFolderPath: 'X/Old' })
+    const off = rule({ id: 'off', signal: 'other.example', targetFolderPath: 'X/New', enabled: false })
+    const merged2 = mergeWithTakeovers([local], [off])
+    expect(merged2.map((r) => `${r.id}:${r.enabled}`)).toEqual(['scan:true', 'off:false'])
+    expect(previewImport([local], [off])).toMatchObject({ replaceCount: 1, supersedeCount: 0 })
+  })
+
+  // Round 3: decided before the reconcile, the takeover switched off a
+  // working local rule for an imported one whose folder no longer exists.
+  it('repro: no takeover once the reconcile finds the imported rule\'s folder gone', () => {
+    const local = rule({ id: 'scan', source: 'auto_scan', signal: 'client.example', targetFolderPath: 'X/Old' })
+    const imported = rule({ id: 'mine', signal: 'client.example', targetFolderPath: 'X/Gone' })
+    const orphanImported = (rs: Rule[]) => rs.map((r) => (r.id === 'mine' ? { ...r, orphaned: true } : r))
+    const merged = mergeWithTakeovers([local], [imported], orphanImported)
+    expect(merged.map((r) => [r.id, r.enabled, !!r.orphaned, r.autoDisabledReason ?? null])).toEqual([
+      ['scan', true, false, null], // was ['scan', false, false, 'superseded']
+      ['mine', true, true, null],
+    ])
+  })
+
+  it('nor of a local rule the reconcile orphaned, nor when the reconcile put both in one folder', () => {
+    const local = rule({ id: 'scan', source: 'auto_scan', signal: 'client.example', targetFolderPath: 'X/Old' })
+    const imported = rule({ id: 'mine', signal: 'client.example', targetFolderPath: 'X/New' })
+    const orphanLocal = (rs: Rule[]) => rs.map((r) => (r.id === 'scan' ? { ...r, orphaned: true } : r))
+    expect(mergeWithTakeovers([local], [imported], orphanLocal).find((r) => r.id === 'scan')?.enabled).toBe(true)
+    const samePath = (rs: Rule[]) => rs.map((r) => ({ ...r, targetFolderPath: 'X/Renamed' }))
+    expect(mergeWithTakeovers([local], [imported], samePath).find((r) => r.id === 'scan')?.enabled).toBe(true)
   })
 })
 

@@ -12,8 +12,11 @@
 // boundary; the dispatcher reads as routing, not implementation.
 
 import {
+  backupLabel,
+  beginSyncParticipation,
   clearCloudState,
   dismissSyncError,
+  flushPendingPush,
   getSyncStatus,
   listBackups,
   pullNow,
@@ -49,7 +52,10 @@ function describeEnableFailure(kind: 'pull' | 'push', reason: string | undefined
     )
   }
   if (/incomplete/i.test(r)) {
-    return '雲端資料正在由另一台機器上傳中、尚未完整。請稍候幾秒再按一次「啟用同步」。'
+    return (
+      '雲端資料正在由另一台機器上傳中、尚未完整。請稍候幾秒再按一次「啟用同步」。' +
+      '若一分鐘後仍是如此(上傳的機器已離線),再按一次即會先備份這台機器的資料、再以它修復雲端資料。'
+    )
   }
   return `${kind === 'pull' ? '下載失敗' : '上傳失敗'}:${r}`
 }
@@ -67,9 +73,25 @@ function describeEnableFailure(kind: 'pull' | 'push', reason: string | undefined
  *
  * Bug #M: surface real failure. If pull or push-back fails, roll back
  * syncEnabled and return ok:false — otherwise the UI would show "啟用
- * 成功" green while sync is actually broken.
+ * 成功" green while sync is actually broken. The rollback also resets the
+ * v4 participation (S6, 2026-11-06): a pull that succeeded before the
+ * push-back failed left this machine participating, so the next enable's
+ * beginSyncParticipation was a no-op and a wipe issued in between was
+ * APPLIED instead of recorded.
+ *
+ * S7 (2026-11-06): a cloud that stays torn (its pusher went away mid-push)
+ * used to fail every enable — and with no participating machine left to
+ * repair it, no machine could ever join. A still-torn pull now falls through
+ * to a push, which rewrites the cloud from local once tornRecoveryAllowed
+ * holds (same torn pushId for ≥ 3 reads over ≥ 1 min; repeated enable
+ * attempts accumulate it), after a 'torn-recovery' backup and never over an
+ * unseen wipe of a participating machine.
  */
 export async function handleEnableSync(): Promise<PopupResponse> {
+  // Participation starts NOW (2026-11-06): a machine that switched sync off
+  // under v1.0.7 has no v4 state and a stale lastSyncAt, which used to make
+  // this enable apply a wipe issued while it was away.
+  await beginSyncParticipation()
   await setSettings({ syncEnabled: true })
   const status = await getSyncStatus()
   let action: 'push' | 'pull' | 'union-merge' = 'push'
@@ -92,6 +114,13 @@ export async function handleEnableSync(): Promise<PopupResponse> {
       // Don't attempt push-back if the pull itself failed — we'd be
       // pushing pre-merge local state which could lose data.
       push = await pushNow('first-enable-push-back')
+    } else if (pull.torn) {
+      // Still torn (S7): the push path's own pull-before-push decides — it
+      // rewrites the cloud only when the torn-cloud recovery is allowed
+      // (backup first), otherwise it fails like the pull did.
+      action = 'push'
+      push = await pushNow('first-enable-torn-recovery')
+      if (push.pushed) pull = undefined
     }
   } else {
     push = await pushNow('first-enable')
@@ -103,8 +132,10 @@ export async function handleEnableSync(): Promise<PopupResponse> {
   if (!ok) {
     // Roll back the syncEnabled flip — sync didn't actually start, so
     // leaving syncEnabled=true would mean every subsequent local
-    // mutation schedules a doomed push.
+    // mutation schedules a doomed push — and the participation a pull may
+    // already have started (S6), keeping the torn-read streak (S7).
     await setSettings({ syncEnabled: false })
+    await resetSyncParticipation({ keepTornStreak: true })
     const reason =
       pull && !pull.pulled
         ? describeEnableFailure('pull', pull.reason)
@@ -135,6 +166,14 @@ export async function handleDisableSync(msg: {
   keepCloud?: boolean
 }): Promise<PopupResponse> {
   const keepCloud = msg.keepCloud !== false
+  if (keepCloud) {
+    // Counter-only changes may still be waiting for their coalesced push
+    // (2026-11-06) — write them while sync is still on. Best effort: a
+    // failing push must not block switching sync off.
+    await flushPendingPush('pre-disable').catch((e) =>
+      console.warn('[mail-organizer] flush before disabling sync failed (non-fatal)', e),
+    )
+  }
   await setSettings({ syncEnabled: false })
   // Re-enabling later must count as FIRST participation (2026-11-05): a wipe
   // marker still in the cloud then is recorded as seen, never applied to the
@@ -174,6 +213,9 @@ export async function handleListSyncBackups(): Promise<PopupResponse> {
     snapshotAt: b.snapshotAt,
     direction: b.direction,
     trigger: b.trigger,
+    // User-facing name (2026-11-06), e.g. 「升級同步格式前」 for the pinned
+    // snapshot taken before an upgraded machine's first v4 merge.
+    label: backupLabel(b),
     pinned: b.pinned === true,
     ruleCount: Array.isArray(b.payload?.rules) ? b.payload.rules.length : 0,
     tombstoneCount: Array.isArray(b.payload?.tombstones) ? b.payload.tombstones.length : 0,

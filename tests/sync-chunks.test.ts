@@ -321,10 +321,17 @@ describe('Item 13b: one-pass planner', () => {
   })
 
   it('disabled rules ride as stubs when their full rows do not fit', () => {
+    // Recently disabled (editedAt now) — only those get a guaranteed stub
+    // since 2026-11-06 (see the A7 tests below).
     const rules = [
       ...Array.from({ length: 500 }, (_, i) => caseRule(i)),
       ...Array.from({ length: 30 }, (_, i) =>
-        caseRule(900 + i, { enabled: false, autoDisabledReason: 'stale', autoDisabledAt: '2026-10-01T00:00:00.000Z' }),
+        caseRule(900 + i, {
+          enabled: false,
+          autoDisabledReason: 'stale',
+          autoDisabledAt: '2026-10-01T00:00:00.000Z',
+          editedAt: Date.now(),
+        }),
       ),
     ]
     const p = plan({ rules })

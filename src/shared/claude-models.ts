@@ -136,3 +136,37 @@ export function familyFallbackModel(id: string | null | undefined): ClaudeModelI
         'sonnet'
   return CLAUDE_MODELS.find((x) => x.family === family && !x.legacy)!
 }
+
+/**
+ * Models that can SERVE a classify request without being selectable here
+ * (2026-11-06): server-side refusal fallback (`fallbacks: "default"`) re-runs
+ * a declined Sonnet 5.5 request on Claude Sonnet 5, and a declined Opus 5.5
+ * request on Claude Opus 5 / Opus 4.8 — at THOSE models' rates. Price-only:
+ * not in CLAUDE_MODELS, so never offered in the picker or accepted as a
+ * setting.
+ */
+const SERVING_ONLY_PRICES: Readonly<Record<string, ClaudeModelPrice>> = {
+  'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.2, cacheWrite1h: 4 },
+  'claude-opus-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite1h: 10 },
+  'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.5, cacheWrite1h: 10 },
+}
+
+function exactPrice(id: string): ClaudeModelPrice | undefined {
+  return findClaudeModel(id)?.price ?? SERVING_ONLY_PRICES[id]
+}
+
+/**
+ * List price of the model that ran a request. Exact id first; then the
+ * longest known id the given one extends (`<id>-<suffix>`, e.g. a dated
+ * snapshot id); then the current model of its family.
+ */
+export function claudeModelPrice(id: string | null | undefined): ClaudeModelPrice {
+  const m = (id ?? '').trim().toLowerCase()
+  const exact = m ? exactPrice(m) : undefined
+  if (exact) return exact
+  const known = [...CLAUDE_MODELS.map((x) => x.id), ...Object.keys(SERVING_ONLY_PRICES)].sort(
+    (a, b) => b.length - a.length,
+  )
+  const base = m ? known.find((k) => m.startsWith(k + '-')) : undefined
+  return (base ? exactPrice(base) : undefined) ?? familyFallbackModel(m).price
+}
