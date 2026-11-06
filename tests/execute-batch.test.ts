@@ -11,6 +11,7 @@ import {
   startExecute,
   startRetryFailed,
 } from '@/background/execute'
+import { EXECUTE_PARALLEL_ITEMS } from '@/shared/constants'
 import { OutlookError, type OutlookApi } from '@/shared/outlook-api'
 import { listRules, newRule } from '@/shared/rules'
 import {
@@ -394,34 +395,103 @@ describe('moves into Deleted Items & co. are refused (item 2)', () => {
 })
 
 describe('cancel (items 14, 18)', () => {
-  it('a POST aborted mid-flight is a soft "may have completed" row, the rest cancelled', async () => {
+  const N = EXECUTE_PARALLEL_ITEMS
+  /** Resolves once `n` moves are in flight at the same time. */
+  function inFlightBarrier(n: number) {
+    let started = 0
+    let release: () => void = () => {}
+    const all = new Promise<void>((r) => (release = r))
+    return {
+      arrive: async () => {
+        if (++started === n) release()
+        await all
+      },
+    }
+  }
+
+  it('POSTs aborted mid-flight are soft "may have completed" rows, the never-started rest cancelled', async () => {
     const api = fakeApi()
-    api.moveMessage.mockImplementationOnce(async () => {
-      void requestCancel()
-      throw new OutlookError(0, 'Cancelled while POST was in flight', undefined, true, true)
+    const barrier = inFlightBarrier(N)
+    api.moveMessage.mockImplementation(async (id: string, _dest: string, signal?: AbortSignal) => {
+      await barrier.arrive()
+      if (id === 'e1') void requestCancel()
+      // Every POST in flight was on the wire when the cancel aborted it.
+      if (signal?.aborted) {
+        throw new OutlookError(0, 'Cancelled while POST was in flight', undefined, true, true)
+      }
+      return { Id: `new-${id}`, ParentFolderId: A }
     })
-    await startExecute([moveRow('e1', A), moveRow('e2', B), moveRow('e3', B)], tree(), asApi(api))
+    const plan = Array.from({ length: N + 2 }, (_, i) => moveRow(`e${i + 1}`, i % 2 ? B : A))
+    await startExecute(plan, tree(), asApi(api))
     const s = await finalState()
-    expect(s.results[0]!.status).toBe('skipped')
+    expect(api.moveMessage).toHaveBeenCalledTimes(N) // nothing started after the cancel
+    expect(s.results.map((r) => r.status)).toEqual([
+      ...Array.from({ length: N }, () => 'skipped'),
+      'cancelled',
+      'cancelled',
+    ])
     expect(s.results[0]!.message).toContain('已取消')
-    expect(s.results.slice(1).map((r) => r.status)).toEqual(['cancelled', 'cancelled'])
+    expect(s.summary).toMatchObject({ moved: 0, skipped: N, cancelled: 2 })
     expect(s.cancelRequested).toBe(true)
   })
 
-  it('requestCancel takes effect from memory at the next item boundary', async () => {
+  it("requestCancel takes effect from memory at each worker's next item boundary", async () => {
     const api = fakeApi()
-    let calls = 0
+    const barrier = inFlightBarrier(N)
+    let cancelled = false
     api.moveMessage.mockImplementation(async (id: string) => {
-      calls++
-      if (calls === 2) void requestCancel()
+      await barrier.arrive()
+      // The cancel lands while every worker's move is committing.
+      if (!cancelled) {
+        cancelled = true
+        void requestCancel()
+      }
       return { Id: `new-${id}`, ParentFolderId: A }
     })
-    const plan = Array.from({ length: 6 }, (_, i) => moveRow(`e${i}`, A))
+    const plan = Array.from({ length: N + 3 }, (_, i) => moveRow(`e${i}`, A))
     await startExecute(plan, tree(), asApi(api))
     const s = await finalState()
-    expect(api.moveMessage).toHaveBeenCalledTimes(2)
-    expect(s.summary).toMatchObject({ moved: 2, cancelled: 4 })
+    expect(api.moveMessage).toHaveBeenCalledTimes(N)
+    expect(s.summary).toMatchObject({ moved: N, cancelled: 3 })
+    expect(s.results.slice(N).every((r) => r.status === 'cancelled')).toBe(true)
     expect(s.cancelRequested).toBe(true)
+  })
+})
+
+describe('parallel moves (2026-11-05, 放寬並加速)', () => {
+  it('runs up to EXECUTE_PARALLEL_ITEMS moves at once, after every new_folder row, rows in plan order', async () => {
+    const api = fakeApi()
+    const events: string[] = []
+    const create = api.createChildFolder.getMockImplementation()!
+    api.createChildFolder.mockImplementation(async (parent: string, name: string) => {
+      events.push('create')
+      return create(parent, name)
+    })
+    let inFlight = 0
+    let peak = 0
+    api.moveMessage.mockImplementation(async (id: string, dest: string) => {
+      events.push(`move:${id}`)
+      peak = Math.max(peak, ++inFlight)
+      await new Promise((r) => setTimeout(r, 5))
+      inFlight--
+      return { Id: `new-${id}`, ParentFolderId: dest }
+    })
+    const plan: PlanItem[] = Array.from({ length: 10 }, (_, i) => moveRow(`e${i}`, i % 2 ? B : A))
+    plan[6] = {
+      ...moveRow('e6', A),
+      action: 'new_folder',
+      targetFolderId: undefined,
+      targetFolderPath: undefined,
+      suggestedParentPath: '案件',
+      suggestedFolderName: '丙',
+    }
+    await startExecute(plan, tree(), asApi(api))
+    const s = await finalState()
+    expect(events.slice(0, 2)).toEqual(['create', 'move:e6']) // the folder row first, alone
+    expect(peak).toBe(EXECUTE_PARALLEL_ITEMS)
+    expect(s.results.map((r) => r.emailId)).toEqual(plan.map((p) => p.emailId))
+    expect(s.results.map((r) => r.status)).toEqual(plan.map((p) => (p.action === 'new_folder' ? 'folder_created' : 'moved')))
+    expect(s.summary).toMatchObject({ moved: 10, foldersCreated: 1, errors: 0, cancelled: 0 })
   })
 })
 

@@ -77,7 +77,15 @@ import {
   type PopupRequest,
   type PopupResponse,
 } from '@/shared/messages'
-import { BATCH_SIZE_MAX, BATCH_SIZE_MIN } from '@/shared/constants'
+import {
+  AI_PARALLEL_CHUNKS,
+  BATCH_SIZE_MAX,
+  BATCH_SIZE_MIN,
+  INBOX_PAGE_SIZE_MAX,
+  INBOX_PAGE_SIZE_MIN,
+  INBOX_SCAN_MAX_MESSAGES,
+  INBOX_SCAN_MIN_MESSAGES,
+} from '@/shared/constants'
 import {
   addRulesFilteringTombstones,
   applyClosedCaseRetirement,
@@ -991,8 +999,33 @@ function viewAiProgress(
 // Once the newest page was all kept or flagged mail, classify reported 0
 // emails although older mail sat right below. Follow @odata.nextLink until we
 // have batchSize eligible messages or hit a cap.
-const INBOX_SCAN_MAX_PAGES = 5
-const INBOX_SCAN_MAX_MESSAGES = 500
+// Sized from the batch (2026-11-05, 放寬並加速): pages of
+// [INBOX_PAGE_SIZE_MIN, INBOX_PAGE_SIZE_MAX] messages, total scanned = 3× the
+// batch within [INBOX_SCAN_MIN_MESSAGES, INBOX_SCAN_MAX_MESSAGES], so a
+// 500-email batch isn't cut short at a fixed 500-message / 5-page budget once
+// kept or flagged mail sits in between, and a 25-email batch still needs at
+// most ~6 calls to look 500 messages deep.
+export function inboxScanBudget(
+  batchSize: number,
+  ghosts: number,
+): { pageSize: number; maxMessages: number; maxPages: number } {
+  const pageSize = Math.min(
+    INBOX_PAGE_SIZE_MAX,
+    Math.max(INBOX_PAGE_SIZE_MIN, batchSize + Math.min(ghosts, 100)),
+  )
+  const maxMessages = Math.min(
+    INBOX_SCAN_MAX_MESSAGES,
+    Math.max(INBOX_SCAN_MIN_MESSAGES, batchSize * 3),
+  )
+  return { pageSize, maxMessages, maxPages: Math.ceil(maxMessages / pageSize) + 1 }
+}
+
+/** A batchSize from a message is clamped like the stored setting. */
+function clampBatchSize(n: unknown, fallback: number): number {
+  return typeof n === 'number' && Number.isFinite(n)
+    ? Math.max(BATCH_SIZE_MIN, Math.min(BATCH_SIZE_MAX, Math.floor(n)))
+    : fallback
+}
 
 async function scanInboxForBatch(opts: {
   batchSize: number
@@ -1008,13 +1041,19 @@ async function scanInboxForBatch(opts: {
 }> {
   // Over-fetch the first page by the ghost count (just-moved mail Outlook
   // still lists) so a fully-stale top-N can't starve the batch on its own.
-  const top = opts.batchSize + Math.min(opts.recentlyProcessed.size, 100)
+  const budget = inboxScanBudget(opts.batchSize, opts.recentlyProcessed.size)
+  const top = budget.pageSize
   const eligible: Email[] = []
   let preFilteredCount = 0
   let flaggedCount = 0
   let scanned = 0
   let pages = 0
   let nextLink: string | null = null
+  // $skip paging shifts when mail arrives between two page reads: the next
+  // page then re-lists the previous page's tail. Without this the same email
+  // could land in one batch twice (duplicate plan rows, a 404 on execute,
+  // double learning input).
+  const seen = new Set<string>()
   do {
     let page: { messages: Email[]; nextLink: string | null }
     try {
@@ -1033,6 +1072,8 @@ async function scanInboxForBatch(opts: {
     pages++
     scanned += page.messages.length
     for (const m of page.messages) {
+      if (seen.has(m.Id)) continue
+      seen.add(m.Id)
       if (opts.skipIds.has(m.Id)) {
         preFilteredCount++
         continue
@@ -1053,8 +1094,8 @@ async function scanInboxForBatch(opts: {
   } while (
     eligible.length < opts.batchSize &&
     nextLink &&
-    pages < INBOX_SCAN_MAX_PAGES &&
-    scanned < INBOX_SCAN_MAX_MESSAGES
+    pages < budget.maxPages &&
+    scanned < budget.maxMessages
   )
   return {
     eligible,
@@ -1577,8 +1618,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       // the old always-show-button behaviour.
       try {
         const settings = await getSettings()
-        const batchSize =
-          typeof msg.batchSize === 'number' ? msg.batchSize : settings.batchSize
+        const batchSize = clampBatchSize(msg.batchSize, settings.batchSize)
         // Same scan as classifyPreflight (ledgers, ghost over-fetch, paging
         // past kept / flagged mail) so the peek number predicts what classify
         // will actually act on — a peek of "0 封可處理" while older mail sat
@@ -1631,7 +1671,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
       if (!settings.claudeApiKey) {
         return { ok: false, code: 'NO_API_KEY', message: '請先到設定頁設定 Claude API key' }
       }
-      const batchSize = typeof msg.batchSize === 'number' ? msg.batchSize : settings.batchSize
+      const batchSize = clampBatchSize(msg.batchSize, settings.batchSize)
       const forceFresh = msg.forceFresh === true
 
       // Wipe any leftover state from a prior run so popup mount-time resume
@@ -2195,8 +2235,29 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             console.warn('[mail-organizer] getFolderActivity for AI hint failed', e)
           }
 
-          for (let ci = 0; ci < chunks.length; ci++) {
-            if (!ownsRun()) break
+          // Chunks run up to AI_PARALLEL_CHUNKS at a time (2026-11-05, 放寬並加速);
+          // a 500-email batch was 20 strictly sequential Claude calls. Each chunk
+          // resolves to an outcome (never rejects); outcomes merge into aiPlan
+          // strictly in chunk order, so the plan order and the progress bar
+          // (completedChunks = contiguous merged chunks) behave as before. Any
+          // 429 / 529 drops the run to one call at a time. A run-fatal error
+          // stops scheduling; chunks already in flight finish and keep their
+          // results; whatever never completed becomes `unclassified` below.
+          type ChunkOutcome =
+            | { kind: 'done'; items: PlanItem[] }
+            | { kind: 'fatal'; items: PlanItem[]; error: unknown; retriedMs: number }
+            | { kind: 'aborted' }
+          let throttled = false
+          // Cold-cache gate: one request goes first; the rest wait until its
+          // response begins streaming, the point where its prompt-cache write
+          // (system + folder tree + rules, identical for every chunk of this
+          // run) becomes readable. Without it the first wave would each pay a
+          // 1h-TTL cache write for the same prefix and read none of it.
+          let warm = false
+          let firstChunkLocalError: { code: string; message: string } | null = null
+
+          const processChunk = async (ci: number): Promise<ChunkOutcome> => {
+            const chunk = chunks[ci]!
             // Full-body fetch (batch-3): ONLY the conversation reps that
             // actually reach Claude get their UniqueBody pulled, so body case
             // numbers surface in the prompt (B3-C4) and can sink into learning
@@ -2207,7 +2268,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             // restart recovery re-runs idempotent.
             const bodyFailures: string[] = []
             await Promise.all(
-              chunks[ci]!.map(async (m) => {
+              chunk.map(async (m) => {
                 if (m.bodyText !== undefined) return
                 try {
                   m.bodyText = await api.getMessageBody(m.Id, controller.signal)
@@ -2224,13 +2285,14 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 }
               }),
             )
-            if (bodyFailures.length > 0 && ownsRun()) {
+            if (!ownsRun()) return { kind: 'aborted' }
+            if (bodyFailures.length > 0) {
               // Still fail-soft (the preview is classified instead), but no
               // longer console-only (item 15): one entry per chunk, not per
               // email, so an Outlook outage can't flood the 200-entry log.
               await logError(
                 'classify:body',
-                `正文抓取失敗 ${bodyFailures.length}/${chunks[ci]!.length} 封，改用 250 字預覽分類`,
+                `正文抓取失敗 ${bodyFailures.length}/${chunk.length} 封，改用 250 字預覽分類`,
                 {
                   chunk: ci + 1,
                   chunks: chunks.length,
@@ -2248,7 +2310,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
             // first + structural-only gating lives in matchBodyCaseWithIndex.
             const aiReps: Email[] = []
             const bodyRouted: PlanItem[] = []
-            for (const m of chunks[ci]!) {
+            for (const m of chunk) {
               const bodyOutcome = matchBodyCaseWithIndex(m, aiRuleIndex)
               if (!bodyOutcome) {
                 aiReps.push(m)
@@ -2284,9 +2346,8 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 for (const sib of sibs) bodyRouted.push(inheritPlanItemForSibling(repItem, sib))
               }
             }
-            if (bodyRouted.length) aiPlan = [...aiPlan, ...bodyRouted]
             // Ownership re-check right before spending tokens (item 1).
-            if (!ownsRun()) break
+            if (!ownsRun()) return { kind: 'aborted' }
             let retriedMs = 0
             try {
               // Only the still-unmatched reps hit Claude; classifyBatch returns
@@ -2303,12 +2364,15 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                       recentFolders,
                     },
                     settings,
-                    { signal: controller.signal },
+                    { signal: controller.signal, onResponseStart: () => markWarm() },
                   ),
                 {
                   signal: controller.signal,
                   onRetry: ({ attempt, waitMs, error }) => {
                     retriedMs += waitMs
+                    // Rate-limited / overloaded: stop fanning out for the rest
+                    // of the run (the in-flight calls finish on their own).
+                    if (error.code === 'HTTP_429' || error.code === 'HTTP_529') throttled = true
                     console.warn(
                       `[mail-organizer] Claude 暫時性錯誤 ${error.code}，` +
                         `${Math.round(waitMs / 1000)}s 後重試 (#${attempt})`,
@@ -2323,10 +2387,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 // this term negative — and a negative term would cancel a
                 // sibling chunk's real positive, silently suppressing the
                 // "部分 chunk 觸頂截斷" warning even though emails WERE cut.
-                truncatedCount += Math.max(
-                  0,
-                  aiReps.length - result.truncated.parsedCount,
-                )
+                truncatedCount += Math.max(0, aiReps.length - result.truncated.parsedCount)
               }
               const chunkPlan = result.plan.map((p) => {
                 if (p.action !== 'skip' && p.source === 'ai' && p.confidence < threshold) {
@@ -2351,20 +2412,18 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 return p
               })
               // Fan out each rep's decision to its thread siblings. After
-              // this step, `aiPlan` length matches the email count the user
+              // this step the plan length matches the email count the user
               // expects (not the rep count).
               const fannedOut: PlanItem[] = []
               for (const repItem of chunkPlan) {
                 fannedOut.push(repItem)
                 const sibs = siblingsByRepId.get(repItem.emailId)
                 if (sibs) {
-                  for (const sib of sibs) {
-                    fannedOut.push(inheritPlanItemForSibling(repItem, sib))
-                  }
+                  for (const sib of sibs) fannedOut.push(inheritPlanItemForSibling(repItem, sib))
                 }
               }
-              aiPlan = [...aiPlan, ...fannedOut]
               addUsage(result.usage)
+              return { kind: 'done', items: [...bodyRouted, ...fannedOut] }
             } catch (e) {
               // Cancelled / superseded (item 1): the run is gone — no stubs,
               // no banner, no progress write; just stop spending.
@@ -2373,7 +2432,7 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
                 controller.signal.aborted ||
                 (e instanceof ClassifierError && e.code === 'ABORTED')
               ) {
-                break
+                return { kind: 'aborted' }
               }
               const ce = e instanceof ClassifierError ? e : null
               // A parse failure or a mid-stream refusal still consumed tokens.
@@ -2384,80 +2443,180 @@ async function handle(msg: PopupRequest): Promise<PopupResponse> {
               // keep classifying the rest. Everything else — retries exhausted
               // (the service is still down / rate-limited), auth, invalid
               // request, model unavailable — stops the run gracefully: every
-              // remaining email becomes an `unclassified` placeholder (never
-              // recorded in skipHistory, so it comes back next batch).
+              // email that never got classified becomes an `unclassified`
+              // placeholder (never recorded in skipHistory, so it comes back
+              // next batch).
               const chunkLocal = ce?.code === 'PARSE_ERROR' || ce?.code === 'REFUSAL'
-              // The affected set *includes the chunk that just failed* —
-              // dedup against aiPlan so successful entries from earlier in the
-              // same chunk (body-routed reps) don't get a phantom "skip" stub
-              // piled on top, which would skew completedEmails and downstream
-              // summary counts.
-              const remaining = chunkLocal ? aiReps : chunks.slice(ci).flat()
-              const already = new Set(aiPlan.map((p) => p.emailId))
-              const stubReason =
-                ce?.code === 'REFUSAL'
-                  ? ce.message
-                  : `AI 分類失敗：${ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED'}`
-              const skipStub = (m: Email): PlanItem => ({
-                emailId: m.Id,
-                emailSubject: m.Subject ?? '',
-                emailFrom: m.From?.EmailAddress?.Address ?? '',
-                bodyPreview: m.BodyPreview ?? '',
-                conversationId: m.ConversationId,
-                action: 'skip',
-                confidence: 0,
-                reason: stubReason,
-                source: 'unresolved',
-                unclassified: true,
-              })
-              let stubbed = 0
-              for (const m of remaining) {
-                if (already.has(m.Id)) continue
-                aiPlan.push(skipStub(m))
-                already.add(m.Id)
-                stubbed++
-                // Siblings also need a skip stub or they vanish from the
-                // plan entirely.
-                const sibs = siblingsByRepId.get(m.Id)
-                if (sibs) {
-                  for (const sib of sibs) {
-                    if (already.has(sib.Id)) continue
-                    aiPlan.push(skipStub(sib))
-                    already.add(sib.Id)
-                    stubbed++
-                  }
-                }
-              }
-              aiError = {
-                code: ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED',
+              if (!chunkLocal) return { kind: 'fatal', items: bodyRouted, error: e, retriedMs }
+              const stubReason = ce?.code === 'REFUSAL' ? ce.message : `AI 分類失敗：CLASSIFIER_${ce!.code}`
+              const stubs = unclassifiedStubs(aiReps, stubReason, new Set(bodyRouted.map((p) => p.emailId)))
+              firstChunkLocalError ??= {
+                code: `CLASSIFIER_${ce!.code}`,
                 message:
                   ce?.code === 'REFUSAL'
-                    ? `Claude 拒絕分類其中 ${stubbed} 封（類別：${ce.category ?? '未提供'}），已標為未分類`
-                    : describeClassifyFailure(e, stubbed),
+                    ? `Claude 拒絕分類其中 ${stubs.length} 封（類別：${ce.category ?? '未提供'}），已標為未分類`
+                    : describeClassifyFailure(e, stubs.length),
               }
               // The dispatcher's classify:api branch never sees these (the
               // loop runs detached from any message), so log here (item 4).
               await logError('classify:api', ce?.message ?? String(e), {
-                code: ce?.code ?? 'AI_FAILED',
+                code: ce!.code,
                 ...(ce?.status !== undefined ? { status: ce.status } : {}),
                 ...(ce?.category !== undefined ? { category: ce.category } : {}),
                 model: settings.claudeModel,
                 chunk: ci + 1,
                 chunks: chunks.length,
-                unclassified: stubbed,
+                unclassified: stubs.length,
                 retriedMs,
-                fatal: !chunkLocal,
+                fatal: false,
               })
-              if (!chunkLocal) break
-              // chunk-local: fall through to the per-chunk progress write
-              // below and continue with the next chunk.
+              return { kind: 'done', items: [...bodyRouted, ...stubs] }
             }
-
-            // After each chunk, push partial plan to progress
-            const chunkWrite = writeProgress({ completedChunks: ci + 1, done: false })
-            if (!chunkWrite) break
-            await chunkWrite
           }
+
+          /** `unclassified` placeholders for reps (+ their thread siblings) not in `already`. */
+          const unclassifiedStubs = (
+            reps: Email[],
+            reason: string,
+            already: Set<string>,
+          ): PlanItem[] => {
+            const stub = (m: Email): PlanItem => ({
+              emailId: m.Id,
+              emailSubject: m.Subject ?? '',
+              emailFrom: m.From?.EmailAddress?.Address ?? '',
+              bodyPreview: m.BodyPreview ?? '',
+              conversationId: m.ConversationId,
+              action: 'skip',
+              confidence: 0,
+              reason,
+              source: 'unresolved',
+              unclassified: true,
+            })
+            const out: PlanItem[] = []
+            for (const m of reps) {
+              if (already.has(m.Id)) continue
+              out.push(stub(m))
+              already.add(m.Id)
+              // Siblings also need a stub or they vanish from the plan.
+              for (const sib of siblingsByRepId.get(m.Id) ?? []) {
+                if (already.has(sib.Id)) continue
+                out.push(stub(sib))
+                already.add(sib.Id)
+              }
+            }
+            return out
+          }
+
+          const outcomes: (ChunkOutcome | undefined)[] = new Array(chunks.length)
+          let merged = 0 // chunks [0, merged) are in aiPlan
+          let fatalAt = -1
+          let nextChunk = 0
+          let inFlight = 0
+          let mergeChain: Promise<void> = Promise.resolve()
+          // Merge every contiguous finished chunk, in order, then persist once.
+          const mergeReady = () => {
+            mergeChain = mergeChain.then(async () => {
+              const before = merged
+              while (merged < chunks.length && outcomes[merged]?.kind === 'done') {
+                aiPlan = [
+                  ...aiPlan,
+                  ...(outcomes[merged] as { kind: 'done'; items: PlanItem[] }).items,
+                ]
+                merged++
+              }
+              if (merged > before) {
+                const w = writeProgress({ completedChunks: merged, done: false })
+                if (w) await w
+              }
+            })
+          }
+          let resolveAll!: () => void
+          const allDone = new Promise<void>((r) => {
+            resolveAll = r
+          })
+          const lanes = () => (throttled || !warm ? 1 : Math.max(1, AI_PARALLEL_CHUNKS))
+          const pump = () => {
+            while (
+              ownsRun() &&
+              !controller.signal.aborted &&
+              fatalAt < 0 &&
+              nextChunk < chunks.length &&
+              inFlight < lanes()
+            ) {
+              const ci = nextChunk++
+              inFlight++
+              void processChunk(ci)
+                .catch(
+                  // processChunk handles every expected failure; anything else
+                  // (a bug) must end the run gracefully, not hang it.
+                  (e): ChunkOutcome => ({ kind: 'fatal', items: [], error: e, retriedMs: 0 }),
+                )
+                .then((outcome) => {
+                  outcomes[ci] = outcome
+                  if (outcome.kind === 'fatal' && (fatalAt < 0 || ci < fatalAt)) fatalAt = ci
+                  inFlight--
+                  mergeReady()
+                  pump()
+                })
+            }
+            if (inFlight === 0) resolveAll()
+          }
+          function markWarm() {
+            if (warm) return
+            warm = true
+            pump()
+          }
+          pump()
+          await allDone
+          await mergeChain
+
+          if (!ownsRun()) return
+
+          // Everything from the first chunk that didn't merge: completed chunks
+          // keep their items (in order); a fatal chunk keeps its body-routed
+          // items; anything never classified becomes an `unclassified` stub.
+          if (merged < chunks.length) {
+            const fatal =
+              fatalAt >= 0
+                ? (outcomes[fatalAt] as { kind: 'fatal'; error: unknown; retriedMs: number })
+                : null
+            const ce = fatal && fatal.error instanceof ClassifierError ? fatal.error : null
+            const stubReason = `AI 分類失敗：${ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED'}`
+            const already = new Set(aiPlan.map((p) => p.emailId))
+            let stubbed = 0
+            for (let ci = merged; ci < chunks.length; ci++) {
+              const o = outcomes[ci]
+              if (o && o.kind !== 'aborted') {
+                for (const item of o.items) already.add(item.emailId)
+                aiPlan = [...aiPlan, ...o.items]
+              }
+              if (!o || o.kind !== 'done') {
+                const stubs = unclassifiedStubs(chunks[ci]!, stubReason, already)
+                stubbed += stubs.length
+                aiPlan = [...aiPlan, ...stubs]
+              }
+            }
+            if (fatal) {
+              aiError = {
+                code: ce ? `CLASSIFIER_${ce.code}` : 'AI_FAILED',
+                message: describeClassifyFailure(fatal.error, stubbed),
+              }
+              // The dispatcher's classify:api branch never sees these (the
+              // loop runs detached from any message), so log here (item 4).
+              await logError('classify:api', ce?.message ?? String(fatal.error), {
+                code: ce?.code ?? 'AI_FAILED',
+                ...(ce?.status !== undefined ? { status: ce.status } : {}),
+                ...(ce?.category !== undefined ? { category: ce.category } : {}),
+                model: settings.claudeModel,
+                chunk: fatalAt + 1,
+                chunks: chunks.length,
+                unclassified: stubbed,
+                retriedMs: fatal.retriedMs,
+                fatal: true,
+              })
+            }
+          }
+          aiError ??= firstChunkLocalError
 
           if (!ownsRun()) return
 

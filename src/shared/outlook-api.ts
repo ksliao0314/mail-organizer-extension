@@ -11,6 +11,7 @@
 // Rate limiting via module-level TokenBucket (10 burst / 1 per sec, FIFO
 // reservations) + a module-level Semaphore capping requests in flight at 4.
 
+import { OUTLOOK_REQUEST_BURST, OUTLOOK_REQUESTS_PER_SEC } from './constants'
 import { Semaphore, TokenBucket, abortableSleep } from './throttle'
 import type { Email, MailFolder, MailFolderNode } from './types'
 
@@ -19,7 +20,8 @@ function isAbortError(e: unknown): boolean {
 }
 
 const DEFAULT_BASE = 'https://outlook.office.com/api/v2.0'
-const defaultBucket = new TokenBucket(10, 1)
+// 4 req/s steady, burst 20 (2026-11-05; was 1/s, burst 10) — see constants.
+const defaultBucket = new TokenBucket(OUTLOOK_REQUEST_BURST, OUTLOOK_REQUESTS_PER_SEC)
 
 // Exchange throttles concurrent requests PER MAILBOX at ~4 (2026-11-05).
 // Module-level so every OutlookApi instance shares one budget — the limit is

@@ -182,13 +182,13 @@ describe('setSettings sanitizes the MERGED result (every writer)', () => {
     return ((await chrome.storage.local.get('settings'))['settings'] ?? {}) as Record<string, unknown>
   }
 
-  it('clamps batchSize to 1–200 and aiConfidenceThreshold to 0–1, stored and read back', async () => {
+  it('clamps batchSize to 1–500 and aiConfidenceThreshold to 0–1, stored and read back', async () => {
     await setSettings({ batchSize: 0, aiConfidenceThreshold: 7 })
     expect(await rawStored()).toMatchObject({ batchSize: 1, aiConfidenceThreshold: 1 })
     expect(await getSettings()).toMatchObject({ batchSize: 1, aiConfidenceThreshold: 1 })
 
     await setSettings({ batchSize: 999, aiConfidenceThreshold: -0.5 })
-    expect(await getSettings()).toMatchObject({ batchSize: 200, aiConfidenceThreshold: 0 })
+    expect(await getSettings()).toMatchObject({ batchSize: 500, aiConfidenceThreshold: 0 })
 
     await setSettings({ batchSize: 12.7 })
     expect((await getSettings()).batchSize).toBe(12)

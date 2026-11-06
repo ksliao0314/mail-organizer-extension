@@ -178,6 +178,8 @@ type ScanState = {
 // validation and the per-model request params can't drift apart. Current
 // 5.5 models first; 4.x ids stay selectable, labelled 舊版.
 const MODEL_OPTIONS = CLAUDE_MODELS.map((m) => ({ id: m.id, label: m.label }))
+/** 每次處理筆數 choices (≤ BATCH_SIZE_MAX = 500, 2026-11-05 放寬並加速). */
+const BATCH_SIZE_OPTIONS = [25, 50, 100, 200, 300, 500]
 
 /**
  * Collapsible wrapper for advanced / diagnostic sections — uses native
@@ -1343,16 +1345,20 @@ export default function App() {
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">每次處理筆數</CardTitle>
-            <CardDescription>從收件夾取最近的 N 封做歸類。可在 popup 臨時覆寫。</CardDescription>
+            <CardDescription>
+              從收件匣取最近的 N 封做歸類。AI 每 25 封一組、最多 3 組同時分類，搬信也 3 封同時進行；
+              數字越大單次等越久（500 封約需數分鐘），API 費用依實際送給 AI 的封數計算。
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
-            <div className="flex gap-2">
-              {[25, 50, 100].map((n) => (
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+              {BATCH_SIZE_OPTIONS.map((n) => (
                 <button
                   key={n}
                   type="button"
                   onClick={() => changeBatchSize(n)}
-                  className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  aria-pressed={status?.batchSize === n}
+                  className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
                     status?.batchSize === n
                       ? 'border-foreground bg-foreground text-background'
                       : 'border-border bg-background hover:bg-accent'

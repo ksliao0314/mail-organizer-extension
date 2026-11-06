@@ -106,13 +106,35 @@ describe('preflight / peek page past kept and flagged mail', () => {
     expect(router.outlookUrls[0]).toContain('$select=Id,Flag')
   })
 
-  it('stops after 5 pages when every page is flagged', async () => {
-    router.inboxPages = Array.from({ length: 8 }, (_, p) => ({
+  it('stops at the page cap when every page is flagged', async () => {
+    const { inboxScanBudget } = await import('@/background/service-worker')
+    const { maxPages } = inboxScanBudget(2, 0)
+    router.inboxPages = Array.from({ length: maxPages + 3 }, (_, p) => ({
       messages: [flagged(p * 2), flagged(p * 2 + 1)],
       nextLink: link((p + 1) * 2),
     }))
     const r = await sw.send({ type: 'peekNextBatch', batchSize: 2 })
-    expect(r.data).toMatchObject({ eligibleCount: 0, totalFetched: 10 })
-    expect(router.outlookUrls.filter((u) => u.includes('/inbox/messages'))).toHaveLength(5)
+    expect(r.data).toMatchObject({ eligibleCount: 0, totalFetched: maxPages * 2 })
+    expect(router.outlookUrls.filter((u) => u.includes('/inbox/messages'))).toHaveLength(maxPages)
+  })
+
+  it("a page that re-lists the previous page's tail (mail arrived in between) adds no duplicates", async () => {
+    router.inboxPages = [
+      { messages: [inboxMail(0), inboxMail(1), inboxMail(2)], nextLink: link(3) },
+      { messages: [inboxMail(2), inboxMail(3), inboxMail(4)], nextLink: link(6) },
+    ]
+    const r = await sw.send({ type: 'classifyPreflight', batchSize: 5 })
+    expect(r.ok, JSON.stringify(r)).toBe(true)
+    const d = r.data as { unmatchedPreview: Array<{ id: string }> }
+    expect(d.unmatchedPreview.map((m) => m.id)).toEqual(['m0', 'm1', 'm2', 'm3', 'm4'])
+  })
+
+  it('the scan budget scales with the batch (2026-11-05, 放寬並加速)', async () => {
+    const { inboxScanBudget } = await import('@/background/service-worker')
+    // Pages of 100–200; 3× the batch scanned, within [500, 2000].
+    expect(inboxScanBudget(25, 0)).toEqual({ pageSize: 100, maxMessages: 500, maxPages: 6 })
+    expect(inboxScanBudget(100, 100)).toEqual({ pageSize: 200, maxMessages: 500, maxPages: 4 })
+    expect(inboxScanBudget(500, 0)).toEqual({ pageSize: 200, maxMessages: 1500, maxPages: 9 })
+    expect(inboxScanBudget(500, 900)).toEqual({ pageSize: 200, maxMessages: 1500, maxPages: 9 })
   })
 })

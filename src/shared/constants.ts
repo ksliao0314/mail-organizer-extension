@@ -215,10 +215,53 @@ export const AI_CHUNK_SIZE = 25
  * Valid range for settings.batchSize (2026-11-05: enforced in storage on every
  * read AND every merged write, not just in the SW setSettings handler — sync
  * pull / backup restore bypass the handler). 0 meant every batch came back
- * empty. 200 is the ceiling the handler has always applied.
+ * empty. Ceiling raised 200 → 500 (2026-11-05, 放寬並加速) together with the
+ * parallel AI chunks / parallel moves / faster Outlook rate below, so a
+ * 500-email batch finishes in minutes rather than a quarter of an hour.
  */
 export const BATCH_SIZE_MIN = 1
-export const BATCH_SIZE_MAX = 200
+export const BATCH_SIZE_MAX = 500
+
+/**
+ * Claude calls in flight at once while classifying (2026-11-05). Each call
+ * carries one AI_CHUNK_SIZE chunk; results are still merged into the plan in
+ * chunk order. Drops to 1 for the rest of the run after any 429 / 529, so an
+ * account with a low rate-limit tier degrades to the old sequential pace
+ * instead of retrying in a storm.
+ */
+export const AI_PARALLEL_CHUNKS = 3
+
+/**
+ * Move / delete requests in flight at once during execute (2026-11-05).
+ * new_folder items still run first and one at a time (later moves may target
+ * them). Below MAX_CONCURRENT_REQUESTS (4) on purpose: the token is OWA's
+ * own, so the Outlook tab's traffic shares the same per-mailbox budget.
+ */
+export const EXECUTE_PARALLEL_ITEMS = 3
+
+/**
+ * Outlook REST pacing (2026-11-05): steady requests/second and burst for the
+ * shared TokenBucket. Was 1/s (burst 10): once the bucket became a real FIFO
+ * reservation queue, every fan-out (25 body fetches per AI chunk, the folder
+ * tree's sibling GETs) ran ~10× slower than before. 8/s sustained is 4,800
+ * requests / 10 min — under half of Exchange's ~10,000 per mailbox — and the
+ * per-mailbox concurrency cap (4 in flight, outlook-api.ts) stays the guard.
+ */
+export const OUTLOOK_REQUESTS_PER_SEC = 8
+export const OUTLOOK_REQUEST_BURST = 40
+
+/**
+ * Inbox scan sizing for one batch (2026-11-05). Pages hold 100–200 messages
+ * (200 = the size already proven against Outlook REST: batch 100 + 100
+ * ghosts; the 100 floor keeps a small batch from walking 20 tiny pages when
+ * the inbox top is all kept mail) and the scan follows @odata.nextLink; the
+ * total scanned scales with the batch (3×, so kept / flagged mail can't
+ * starve a big batch) within a hard cap.
+ */
+export const INBOX_PAGE_SIZE_MIN = 100
+export const INBOX_PAGE_SIZE_MAX = 200
+export const INBOX_SCAN_MIN_MESSAGES = 500
+export const INBOX_SCAN_MAX_MESSAGES = 2000
 
 // ---- folders --------------------------------------------------------------
 

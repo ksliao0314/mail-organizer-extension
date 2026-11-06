@@ -1181,7 +1181,11 @@ function streamError(error: { type?: unknown; message?: unknown } | undefined): 
  * fallback the rescuing model continues the same text, so concatenating the
  * text blocks in order yields the full reply.
  */
-async function readSseMessage(resp: Response, signal?: AbortSignal): Promise<ParsedMessage> {
+async function readSseMessage(
+  resp: Response,
+  signal?: AbortSignal,
+  onFirstToken?: () => void,
+): Promise<ParsedMessage> {
   if (!resp.body) throw new ClassifierError('NETWORK', 'Claude 串流回應沒有內容')
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
@@ -1194,6 +1198,12 @@ async function readSseMessage(resp: Response, signal?: AbortSignal): Promise<Par
   let buf = ''
   let eventName = ''
   let dataLines: string[] = []
+  let sawToken = false
+  const firstToken = () => {
+    if (sawToken) return
+    sawToken = true
+    onFirstToken?.()
+  }
 
   const dispatch = () => {
     if (dataLines.length === 0) {
@@ -1216,6 +1226,7 @@ async function readSseMessage(resp: Response, signal?: AbortSignal): Promise<Par
         mergeUsage(usage, (ev.message as { usage?: RawUsage } | undefined)?.usage)
         break
       case 'content_block_start': {
+        firstToken()
         const block = ev.content_block as { type?: unknown; text?: unknown } | undefined
         const blockType = typeof block?.type === 'string' ? block.type : ''
         if (typeof ev.index === 'number') blockTypes.set(ev.index, blockType)
@@ -1223,6 +1234,7 @@ async function readSseMessage(resp: Response, signal?: AbortSignal): Promise<Par
         break
       }
       case 'content_block_delta': {
+        firstToken()
         const delta = ev.delta as { type?: unknown; text?: unknown } | undefined
         const blockType = typeof ev.index === 'number' ? blockTypes.get(ev.index) : undefined
         if (
@@ -1355,6 +1367,8 @@ async function callClaude(
   info: ClaudeModelInfo | undefined,
   apiKey: string,
   signal?: AbortSignal,
+  /** Fired once the response has begun streaming (prompt-cache entry now readable). */
+  onResponseStart?: () => void,
 ): Promise<ParsedMessage> {
   const remembered = rejectedFeatures.get(base.model) ?? {}
   const features: RequestFeatures = {
@@ -1393,9 +1407,10 @@ async function callClaude(
       throw httpError(resp, err)
     }
     const ctype = resp.headers.get('content-type') ?? ''
-    return ctype.includes('text/event-stream')
-      ? readSseMessage(resp, signal)
-      : readJsonMessage(resp)
+    if (ctype.includes('text/event-stream')) return readSseMessage(resp, signal, onResponseStart)
+    const json = await readJsonMessage(resp)
+    onResponseStart?.()
+    return json
   }
 }
 
@@ -1404,7 +1419,16 @@ async function callClaude(
 export async function classifyBatch(
   input: ClassifierInput,
   settings: Settings,
-  opts: { signal?: AbortSignal } = {},
+  opts: {
+    signal?: AbortSignal
+    /**
+     * Called once this request's response begins streaming — the moment its
+     * prompt-cache write becomes readable. Parallel callers hold back their
+     * other requests until then so they read the shared prefix instead of
+     * each paying for a cold write (2026-11-05).
+     */
+    onResponseStart?: () => void
+  } = {},
 ): Promise<ClassifierResult> {
   if (!settings.claudeApiKey) {
     throw new ClassifierError('NO_API_KEY', 'Claude API key 未設定')
@@ -1516,7 +1540,7 @@ export async function classifyBatch(
     ],
   }
 
-  const msg = await callClaude(request, info, settings.claudeApiKey, opts.signal)
+  const msg = await callClaude(request, info, settings.claudeApiKey, opts.signal, opts.onResponseStart)
   const { text, usage } = msg
 
   // Refusal (item 9): a safety classifier (or the model) declined — after

@@ -73,6 +73,7 @@ import {
   recordSubjectFilings,
   setUndoSnapshot,
 } from '@/shared/storage'
+import { EXECUTE_PARALLEL_ITEMS } from '@/shared/constants'
 import { MIN_NORMALIZED_SUBJECT_LEN, normalizeSubject } from '@/shared/normalize'
 import {
   type ExecuteItemResult,
@@ -476,13 +477,14 @@ async function runClaimedExecute(
     held = true
     const guard = new DestinationGuard(tree, api)
 
-    for (const i of indexOrder) {
+    // One item; true = stop the batch (cancel requested / aborted).
+    const runOne = async (i: number): Promise<boolean> => {
       // Cancellation check between items — in memory (2026-11-05); the
       // in-flight call below is interrupted by the controller.
       if (state.cancelRequested || controller.signal.aborted) {
         state.results[i] = { ...state.results[i]!, status: 'cancelled' }
         state.summary.cancelled++
-        break
+        return true
       }
 
       const item = plan[i]!
@@ -519,7 +521,7 @@ async function runClaimedExecute(
         if (isAbortError(e)) {
           state.results[i] = { ...state.results[i]!, status: 'cancelled' }
           state.summary.cancelled++
-          break
+          return true
         }
         // F5 (2026-06-03): a non-idempotent op (move/delete) that failed
         // with `uncertain` — the request reached Outlook and MAY have
@@ -540,7 +542,7 @@ async function runClaimedExecute(
           }
           state.summary.skipped++
           writer.touch()
-          continue
+          return false
         }
         const message =
           e instanceof OutlookError
@@ -553,7 +555,37 @@ async function runClaimedExecute(
       }
 
       writer.touch()
+      return false
     }
+
+    // new_folder items first and one at a time (later moves may target the
+    // folders they create); then everything else with up to
+    // EXECUTE_PARALLEL_ITEMS moves / deletes in flight (2026-11-05, 放寬並加速).
+    // Each worker pulls the next index, so results land in their own rows
+    // whatever order they finish in; the first stop ends every worker at its
+    // next item boundary, and never-started rows become 'cancelled' below.
+    const firstOther = indexOrder.findIndex((i) => plan[i]!.action !== 'new_folder')
+    const folderPhase = firstOther < 0 ? indexOrder : indexOrder.slice(0, firstOther)
+    const parallelPhase = firstOther < 0 ? [] : indexOrder.slice(firstOther)
+    let stopped = false
+    for (const i of folderPhase) {
+      if (await runOne(i)) {
+        stopped = true
+        break
+      }
+    }
+    let nextItem = 0
+    const worker = async (): Promise<void> => {
+      while (!stopped && nextItem < parallelPhase.length) {
+        if (await runOne(parallelPhase[nextItem++]!)) stopped = true
+      }
+    }
+    await Promise.all(
+      Array.from(
+        { length: Math.max(1, Math.min(EXECUTE_PARALLEL_ITEMS, parallelPhase.length)) },
+        worker,
+      ),
+    )
 
     // Mark any never-started items (after break) as cancelled
     for (let i = 0; i < state.results.length; i++) {

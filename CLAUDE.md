@@ -24,7 +24,7 @@ popup (React)        options (React)         content (outlook.*)
    chrome.storage.local (持久) / .session (暫存) / .sync (跨機器)
 ```
 
-代碼大小快查(2026-11-05):`service-worker.ts` ≈ 3900 行、`options/App.tsx` ≈ 7700 行、`popup/App.tsx` ≈ 3800 行、`sync-engine.ts` ≈ 2100 行、`shared/rules.ts` ≈ 3000 行、`background/execute.ts` ≈ 2800 行、`shared/classifier.ts` ≈ 1600 行。991 tests across 73 test files。
+代碼大小快查(2026-11-05):`service-worker.ts` ≈ 3900 行、`options/App.tsx` ≈ 7700 行、`popup/App.tsx` ≈ 3800 行、`sync-engine.ts` ≈ 2100 行、`shared/rules.ts` ≈ 3000 行、`background/execute.ts` ≈ 2800 行、`shared/classifier.ts` ≈ 1600 行。998 tests across 74 test files。
 
 ---
 
@@ -376,7 +376,10 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 - **wipeAllRules abort on cloud-clear failure** — 雲端清除失敗時不動本機,避免 cloud 滿、local 空的不一致狀態
 - **REDESIGN_CUTOFF_ISO = '2026-05-27T00:00:00.000Z'** — `isLegacyTokenSubjectRule` 用這個分界線辨識舊 tokenize 路徑生的規則
 - **「刪除」= 移到「已刪除的郵件」(2026-11-05)** — 以前 `DELETE /me/messages` 會進 Recoverable Items(使用者在「已刪除的郵件」找不到)。現在 POST /move 到 well-known `DeletedItems`(400 時改用解析出的資料夾 id),並且進撤回快照(`deleted: true`)
-- **Outlook 並發上限 4** — `OutlookApi.request()` 內建 FIFO semaphore(Exchange 每信箱並發限制);`TokenBucket` 改為預約制。不要再在呼叫端自己加 limiter
+- **Outlook 並發上限 4** — `OutlookApi.request()` 內建 FIFO semaphore(Exchange 每信箱並發限制);`TokenBucket` 改為預約制(v1.0.9 起 8/s、burst 40,`OUTLOOK_REQUESTS_PER_SEC` / `OUTLOOK_REQUEST_BURST`)。不要再在呼叫端自己加 limiter
+- **AI 分組平行(v1.0.9)** — `classifyAi` 最多 `AI_PARALLEL_CHUNKS`(3)組同時呼叫 Claude。第一組先送、等它的回應**開始串流**(`classifyBatch` 的 `onResponseStart`,prompt cache 從此可讀)才放行其餘組;結果依組別順序併入 aiPlan,`completedChunks` 只算連續已併入的前綴;任一 429/529 之後整次退回一次一組;run-fatal 錯誤停止排程、已完成的組(含失敗組之後的)保留、其餘標 `unclassified`。每組的處理(`processChunk`)只回傳結果、不丟例外
+- **搬信平行(v1.0.9)** — `runClaimedExecute` 先逐筆跑 new_folder(後面的 move 可能指向它建的資料夾),其餘最多 `EXECUTE_PARALLEL_ITEMS`(3)筆同時;取消在每個 worker 的下一筆邊界生效,沒開始的列標 cancelled
+- **收件匣掃描預算(v1.0.9)** — `inboxScanBudget(batchSize, ghosts)`:每頁 100–200、總掃描 = 3× 批次(500–2000);`scanInboxForBatch` 跨頁以 Id 去重($skip 分頁在新信進來時會重列上一頁尾端)。批次上限 `BATCH_SIZE_MAX = 500`
 - **well-known 資料夾不是目標** — deleteditems / junkemail / drafts / outbox / sentitems 的子樹不出現在資料夾樹,execute 也拒絕搬進去;規則指向它們會被 reconcile 標孤兒
 - **非冪等 retry 是禁忌** — `outlook-api.ts:request()` 對 POST / DELETE / PATCH **不** retry 網路錯誤 + 5xx,只 retry 429。若硬把這條規則破掉,POST `/move` 第一次成功但 response 掉了的場景會在重試時 404、UI 顯示成失敗、使用者誤以為訊息沒搬走。`OutlookError.uncertain = true` 是給這類「可能成功」case 用的 marker
 - **404 ErrorItemNotFound on move/delete = soft skip,不是 error** — `executeItem` 用 `isAlreadyMovedError(e)` helper 偵測、回傳 `status: 'skipped'`。原因:訊息已不在那個 Id(可能我們上一次 POST 其實成功了、或被其他規則 / 帳號處理過)。重試只會再 404
@@ -414,7 +417,7 @@ P0 tombstone resurrection on fail     Critical (2026-05-27)
 
 ## 測試
 
-`tests/` 目錄、vitest + jsdom + mocked chrome.storage。**991 tests across 73 files**(2026-11-05)。共用 helper:`tests/helpers/sw-harness.ts`(載入真正的 SW dispatcher,用 UI 實際訊息格式測 contract)、`classify-env.ts` + `claude-sse.ts`(classify 端到端 + SSE fixture)、`sync-sim.ts`(多機器同步模擬)、`ui-harness.ts`(jsdom 渲染真正的 popup / options)、`active-days.ts`。重要測試:
+`tests/` 目錄、vitest + jsdom + mocked chrome.storage。**998 tests across 74 files**(2026-11-05,v1.0.9)。共用 helper:`tests/helpers/sw-harness.ts`(載入真正的 SW dispatcher,用 UI 實際訊息格式測 contract)、`classify-env.ts` + `claude-sse.ts`(classify 端到端 + SSE fixture)、`sync-sim.ts`(多機器同步模擬)、`ui-harness.ts`(jsdom 渲染真正的 popup / options)、`active-days.ts`。重要測試:
 
 - `compound-learning.test.ts` — 學到內部網域 / compound 規則
 - `case-code-learning.test.ts` — case_code 規則學習
@@ -502,7 +505,7 @@ mail-organizer-extension/
 │   │   ├── content.ts              ← token 抓取
 │   │   └── owa-fab.ts              ← 浮動按鈕注入
 │   └── components/ui/              ← shadcn 基礎元件
-└── tests/                          ← 991 tests (2026-11-05)
+└── tests/                          ← 998 tests (2026-11-05)
 ```
 
 2026-11-05 新增:`src/shared/claude-models.ts`(模型表:id / 世代 / 價格 / 是否支援 structured outputs、server-side fallback)、`src/shared/msal-token-reader.ts`(MSAL token 讀取,content script 與測試共用)、`src/background/handlers/rules-bulk.ts`(`bulkRuleAction` 與批次規則操作,一次 mutateRules)、`src/popup/keyboard.ts`、`src/popup/web-storage.ts`(包好 try/catch 的 local/sessionStorage)、`src/options/rule-list.ts`(refresh 時保留未變動規則的物件身分)、`src/components/ui/error-boundary.tsx`、`src/fonts.css`(只打包 Latin 字型子集)。
